@@ -21,7 +21,9 @@ import {
   Terminal,
   Code2,
   Copy,
-  Check
+  Check,
+  Trash2,
+  AlertTriangle
 } from 'lucide-react';
 
 const API_BASE = 'http://localhost:8000';
@@ -196,9 +198,11 @@ function PrettyPrintEventStream({ events }) {
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('ingest'); // 'ingest' | 'query' | 'agent'
+  const [activeTab, setActiveTab] = useState('ingest'); // 'ingest' | 'query' | 'agent' | 'manage'
 
   const [collections, setCollections] = useState([]);
+  const [collectionDetails, setCollectionDetails] = useState([]);
+  const [deletingCol, setDeletingCol] = useState(null);
   const [collectionMode, setCollectionMode] = useState('existing'); // 'existing' | 'new'
   const [selectedCollection, setSelectedCollection] = useState('');
   const [newCollectionName, setNewCollectionName] = useState('');
@@ -242,13 +246,19 @@ export default function App() {
       if (!res.ok) throw new Error('Failed to fetch collections');
       const data = await res.json();
       const colList = data.collections || [];
+      const details = data.details || colList.map(c => ({ name: c, count: 0 }));
       setCollections(colList);
+      setCollectionDetails(details);
       setApiStatus('online');
       
       if (colList.length > 0) {
-        if (!selectedCollection) setSelectedCollection(colList[0]);
-        if (!queryCollection) setQueryCollection(colList[0]);
-        if (!agentCollection) setAgentCollection(colList[0]);
+        if (!selectedCollection || !colList.includes(selectedCollection)) setSelectedCollection(colList[0]);
+        if (!queryCollection || !colList.includes(queryCollection)) setQueryCollection(colList[0]);
+        if (!agentCollection || !colList.includes(agentCollection)) setAgentCollection(colList[0]);
+      } else {
+        setSelectedCollection('');
+        setQueryCollection('');
+        setAgentCollection('');
       }
     } catch (err) {
       console.error('Error connecting to backend:', err);
@@ -257,6 +267,41 @@ export default function App() {
         type: 'error',
         message: 'Could not connect to FastAPI server on http://localhost:8000 or http://localhost:8001. Please ensure backend is running.'
       });
+    }
+  };
+
+  const handleDeleteCollection = async (colName) => {
+    setNotification(null);
+    setLoading(true);
+    try {
+      let res;
+      try {
+        res = await fetch(`${API_BASE}/collections/${encodeURIComponent(colName)}`, {
+          method: 'DELETE',
+        });
+      } catch (e) {
+        res = await fetch(`${AGENT_API_BASE}/collections/${encodeURIComponent(colName)}`, {
+          method: 'DELETE',
+        });
+      }
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || 'Failed to delete collection');
+      }
+      setNotification({
+        type: 'success',
+        message: `Successfully deleted collection '${colName}'.`
+      });
+      setDeletingCol(null);
+      await fetchCollections();
+    } catch (err) {
+      console.error('Delete collection error:', err);
+      setNotification({
+        type: 'error',
+        message: err.message || `Failed to delete collection '${colName}'.`
+      });
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -604,6 +649,13 @@ export default function App() {
         >
           <Bot size={18} />
           Agentic RAG Assistant
+        </button>
+        <button
+          className={`nav-tab-btn ${activeTab === 'manage' ? 'active' : ''}`}
+          onClick={() => setActiveTab('manage')}
+        >
+          <Database size={18} />
+          Manage Collections
         </button>
       </div>
 
@@ -1042,6 +1094,175 @@ export default function App() {
                 {showStreamEvents && (
                   <PrettyPrintEventStream events={agentEvents} />
                 )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Manage Collections Tab View */}
+        {activeTab === 'manage' && (
+          <div className="glass-card">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h2 className="card-title" style={{ margin: 0 }}>
+                <Database size={22} color="var(--primary)" />
+                Manage Collections
+              </h2>
+              <button onClick={fetchCollections} className="refresh-btn" title="Refresh collections">
+                <RefreshCw size={16} className={apiStatus === 'checking' ? 'spinner' : ''} />
+              </button>
+            </div>
+            <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '1.5rem' }}>
+              View stored vector store collections, check document chunk counts, or delete existing collections.
+            </p>
+
+            {collectionDetails.length === 0 ? (
+              <div style={{ padding: '3rem 1.5rem', textAlign: 'center', background: 'rgba(255,255,255,0.02)', borderRadius: 'var(--radius-md)', border: '1px dashed var(--border-color)' }}>
+                <Database size={40} color="var(--text-muted)" style={{ marginBottom: '1rem', opacity: 0.5 }} />
+                <p style={{ color: 'var(--text-muted)', fontSize: '0.95rem' }}>No vector store collections exist yet.</p>
+                <button 
+                  className="btn-primary" 
+                  style={{ marginTop: '1rem', display: 'inline-flex', width: 'auto', padding: '0.6rem 1.2rem' }}
+                  onClick={() => setActiveTab('ingest')}
+                >
+                  <Upload size={16} />
+                  Ingest Documents to Create Collection
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                {collectionDetails.map((col) => {
+                  const isConfirming = deletingCol === col.name;
+                  return (
+                    <div 
+                      key={col.name}
+                      style={{
+                        padding: '1.25rem',
+                        borderRadius: 'var(--radius-md)',
+                        background: isConfirming ? 'rgba(239, 68, 68, 0.08)' : 'rgba(255, 255, 255, 0.03)',
+                        border: `1px solid ${isConfirming ? 'rgba(239, 68, 68, 0.4)' : 'var(--border-color)'}`,
+                        transition: 'all 0.2s ease',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '1rem'
+                      }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                          <div style={{ padding: '0.6rem', borderRadius: '8px', background: 'rgba(99, 102, 241, 0.15)', color: 'var(--primary)' }}>
+                            <Server size={20} />
+                          </div>
+                          <div>
+                            <h3 style={{ fontSize: '1rem', fontWeight: 600, color: '#fff', margin: 0 }}>
+                              {col.name}
+                            </h3>
+                            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', margin: '2px 0 0 0' }}>
+                              {col.count !== undefined ? `${col.count} document chunk(s) stored` : 'Chroma Collection'}
+                            </p>
+                          </div>
+                        </div>
+
+                        {!isConfirming && (
+                          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                            <button
+                              type="button"
+                              className="tab-btn"
+                              style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem' }}
+                              onClick={() => {
+                                setQueryCollection(col.name);
+                                setActiveTab('query');
+                              }}
+                            >
+                              <Search size={14} />
+                              Query
+                            </button>
+                            <button
+                              type="button"
+                              className="tab-btn"
+                              style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem' }}
+                              onClick={() => {
+                                setAgentCollection(col.name);
+                                setActiveTab('agent');
+                              }}
+                            >
+                              <Bot size={14} />
+                              Ask Agent
+                            </button>
+                            <button
+                              type="button"
+                              className="tab-btn"
+                              style={{ 
+                                padding: '0.4rem 0.8rem', 
+                                fontSize: '0.8rem',
+                                color: '#f87171',
+                                borderColor: 'rgba(248, 113, 113, 0.3)',
+                                background: 'rgba(248, 113, 113, 0.1)'
+                              }}
+                              onClick={() => setDeletingCol(col.name)}
+                            >
+                              <Trash2 size={14} />
+                              Delete
+                            </button>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Confirmation Banner if deleting */}
+                      {isConfirming && (
+                        <div style={{ 
+                          padding: '0.85rem 1rem', 
+                          borderRadius: '8px', 
+                          background: 'rgba(239, 68, 68, 0.15)', 
+                          border: '1px solid rgba(239, 68, 68, 0.3)',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justify: 'space-between',
+                          gap: '1rem'
+                        }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#fca5a5', fontSize: '0.85rem' }}>
+                            <AlertTriangle size={18} style={{ flexShrink: 0 }} />
+                            <span>Are you sure you want to delete collection <strong>"{col.name}"</strong>?</span>
+                          </div>
+                          <div style={{ display: 'flex', gap: '0.5rem', flexShrink: 0 }}>
+                            <button
+                              type="button"
+                              className="tab-btn"
+                              style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem' }}
+                              onClick={() => setDeletingCol(null)}
+                              disabled={loading}
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="button"
+                              style={{
+                                padding: '0.35rem 0.75rem',
+                                fontSize: '0.8rem',
+                                background: '#ef4444',
+                                color: '#fff',
+                                border: 'none',
+                                borderRadius: '6px',
+                                fontWeight: 600,
+                                cursor: 'pointer',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '0.35rem'
+                              }}
+                              onClick={() => handleDeleteCollection(col.name)}
+                              disabled={loading}
+                            >
+                              {loading ? (
+                                <RefreshCw className="spinner" size={14} />
+                              ) : (
+                                <Trash2 size={14} />
+                              )}
+                              Confirm Delete
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>
