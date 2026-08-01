@@ -144,7 +144,8 @@ npm run dev
 
 | Endpoint | Method | Description |
 | :--- | :--- | :--- |
-| `/collections` | `GET` | List all Chroma vector store collections. |
+| `/collections` | `GET` | List all Chroma vector store collections and item chunk counts. |
+| `/collections/{collection_name}` | `DELETE` | Delete an existing Chroma vector store collection by name. |
 | `/add_documents` | `POST` | Ingest local PDF paths into a vector collection. |
 | `/upload_pdf` | `POST` | Upload single/multiple PDF files via `multipart/form-data` and ingest into a collection. |
 | `/query` | `POST` | Similarity search on a vector collection returning top `k` chunks with metadata. |
