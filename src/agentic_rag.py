@@ -182,19 +182,57 @@ def run_agent_stream(
 
 @app.get("/collections")
 def get_collections():
-    """Returns a list of existing collection names from Chroma vectorstore."""
+    """Returns a list of existing collection details from Chroma vectorstore."""
     persist_directory = "chroma_db"
     if not os.path.exists(persist_directory):
-        return {"collections": []}
+        return {"collections": [], "details": []}
     try:
         import chromadb
         client = chromadb.PersistentClient(path=persist_directory)
         collections = client.list_collections()
         collection_names = [col.name for col in collections]
-        return {"collections": collection_names}
+        details = []
+        for col in collections:
+            try:
+                count = col.count()
+            except Exception:
+                count = 0
+            details.append({
+                "name": col.name,
+                "count": count,
+            })
+        return {"collections": collection_names, "details": details}
     except Exception as e:
         logger.error(f"Error fetching collections: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/collections/{collection_name}")
+def delete_collection(collection_name: str):
+    """Deletes an existing collection from Chroma vectorstore."""
+    persist_directory = "chroma_db"
+    if not os.path.exists(persist_directory):
+        raise HTTPException(status_code=404, detail="Vector store database directory not found.")
+    try:
+        import chromadb
+        client = chromadb.PersistentClient(path=persist_directory)
+        existing = [col.name for col in client.list_collections()]
+        if collection_name not in existing:
+            raise HTTPException(status_code=404, detail=f"Collection '{collection_name}' not found.")
+        
+        client.delete_collection(name=collection_name)
+        logger.info(f"Successfully deleted Chroma collection '{collection_name}'.")
+        return {
+            "status": "success",
+            "message": f"Successfully deleted collection '{collection_name}'.",
+            "collection_name": collection_name,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting collection '{collection_name}': {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.post("/agentic_rag")
