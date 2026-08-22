@@ -47,6 +47,9 @@ class AgenticRAGRequest(BaseModel):
     model_name: str = Field(
         default="gemini-2.5-flash", description="Vertex AI model name"
     )
+    embedding_model: str = Field(
+        default="gemini-embedding-001", description="Name of the Vertex AI embedding model"
+    )
     stream: bool = Field(default=False, description="Whether to stream message events via Server-Sent Events (SSE)")
 
 
@@ -60,6 +63,7 @@ def get_retriever_tool(
     collection_name: str = "stock_market_vs",
     persist_directory: str = "chroma_db",
     k: int = 5,
+    embedding_model: str = "gemini-embedding-001",
     description: str = "Search and retrieve relevant document chunks from collection '{collection_name}'."
 ):
     """Loads a Chroma vectorstore collection and creates a LangChain retriever tool."""
@@ -67,7 +71,7 @@ def get_retriever_tool(
         raise FileNotFoundError(f"Chroma DB directory '{persist_directory}' not found.")
 
     embeddings = GoogleGenerativeAIEmbeddings(
-        model="gemini-embedding-001",
+        model=embedding_model,
         project=os.getenv("GOOGLE_CLOUD_PROJECT"),
         vertexai=True,
     )
@@ -160,9 +164,13 @@ def run_agent_stream(
     collection_name: str = "stock_market_vs",
     thread_id: str = "1",
     model_name: str = "gemini-2.5-flash",
+    embedding_model: str = "gemini-embedding-001",
 ) -> Generator[Dict[str, Any], None, None]:
     """Streams graph message output, printing each message component using pretty_print_event."""
-    retriever_tool = get_retriever_tool(collection_name=collection_name)
+    retriever_tool = get_retriever_tool(
+        collection_name=collection_name,
+        embedding_model=embedding_model,
+    )
     agent = setup_agent(retriever_tool, model_name=model_name)
 
     config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
@@ -262,6 +270,7 @@ def agentic_rag_endpoint(request: AgenticRAGRequest):
                     collection_name=request.collection_name,
                     thread_id=request.thread_id,
                     model_name=request.model_name,
+                    embedding_model=request.embedding_model,
                 ):
                     data = {
                         "event": evt["event"],
@@ -278,6 +287,7 @@ def agentic_rag_endpoint(request: AgenticRAGRequest):
                 collection_name=request.collection_name,
                 thread_id=request.thread_id,
                 model_name=request.model_name,
+                embedding_model=request.embedding_model,
             )
         )
 
@@ -321,7 +331,7 @@ def run_agent_interactive(query: str = "What is ARM Holdings?", collection_name:
 def main():
     print_agent_header("Agentic RAG Assistant Server Initialized", "magenta")
     port = int(os.getenv("PORT", "8001"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("src.agentic_rag:app", host="0.0.0.0", port=port, reload=True)
 
 
 if __name__ == "__main__":

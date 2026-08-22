@@ -39,6 +39,9 @@ class AddDocumentsRequest(BaseModel):
     collection_name: str = Field(
         default="stock_market_vs", description="Name of the Chroma vectorstore collection"
     )
+    embedding_model: str = Field(
+        default="gemini-embedding-001", description="Name of the Vertex AI embedding model"
+    )
 
 
 class QueryRequest(BaseModel):
@@ -47,6 +50,9 @@ class QueryRequest(BaseModel):
         default="stock_market_vs", description="Name of the Chroma vectorstore collection"
     )
     k: int = Field(default=5, description="Number of results to retrieve")
+    embedding_model: str = Field(
+        default="gemini-embedding-001", description="Name of the Vertex AI embedding model"
+    )
 
 
 
@@ -207,6 +213,7 @@ async def add_documents(request: Request):
     content_type = request.headers.get("content-type", "")
     pdf_paths_to_process: List[str] = []
     collection_name = "stock_market_vs"
+    embedding_model = "gemini-embedding-001"
 
     try:
         if "application/json" in content_type:
@@ -217,12 +224,18 @@ async def add_documents(request: Request):
             elif isinstance(raw_paths, list):
                 pdf_paths_to_process.extend(raw_paths)
             collection_name = body.get("collection_name", collection_name)
+            embedding_model = body.get("embedding_model", embedding_model)
         elif "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
             form = await request.form()
             collection_name = form.get("collection_name", collection_name)
             if isinstance(collection_name, list):
                 collection_name = collection_name[0]
             collection_name = collection_name.strip() if collection_name else "stock_market_vs"
+
+            raw_embedding = form.get("embedding_model", embedding_model)
+            if isinstance(raw_embedding, list):
+                raw_embedding = raw_embedding[0]
+            embedding_model = raw_embedding.strip() if raw_embedding else "gemini-embedding-001"
 
             # Handle uploaded files
             files = form.getlist("files")
@@ -257,6 +270,7 @@ async def add_documents(request: Request):
                 elif isinstance(raw_paths, list):
                     pdf_paths_to_process.extend(raw_paths)
                 collection_name = body.get("collection_name", collection_name)
+                embedding_model = body.get("embedding_model", embedding_model)
             except Exception:
                 raise HTTPException(
                     status_code=400,
@@ -269,11 +283,12 @@ async def add_documents(request: Request):
                 detail="No PDF files uploaded or PDF paths provided."
             )
 
-        logger.info(f"Processing PDF documents for collection '{collection_name}': {pdf_paths_to_process}")
+        logger.info(f"Processing PDF documents for collection '{collection_name}' (embedding_model: '{embedding_model}'): {pdf_paths_to_process}")
         chunks = load_and_split_pdfs(pdf_paths_to_process)
         vectorstore = add_documents_to_vectorstore(
             documents=chunks,
             collection_name=collection_name,
+            embedding_model=embedding_model,
         )
         return {
             "status": "success",
@@ -301,7 +316,7 @@ def query_collection(request: QueryRequest):
 
     try:
         embeddings = GoogleGenerativeAIEmbeddings(
-            model="gemini-embedding-001",
+            model=request.embedding_model,
             project=os.getenv("GOOGLE_CLOUD_PROJECT"),
             vertexai=True,
         )
@@ -340,7 +355,8 @@ def query_collection(request: QueryRequest):
 
 
 def main():
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("src.add_documents:app", host="0.0.0.0", port=port, reload=True)
 
 
 if __name__ == "__main__":
