@@ -113,7 +113,7 @@ curl -X POST "http://localhost:8000/query" \
 ### LangGraph Agent Workflow
 
 - **`AgentState`**: A `TypedDict` containing `messages: Annotated[Sequence[BaseMessage], add_messages]`.
-- **`model_call` Node**: Injects the expert system prompt, binds the retriever tool, and invokes `ChatVertexAI`.
+- **`model_call` Node**: Injects the expert system prompt, binds the retriever tool, and invokes `ChatGoogleGenerativeAI`.
 - **`tools` Node**: An instance of LangGraph `ToolNode` that executes the retrieval query against ChromaDB.
 - **`should_continue` Conditional Edge**: Evaluates if the LLM emitted tool calls; if so, routes to `tools`, otherwise routes to `END`.
 
@@ -204,7 +204,14 @@ run_agent_interactive(
    export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
    ```
 
-2. **Dependencies**:
+2. **Environment Variables (`.env`)**:
+   Configure `.env` in the root directory or `src/.env`:
+   ```bash
+   GOOGLE_CLOUD_PROJECT="your-google-cloud-project-id"
+   GOOGLE_CLOUD_LOCATION="us-central1"  # Optional, defaults to us-central1
+   ```
+
+3. **Dependencies**:
    Install all dependencies listed in `requirements.txt`:
    ```bash
    pip install -r requirements.txt

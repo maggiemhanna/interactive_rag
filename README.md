@@ -31,8 +31,8 @@ InteractiveRAG/
 
 ### Component Summary
 
-- **`src/add_documents.py` (Port 8000)**: FastAPI service that loads PDFs, chunks text using `RecursiveCharacterTextSplitter`, computes embeddings with Vertex AI (`gemini-embedding-001`), and indexes them in `ChromaDB`. Also provides collection management (`GET /collections`, `DELETE /collections/{name}`) and direct similarity search (`POST /query`).
-- **`src/agentic_rag.py` (Port 8001)**: FastAPI service running a LangGraph `StateGraph` agent with `ChatVertexAI` (`gemini-2.5-flash`). Dynamically binds a Chroma retriever tool, handles multi-turn conversation state with `InMemorySaver`, and streams responses over Server-Sent Events (SSE).
+- **`src/add_documents.py` (Port 8000)**: FastAPI service that loads PDFs, chunks text using `RecursiveCharacterTextSplitter`, computes embeddings with `GoogleGenerativeAIEmbeddings` (`gemini-embedding-001`), and indexes them in `ChromaDB` into specified collections. Also provides collection management (`GET /collections`, `DELETE /collections/{name}`) and direct similarity search (`POST /query`).
+- **`src/agentic_rag.py` (Port 8001)**: FastAPI service running a LangGraph `StateGraph` agent with `ChatGoogleGenerativeAI` (`gemini-2.5-flash`). Dynamically binds a Chroma retriever tool, handles multi-turn conversation state with `InMemorySaver`, and streams responses over Server-Sent Events (SSE).
 - **`frontend/` (Port 3000)**: React dashboard that allows users to upload PDF documents, manage vector store collections, perform semantic search, and chat interactively with the LangGraph agent in real time.
 - **`tests/`**: Integration test scripts to validate backend endpoints and retrieval performance.
 - **`utils/`**: Shared logging and rich terminal message visualizer.
@@ -41,14 +41,20 @@ InteractiveRAG/
 
 ## 🚀 Setup & Prerequisites
 
-### 1. Google Cloud Authentication
-Ensure Google Cloud credentials are configured for Vertex AI:
+### 1. Google Cloud Authentication & Configuration
+Ensure Google Cloud credentials and environment variables are configured:
 ```bash
 gcloud auth application-default login
 ```
 *Or set the service account key path:*
 ```bash
 export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
+```
+
+Configure your `.env` file in the project root or `src/.env`:
+```bash
+GOOGLE_CLOUD_PROJECT="your-google-cloud-project-id"
+GOOGLE_CLOUD_LOCATION="us-central1"  # Optional, defaults to us-central1
 ```
 
 ### 2. Python Environment Setup

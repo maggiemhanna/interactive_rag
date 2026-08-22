@@ -1,8 +1,14 @@
 import requests
+from dotenv import load_dotenv, find_dotenv
+import os 
+
 from langchain_chroma import Chroma
-from langchain_google_vertexai import VertexAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 from utils.logging import setup_logging
+
+load_dotenv(find_dotenv())
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 logger = setup_logging(name="test_add_documents")
 
@@ -21,7 +27,11 @@ if __name__ == "__main__":
 
     # Test the vectorstore with a query using retriever
     collection_name = payload.get("collection_name", "stock_market_vs")
-    embeddings = VertexAIEmbeddings(model="gemini-embedding-001")
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="gemini-embedding-001",
+        project=os.getenv("GOOGLE_CLOUD_PROJECT"),
+        vertexai=True,
+    )
     vectorstore = Chroma(
         persist_directory="chroma_db",
         embedding_function=embeddings,

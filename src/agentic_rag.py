@@ -2,6 +2,7 @@ import os
 import json
 from typing import Annotated, List, Optional, Sequence, TypedDict, Generator, Dict, Any
 
+from dotenv import load_dotenv, find_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -11,7 +12,7 @@ from langchain_chroma import Chroma
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools.retriever import create_retriever_tool
-from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -19,6 +20,10 @@ from langgraph.prebuilt import ToolNode
 
 from utils.logging import setup_logging
 from utils.messages_pretty_print import print_agent_header, pretty_print_event
+
+# Load environment variables from .env file (searches parent directories and current directory / src)
+load_dotenv(find_dotenv())
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 logger = setup_logging(name="agentic_rag")
 
@@ -61,7 +66,12 @@ def get_retriever_tool(
     if not os.path.exists(persist_directory):
         raise FileNotFoundError(f"Chroma DB directory '{persist_directory}' not found.")
 
-    embeddings = VertexAIEmbeddings(model="gemini-embedding-001")
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="gemini-embedding-001",
+        project=os.getenv("GOOGLE_CLOUD_PROJECT"),
+        vertexai=True,
+    )
+
     vectorstore = Chroma(
         persist_directory=persist_directory,
         embedding_function=embeddings,
@@ -87,11 +97,14 @@ def get_retriever_tool(
 
 def setup_agent(retriever_tool, model_name: str = "gemini-2.5-flash"):
     """Constructs and compiles the LangGraph Agentic RAG graph."""
-    llm = ChatVertexAI(
-        model=model_name,
+
+    llm = ChatGoogleGenerativeAI(
+        model=model_name, 
         temperature=0,
-        location="us-central1",
+        project=os.getenv("GOOGLE_CLOUD_PROJECT"),
+        location=os.getenv("GOOGLE_CLOUD_LOCATION")
     )
+
     tools = [retriever_tool]
     model_with_tools = llm.bind_tools(tools)
 

@@ -2,17 +2,22 @@ import os
 import sys
 from typing import List, Union, Optional
 
+from dotenv import load_dotenv, find_dotenv
 from fastapi import FastAPI, HTTPException, Request, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
-from langchain_google_vertexai import VertexAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 
 from utils.logging import setup_logging
+
+# Load environment variables from .env file (searches parent directories and current directory / src)
+load_dotenv(find_dotenv())
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 logger = setup_logging(name="add_documents")
 
@@ -105,7 +110,12 @@ def add_documents_to_vectorstore(
     Returns:
         Chroma vectorstore instance.
     """
-    embeddings = VertexAIEmbeddings(model=embedding_model)
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model=embedding_model,
+        project=os.getenv("GOOGLE_CLOUD_PROJECT"),
+        vertexai=True,
+    )
+
 
     if not os.path.exists(persist_directory):
         os.makedirs(persist_directory)
@@ -290,7 +300,11 @@ def query_collection(request: QueryRequest):
         raise HTTPException(status_code=404, detail="No Chroma vectorstore database found.")
 
     try:
-        embeddings = VertexAIEmbeddings(model="gemini-embedding-001")
+        embeddings = GoogleGenerativeAIEmbeddings(
+            model="gemini-embedding-001",
+            project=os.getenv("GOOGLE_CLOUD_PROJECT"),
+            vertexai=True,
+        )
         vectorstore = Chroma(
             persist_directory=persist_directory,
             embedding_function=embeddings,
