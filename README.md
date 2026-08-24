@@ -1,5 +1,9 @@
 # InteractiveRAG
 
+**InteractiveRAG** is designed for multi-domain document intelligence, allowing users to organize different sets of PDF documents into isolated, dedicated Chroma vector store collections rather than pooling everything into a single shared index. Through either the React dashboard or the API endpoint (`POST /add_documents`), users can create a new collection simply by supplying a custom collection name along with their PDF files (e.g., separate collections for market analysis vs. annual reports). The backend parses the files,  computes dense embeddings using, and indexes the chunks directly into the designated collection. Users can also monitor all active collections and chunk counts or completely remove obsolete collections.
+
+When it comes to querying, users can select a specific collection to keep retrieval strictly scoped to that exact document set, avoiding cross-domain noise. Users can perform direct top-$k$ semantic similarity searches on an indexed collection through (`POST /query`) to inspect raw matching text passages and metadata. Alternatively, users can interact with the LangGraph conversational assistant via (`POST /agentic_rag`), where we dynamically configure an autonomous retrieval tool bound exclusively to the target collection, enabling the Gemini agent to search, inspect relevant context chunks, and synthesize grounded answers in real time.
+
 **InteractiveRAG** is an interactive, full-stack Agentic Retrieval-Augmented Generation (RAG) platform. It pairs a **LangGraph**-driven reasoning agent powered by **Google Cloud Vertex AI** (`gemini-2.5-flash` & `gemini-embedding-001`) and **ChromaDB** with a modern **React** web dashboard.
 
 ---
