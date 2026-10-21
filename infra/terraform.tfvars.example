@@ -1,0 +1,26 @@
+# Copy this file to `infra/terraform.tfvars` (gitignored) and populate values for your GCP project.
+
+project_id  = "your-gcp-project-id"
+region      = "us-central1"
+app_name    = "interactive-rag"
+environment = "prod"
+image_tag   = "latest"
+
+# Cloud Run Sizing
+backend_cpu         = "2"
+backend_memory      = "2Gi"
+frontend_cpu        = "1"
+frontend_memory     = "512Mi"
+min_instance_count  = 0
+max_instance_count  = 5
+bucket_force_destroy = false
+
+# Identity Platform / Firebase Web Config
+# Find `firebase_api_key` in GCP Console -> Identity Platform -> Settings -> Application setup details
+firebase_api_key = ""
+firebase_app_id  = ""
+
+# Optional: Enable Google OAuth Sign-In alongside Email/Password
+enable_google_oauth        = false
+google_oauth_client_id     = ""
+google_oauth_client_secret = ""

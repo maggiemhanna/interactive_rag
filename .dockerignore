@@ -1,0 +1,43 @@
+# Git & VCS
+.git
+.gitignore
+
+# Python virtualenvs & caches
+.venv
+venv
+ENV
+env
+__pycache__
+*.py[cod]
+*$py.class
+.pytest_cache
+
+# Secrets & local environment files
+.env
+**/.env
+*.pem
+*service-account*.json
+
+# Local ChromaDB & runtime uploads
+chroma_db
+data/uploads/*
+!data/uploads/.gitkeep
+
+# Frontend dependencies & build outputs
+frontend/node_modules
+frontend/dist
+frontend/.vite
+
+# Terraform & IaC state
+infra/.terraform
+infra/*.tfstate
+infra/*.tfstate.*
+infra/*.tfvars
+infra/crash.log
+
+# Docs, tests & OS metadata
+docs
+tests
+.DS_Store
+.vscode
+.idea

@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PORT=8080 \
+    LOCAL_CHROMA_ROOT=/tmp/chroma_db \
+    APP_MODULE=src.add_documents:app
+
+WORKDIR /app
+
+# Install minimal runtime libraries required by ChromaDB / ONNX / HNSW
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies first for optimal layer caching
+COPY requirements.txt ./
+RUN pip install --upgrade pip && \
+    pip install -r requirements.txt
+
+# Copy backend source code and shared utilities
+COPY utils/ ./utils/
+COPY src/ ./src/
+
+# Run as non-root user; /tmp remains world-writable (1777) for Cloud Run tmpfs
+RUN useradd --create-home --uid 10001 appuser && \
+    chown -R appuser:appuser /app
+
+USER appuser
+
+EXPOSE 8080
+
+# Override APP_MODULE=src.agentic_rag:app for the Agentic RAG Cloud Run service
+CMD ["sh", "-c", "exec uvicorn ${APP_MODULE} --host 0.0.0.0 --port ${PORT:-8080}"]
