@@ -110,7 +110,7 @@ flowchart TB
   - Add DNS `CNAME` record `*.googleapis.com.` $\rightarrow$ `private.googleapis.com.`.
 
 ### Phase 4: Provision the Global External HTTPS Load Balancer (Concept 2)
-- [ ] Create `infra/load_balancer.tf`:
+- [x] Create `infra/load_balancer.tf`:
   - Reserve a global static IPv4 address (`google_compute_global_address.lb_ip`).
   - Derive the automatic Load Balancer hostname `"${replace(google_compute_global_address.lb_ip.address, ".", "-")}.sslip.io"`.
   - Create a Google-managed SSL certificate (`google_compute_managed_ssl_certificate.lb_cert`) for that `sslip.io` hostname.
