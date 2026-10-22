@@ -64,6 +64,33 @@ def is_local_auth_bypass_enabled() -> bool:
     return True
 
 
+def get_allowed_origins() -> list[str]:
+    """Parses ALLOWED_ORIGINS from the environment (comma-separated).
+
+    Defaults to standard localhost dev ports when running locally, and fails closed ([])
+    in Cloud Run if ALLOWED_ORIGINS is omitted.
+    """
+    raw = os.getenv("ALLOWED_ORIGINS", "").strip()
+    if raw:
+        origins: list[str] = []
+        for item in raw.split(","):
+            cleaned = item.strip()
+            if not cleaned:
+                continue
+            origins.append("*" if cleaned == "*" else cleaned.rstrip("/"))
+        return origins
+
+    if is_cloud_run_environment():
+        return []
+
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+
+
 def ensure_firebase_initialized() -> firebase_admin.App:
     """Initializes the Firebase Admin SDK once per process using Application Default Credentials."""
     if firebase_admin._apps:

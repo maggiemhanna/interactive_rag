@@ -85,15 +85,15 @@ flowchart TB
 - [x] Implement LRU `/tmp` eviction for inactive user directories when `/tmp` free space drops below threshold.
 
 ### Phase 4: Multi-Tenant Backend Hardening (`src/add_documents.py` & `src/agentic_rag.py`)
-- [ ] Inject `uid: str = Depends(get_current_user)` into all collection, ingestion, query, and agent endpoints.
-- [ ] Replace hardcoded `"chroma_db"` with the per-user path returned by `utils/chroma_storage.py`.
-- [ ] **Security fix in `POST /add_documents`**:
+- [x] Inject `uid: str = Depends(get_current_user)` into all collection, ingestion, query, and agent endpoints.
+- [x] Replace hardcoded `"chroma_db"` with the per-user path returned by `utils/chroma_storage.py`.
+- [x] **Security fix in `POST /add_documents`**:
   - Disable arbitrary server-filesystem `pdf_paths` when running in Cloud Run (`K_SERVICE` set) so users cannot read container paths or other users' temp files.
   - Store uploaded multipart PDFs in an isolated per-request temp folder (`/tmp/uploads/{uid}/{uuid}/`), optionally archive raw PDFs to `gs://<BUCKET>/users/{uid}/uploads/`, and clean up `/tmp/uploads/{uid}/{uuid}/` in a `finally` block.
-- [ ] **Conversation state isolation in `src/agentic_rag.py`**:
+- [x] **Conversation state isolation in `src/agentic_rag.py`**:
   - Move `InMemorySaver()` to module scope so multi-turn conversations persist across warm requests.
   - Scope every `thread_id` with the verified user ID: `scoped_thread_id = f"{uid}:{request.thread_id}"`.
-- [ ] **Production server settings**:
+- [x] **Production server settings**:
   - Add unauthenticated `GET /health` endpoints to both FastAPI apps.
   - Read `ALLOWED_ORIGINS` from environment variables instead of `["*"]`.
   - Add `Cache-Control: no-cache` and `X-Accel-Buffering: no` headers to `StreamingResponse` in `src/agentic_rag.py`.
