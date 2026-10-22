@@ -97,7 +97,7 @@ flowchart TB
 - [x] Add `ingestion_subnet_cidr` and `agent_subnet_cidr` variables to `infra/variables.tf` and `infra/terraform.tfvars.example`.
 
 ### Phase 2: Build the Private VPC & Segmented Subnets (Concepts 1 & 2)
-- [ ] Create `infra/network.tf`:
+- [x] Create `infra/network.tf`:
   - Provision custom VPC `google_compute_network.main` with `auto_create_subnetworks = false` and `delete_default_routes_on_create = true` (eliminating outbound public internet access).
   - Provision `ingestion-subnet` (`10.10.1.0/26`) in `var.region` with `private_ip_google_access = true`.
   - Provision `agent-subnet` (`10.10.2.0/26`) in `var.region` with `private_ip_google_access = true`.
