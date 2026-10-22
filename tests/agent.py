@@ -3,7 +3,7 @@ import json
 import requests
 
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
-from src.agent.display import pretty_print_event
+from src.agent.display import print_event
 from src.core.logger import setup_logging
 
 logger = setup_logging(name="test_agent")
@@ -54,7 +54,7 @@ def test_standard_endpoint(url: str):
                         if "message" in event_data:
                             msg_obj = dict_to_message(event_data["message"])
                             if msg_obj:
-                                pretty_print_event(msg_obj)
+                                print_event(msg_obj)
     else:
         res_data = response.json()
         logger.info(f"Status Code: {response.status_code}")
@@ -62,7 +62,7 @@ def test_standard_endpoint(url: str):
         for msg in res_data.get("messages", []):
             msg_obj = dict_to_message(msg)
             if msg_obj:
-                pretty_print_event(msg_obj)
+                print_event(msg_obj)
 
 
 def test_streaming_endpoint(url: str):
@@ -89,7 +89,7 @@ def test_streaming_endpoint(url: str):
                     if "message" in event_data:
                         msg_obj = dict_to_message(event_data["message"])
                         if msg_obj:
-                            pretty_print_event(msg_obj)
+                            print_event(msg_obj)
                 except Exception as e:
                     logger.warning(f"Could not parse stream event: {e}")
 

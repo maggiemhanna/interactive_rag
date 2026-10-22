@@ -40,12 +40,12 @@ def validate_uid(uid: Optional[str]) -> str:
     return uid
 
 
-def is_cloud_run_environment() -> bool:
+def is_cloud_run() -> bool:
     """Returns True when running inside a Google Cloud Run container (K_SERVICE is injected by Cloud Run)."""
     return bool(os.getenv("K_SERVICE", "").strip())
 
 
-def is_local_auth_bypass_enabled() -> bool:
+def is_auth_bypassed() -> bool:
     """Checks whether local-only authentication bypass is active.
 
     Never allows bypass when K_SERVICE is set (Cloud Run), even if AUTH_DISABLED=true is misconfigured.
@@ -54,7 +54,7 @@ def is_local_auth_bypass_enabled() -> bool:
     if not auth_disabled:
         return False
 
-    if is_cloud_run_environment():
+    if is_cloud_run():
         logger.error(
             "AUTH_DISABLED=true is set inside Cloud Run (K_SERVICE detected). "
             "Ignoring bypass and enforcing strict JWT verification."
@@ -80,7 +80,7 @@ def get_allowed_origins() -> list[str]:
             origins.append("*" if cleaned == "*" else cleaned.rstrip("/"))
         return origins
 
-    if is_cloud_run_environment():
+    if is_cloud_run():
         return []
 
     return [
@@ -91,7 +91,7 @@ def get_allowed_origins() -> list[str]:
     ]
 
 
-def ensure_firebase_initialized() -> firebase_admin.App:
+def init_firebase() -> firebase_admin.App:
     """Initializes the Firebase Admin SDK once per process using Application Default Credentials."""
     if firebase_admin._apps:
         return firebase_admin.get_app()
@@ -140,7 +140,7 @@ def _extract_bearer_token(authorization: Optional[str]) -> str:
 
 def verify_bearer_token(token: str) -> Dict[str, Any]:
     """Verifies a Firebase / Google Identity Platform ID token and returns decoded claims."""
-    app = ensure_firebase_initialized()
+    app = init_firebase()
     try:
         decoded_claims = firebase_auth.verify_id_token(
             token,
@@ -189,7 +189,7 @@ def get_current_user_info(
     x_dev_user_id: Optional[str] = Header(default=None, alias="X-Dev-User-Id"),
 ) -> AuthenticatedUser:
     """FastAPI dependency returning full verified user metadata (`uid`, `email`, `name`)."""
-    if is_local_auth_bypass_enabled():
+    if is_auth_bypassed():
         raw_dev_uid = (x_dev_user_id or os.getenv("DEV_USER_ID", "local-dev")).strip()
         uid = validate_uid(raw_dev_uid)
         return AuthenticatedUser(

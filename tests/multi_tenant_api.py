@@ -15,7 +15,7 @@ from src.agent import graph as agent_graph_module
 from src.core import chroma as chroma_module
 from src.core import storage as chroma_storage
 from src.core.logger import setup_logging
-from src.core.storage import release_chroma_client_cache
+from src.core.storage import release_client_cache
 from src.ingestion import app as ingestion_module
 from tests.storage import FakeGCSBucket
 
@@ -124,7 +124,7 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
             if os.path.exists(root):
                 for entry in os.scandir(root):
                     if entry.is_dir():
-                        release_chroma_client_cache(entry.path)
+                        release_client_cache(entry.path)
                 shutil.rmtree(root, ignore_errors=True)
         shutil.rmtree(self.uploads_tmp, ignore_errors=True)
 

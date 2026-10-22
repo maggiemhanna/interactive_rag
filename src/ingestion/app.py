@@ -4,13 +4,13 @@ import uvicorn
 from fastapi import Depends, HTTPException, Request
 
 from src.core.auth import get_current_user
-from src.core.config import INGESTION_DEFAULT_PORT, is_uvicorn_reload_enabled
+from src.core.config import INGESTION_PORT, is_reload_enabled
 from src.core.logger import setup_logging
 from src.core.routes import create_app
-from src.core.storage import ChromaLockTimeoutError
-from src.ingestion.loader import prepare_ingestion_payload
+from src.core.storage import LockTimeoutError
+from src.ingestion.loader import prepare_payload
 from src.ingestion.schemas import QueryRequest
-from src.ingestion.service import ingest_user_documents, query_user_collection
+from src.ingestion.service import ingest_documents, search_collection
 
 logger = setup_logging(name="ingestion")
 
@@ -21,14 +21,14 @@ app = create_app(title="Document Ingestion API", service_name="ingestion-api")
 async def ingest(request: Request, uid: str = Depends(get_current_user)):
     """FastAPI endpoint to load, split, and ingest PDF documents (via file upload or file paths) into Chroma vectorstore."""
     try:
-        payload = await prepare_ingestion_payload(request=request, uid=uid)
+        payload = await prepare_payload(request=request, uid=uid)
 
         logger.info(
             f"Ingesting {len(payload.chunks)} chunks for uid='{uid}' into collection '{payload.collection_name}' "
             f"(embedding_model='{payload.embedding_model}', files={payload.processed_files})"
         )
 
-        ingest_user_documents(
+        ingest_documents(
             uid=uid,
             documents=payload.chunks,
             collection_name=payload.collection_name,
@@ -42,7 +42,7 @@ async def ingest(request: Request, uid: str = Depends(get_current_user)):
             "collection_name": payload.collection_name,
             "processed_files": payload.processed_files,
         }
-    except ChromaLockTimeoutError as e:
+    except LockTimeoutError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except FileNotFoundError as e:
         logger.error(f"File not found error: {e}")
@@ -58,7 +58,7 @@ async def ingest(request: Request, uid: str = Depends(get_current_user)):
 def query(request: QueryRequest, uid: str = Depends(get_current_user)):
     """FastAPI endpoint to search/query documents in a specific Chroma vectorstore collection."""
     try:
-        results = query_user_collection(
+        results = search_collection(
             uid=uid,
             query=request.query,
             collection_name=request.collection_name,
@@ -84,12 +84,12 @@ def query(request: QueryRequest, uid: str = Depends(get_current_user)):
 
 
 def main() -> None:
-    port = int(os.getenv("PORT", str(INGESTION_DEFAULT_PORT)))
+    port = int(os.getenv("PORT", str(INGESTION_PORT)))
     uvicorn.run(
         "src.ingestion.app:app",
         host="0.0.0.0",
         port=port,
-        reload=is_uvicorn_reload_enabled(),
+        reload=is_reload_enabled(),
     )
 
 

@@ -14,7 +14,7 @@ from typing import Any, Dict, Generator, List, Optional
 from google.api_core import exceptions as gcs_exceptions
 from google.cloud import storage
 
-from src.core.auth import is_cloud_run_environment, validate_uid
+from src.core.auth import is_cloud_run, validate_uid
 from src.core.logger import setup_logging
 
 logger = setup_logging(name="storage")
@@ -33,29 +33,29 @@ _user_last_used: Dict[str, float] = {}
 _user_active_refs: Dict[str, int] = {}
 
 
-class ChromaLockTimeoutError(TimeoutError):
+class LockTimeoutError(TimeoutError):
     """Raised when a per-user GCS write lock cannot be acquired within the configured timeout."""
 
 
-def get_gcs_bucket_name() -> str:
+def get_bucket_name() -> str:
     """Returns configured GCS bucket name, or empty string when running in local-only disk mode."""
     return os.getenv("GCS_BUCKET_NAME", "").strip()
 
 
-def get_local_chroma_root() -> str:
+def get_chroma_root() -> str:
     """Returns the root directory where per-user ChromaDB working directories are stored."""
     configured = os.getenv("LOCAL_CHROMA_ROOT", "").strip()
     if configured:
         return os.path.abspath(configured)
-    if is_cloud_run_environment():
+    if is_cloud_run():
         return "/tmp/chroma_db"
     return os.path.abspath(os.path.join("chroma_db", "users"))
 
 
-def get_user_chroma_dir(uid: str) -> str:
+def get_user_dir(uid: str) -> str:
     """Returns the validated, isolated local ChromaDB directory path for a specific user."""
     safe_uid = validate_uid(uid)
-    root = get_local_chroma_root()
+    root = get_chroma_root()
     user_dir = os.path.abspath(os.path.join(root, safe_uid))
     if os.path.commonpath([root, user_dir]) != root or user_dir == root:
         raise ValueError(f"Unsafe resolved Chroma directory for uid={safe_uid!r}")
@@ -75,7 +75,7 @@ def _get_gcs_client() -> storage.Client:
 
 
 def _get_bucket() -> storage.Bucket:
-    bucket_name = get_gcs_bucket_name()
+    bucket_name = get_bucket_name()
     if not bucket_name:
         raise RuntimeError("GCS_BUCKET_NAME is not configured.")
     return _get_gcs_client().bucket(bucket_name)
@@ -107,7 +107,7 @@ def _track_active_user(uid: str) -> Generator[None, None, None]:
             _user_last_used[uid] = time.time()
 
 
-def release_chroma_client_cache(persist_directory: str) -> None:
+def release_client_cache(persist_directory: str) -> None:
     """Stops and evicts ChromaDB's cached System instance for a specific persist_directory.
 
     ChromaDB's PersistentClient caches RustBindingsAPI/SegmentAPI instances per directory path.
@@ -161,16 +161,16 @@ def _directory_size_bytes(path: str) -> int:
     return total
 
 
-def evict_inactive_tmp_dirs_if_needed(exclude_uid: Optional[str] = None) -> List[str]:
+def evict_tmp_cache(exclude_uid: Optional[str] = None) -> List[str]:
     """LRU-evicts inactive `/tmp/chroma_db/{uid}` directories when cache size or free RAM disk is tight.
 
     Runs ONLY when `GCS_BUCKET_NAME` is configured (since GCS holds the canonical persistent copy).
     Never evicts a user directory that currently has an active read or write operation in flight.
     """
-    if not get_gcs_bucket_name():
+    if not get_bucket_name():
         return []
 
-    root = get_local_chroma_root()
+    root = get_chroma_root()
     if not os.path.exists(root):
         return []
 
@@ -225,7 +225,7 @@ def evict_inactive_tmp_dirs_if_needed(exclude_uid: Optional[str] = None) -> List
             with _state_lock:
                 if _user_active_refs.get(cand_uid, 0) > 0:
                     continue
-            release_chroma_client_cache(cand_path)
+            release_client_cache(cand_path)
             shutil.rmtree(cand_path, ignore_errors=True)
             with _state_lock:
                 _user_last_used.pop(cand_uid, None)
@@ -260,8 +260,8 @@ def _read_local_version(user_dir: str) -> Optional[str]:
 
 def _sync_from_gcs_unlocked(uid: str) -> str:
     """Downloads `gs://<bucket>/users/{uid}/chroma_db/` into local `user_dir` if missing or stale."""
-    user_dir = get_user_chroma_dir(uid)
-    if not get_gcs_bucket_name():
+    user_dir = get_user_dir(uid)
+    if not get_bucket_name():
         return user_dir
 
     bucket = _get_bucket()
@@ -271,7 +271,7 @@ def _sync_from_gcs_unlocked(uid: str) -> str:
     if not version_blob.exists():
         # User has no persisted vector store in GCS yet; remove any stale local copy
         if os.path.exists(user_dir):
-            release_chroma_client_cache(user_dir)
+            release_client_cache(user_dir)
             shutil.rmtree(user_dir, ignore_errors=True)
         return user_dir
 
@@ -285,9 +285,9 @@ def _sync_from_gcs_unlocked(uid: str) -> str:
     logger.info(
         f"Syncing ChromaDB from GCS for uid='{uid}' (local_version={local_version!r} -> remote_version={remote_version!r})."
     )
-    evict_inactive_tmp_dirs_if_needed(exclude_uid=uid)
+    evict_tmp_cache(exclude_uid=uid)
 
-    root = get_local_chroma_root()
+    root = get_chroma_root()
     os.makedirs(root, exist_ok=True)
     staging_dir = os.path.join(root, f"{uid}.downloading.{uuid.uuid4().hex[:8]}")
 
@@ -309,7 +309,7 @@ def _sync_from_gcs_unlocked(uid: str) -> str:
             blob.download_to_filename(dest_path)
             downloaded_count += 1
 
-        release_chroma_client_cache(user_dir)
+        release_client_cache(user_dir)
         if os.path.exists(user_dir):
             shutil.rmtree(user_dir)
         os.replace(staging_dir, user_dir)
@@ -320,7 +320,7 @@ def _sync_from_gcs_unlocked(uid: str) -> str:
         raise
 
 
-def ensure_user_chroma_synced(uid: str) -> str:
+def sync_user_dir(uid: str) -> str:
     """Ensures the user's local ChromaDB directory matches the latest snapshot in GCS (Read Path).
 
     Returns the user's `persist_directory` path. If the user has not created any collections yet,
@@ -333,7 +333,7 @@ def ensure_user_chroma_synced(uid: str) -> str:
 
 
 @contextlib.contextmanager
-def user_chroma_read_context(uid: str) -> Generator[str, None, None]:
+def user_read_lock(uid: str) -> Generator[str, None, None]:
     """Context manager for read operations that pins the user's `/tmp` cache against LRU eviction."""
     safe_uid = validate_uid(uid)
     user_lock = _get_user_thread_lock(safe_uid)
@@ -410,7 +410,7 @@ def _acquire_gcs_write_lock(bucket: storage.Bucket, uid: str) -> storage.Blob:
                 pass
 
         if time.monotonic() >= deadline:
-            raise ChromaLockTimeoutError(
+            raise LockTimeoutError(
                 f"Timed out waiting {acquire_timeout_seconds:.0f}s for ChromaDB write lock for user '{uid}'."
             )
 
@@ -436,7 +436,7 @@ def _release_gcs_write_lock(lock_blob: Optional[storage.Blob], uid: str) -> None
 
 def _push_user_dir_to_gcs(bucket: storage.Bucket, uid: str, user_dir: str) -> None:
     """Flushes ChromaDB state and uploads the local user directory snapshot + new version.json to GCS."""
-    release_chroma_client_cache(user_dir)
+    release_client_cache(user_dir)
     _checkpoint_sqlite_wal(user_dir)
 
     prefix = _user_chroma_gcs_prefix(uid)
@@ -497,7 +497,7 @@ def _push_user_dir_to_gcs(bucket: storage.Bucket, uid: str, user_dir: str) -> No
 
 
 @contextlib.contextmanager
-def user_chroma_write_lock(uid: str) -> Generator[str, None, None]:
+def user_write_lock(uid: str) -> Generator[str, None, None]:
     """Transactional context manager for mutating a user's ChromaDB (`ingest` / `delete_collection`).
 
     1. Acquires per-user thread lock + distributed GCS lock (`if_generation_match=0` with TTL recovery).
@@ -510,9 +510,9 @@ def user_chroma_write_lock(uid: str) -> Generator[str, None, None]:
     user_thread_lock = _get_user_thread_lock(safe_uid)
 
     with user_thread_lock, _track_active_user(safe_uid):
-        bucket_name = get_gcs_bucket_name()
+        bucket_name = get_bucket_name()
         if not bucket_name:
-            user_dir = get_user_chroma_dir(safe_uid)
+            user_dir = get_user_dir(safe_uid)
             os.makedirs(user_dir, exist_ok=True)
             yield user_dir
             return
@@ -526,12 +526,12 @@ def user_chroma_write_lock(uid: str) -> Generator[str, None, None]:
             _push_user_dir_to_gcs(bucket, safe_uid, user_dir)
         finally:
             _release_gcs_write_lock(lock_blob, safe_uid)
-            evict_inactive_tmp_dirs_if_needed(exclude_uid=safe_uid)
+            evict_tmp_cache(exclude_uid=safe_uid)
 
 
-def archive_user_upload_to_gcs(uid: str, local_file_path: str, original_filename: str) -> Optional[str]:
+def archive_upload(uid: str, local_file_path: str, original_filename: str) -> Optional[str]:
     """Uploads a user's raw PDF to `gs://<bucket>/users/{uid}/uploads/` when GCS is configured."""
-    bucket_name = get_gcs_bucket_name()
+    bucket_name = get_bucket_name()
     if not bucket_name:
         return None
 

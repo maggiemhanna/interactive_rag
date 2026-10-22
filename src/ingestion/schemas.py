@@ -2,7 +2,7 @@ from typing import List, Union
 
 from pydantic import BaseModel, Field
 
-from src.core.config import DEFAULT_COLLECTION_NAME, DEFAULT_EMBEDDING_MODEL
+from src.core.config import DEFAULT_COLLECTION, DEFAULT_EMBEDDING_MODEL
 
 
 class IngestRequest(BaseModel):
@@ -10,7 +10,7 @@ class IngestRequest(BaseModel):
         ..., description="Path or list of paths (or a single path) to PDF files to ingest"
     )
     collection_name: str = Field(
-        default=DEFAULT_COLLECTION_NAME,
+        default=DEFAULT_COLLECTION,
         description="Name of the Chroma vectorstore collection",
     )
     embedding_model: str = Field(
@@ -22,7 +22,7 @@ class IngestRequest(BaseModel):
 class QueryRequest(BaseModel):
     query: str = Field(..., description="Query text to search for in vector store")
     collection_name: str = Field(
-        default=DEFAULT_COLLECTION_NAME,
+        default=DEFAULT_COLLECTION,
         description="Name of the Chroma vectorstore collection",
     )
     k: int = Field(default=5, description="Number of results to retrieve")

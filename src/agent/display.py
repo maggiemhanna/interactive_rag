@@ -14,7 +14,7 @@ warnings.filterwarnings("ignore")
 console = Console()
 
 
-def pretty_print_event(message):
+def print_event(message):
     def print_message_header(label, color):
         box_width = 112
         padding = (box_width - len(label)) // 2
@@ -70,7 +70,7 @@ def pretty_print_event(message):
         console.print(Markdown(message.content))
 
 
-def print_agent_header(label, color):
+def print_header(label, color):
     box_width = 112
     padding = (box_width - len(label)) // 2
     text = f"{' ' * padding}{label}{' ' * (box_width - len(label) - padding)}"

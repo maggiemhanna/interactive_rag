@@ -6,9 +6,9 @@ from src.core.auth import get_allowed_origins, get_current_user
 from src.core.chroma import list_collections, remove_collection
 from src.core.logger import setup_logging
 from src.core.storage import (
-    ChromaLockTimeoutError,
-    user_chroma_read_context,
-    user_chroma_write_lock,
+    LockTimeoutError,
+    user_read_lock,
+    user_write_lock,
 )
 
 logger = setup_logging(name="routes")
@@ -20,7 +20,7 @@ collections_router = APIRouter()
 def get_collections(uid: str = Depends(get_current_user)):
     """Returns a list of existing collection details from Chroma vectorstore."""
     try:
-        with user_chroma_read_context(uid) as persist_directory:
+        with user_read_lock(uid) as persist_directory:
             return list_collections(persist_directory)
     except HTTPException:
         raise
@@ -33,7 +33,7 @@ def get_collections(uid: str = Depends(get_current_user)):
 def delete_collection(collection_name: str, uid: str = Depends(get_current_user)):
     """Deletes an existing collection from Chroma vectorstore."""
     try:
-        with user_chroma_write_lock(uid) as persist_directory:
+        with user_write_lock(uid) as persist_directory:
             remove_collection(persist_directory, collection_name)
             logger.info(
                 f"Successfully deleted Chroma collection '{collection_name}' for uid='{uid}'."
@@ -45,7 +45,7 @@ def delete_collection(collection_name: str, uid: str = Depends(get_current_user)
             }
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    except ChromaLockTimeoutError as e:
+    except LockTimeoutError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except HTTPException:
         raise

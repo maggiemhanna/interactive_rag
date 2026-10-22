@@ -13,10 +13,9 @@ from src.core.config import DEFAULT_LLM_MODEL
 # Module-scoped checkpointer persists multi-turn conversation history across warm requests;
 # every HTTP request namespaces thread_id as f"{uid}:{request.thread_id}".
 MEMORY_SAVER = InMemorySaver()
-_MEMORY_SAVER = MEMORY_SAVER
 
 
-def setup_agent(
+def build_agent(
     retriever_tool,
     model_name: str = DEFAULT_LLM_MODEL,
     checkpointer: Optional[InMemorySaver] = None,

@@ -2,8 +2,8 @@ import re
 
 from langchain_core.tools.retriever import create_retriever_tool
 
-from src.core.chroma import get_vectorstore, verify_collection_exists
-from src.core.config import DEFAULT_COLLECTION_NAME, DEFAULT_EMBEDDING_MODEL
+from src.core.chroma import get_vectorstore, require_collection
+from src.core.config import DEFAULT_COLLECTION, DEFAULT_EMBEDDING_MODEL
 
 
 def safe_tool_name(collection_name: str) -> str:
@@ -15,14 +15,14 @@ def safe_tool_name(collection_name: str) -> str:
 
 
 def get_retriever_tool(
-    collection_name: str = DEFAULT_COLLECTION_NAME,
+    collection_name: str = DEFAULT_COLLECTION,
     persist_directory: str = "chroma_db",
     k: int = 5,
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     description: str = "Search and retrieve relevant document chunks from collection '{collection_name}'.",
 ):
     """Loads a Chroma vectorstore collection and creates a LangChain retriever tool."""
-    verify_collection_exists(persist_directory, collection_name)
+    require_collection(persist_directory, collection_name)
 
     vectorstore = get_vectorstore(
         persist_directory=persist_directory,

@@ -11,10 +11,10 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from src.core.auth import is_cloud_run_environment
-from src.core.config import DEFAULT_COLLECTION_NAME, DEFAULT_EMBEDDING_MODEL
+from src.core.auth import is_cloud_run
+from src.core.config import DEFAULT_COLLECTION, DEFAULT_EMBEDDING_MODEL
 from src.core.logger import setup_logging
-from src.core.storage import archive_user_upload_to_gcs, get_gcs_bucket_name
+from src.core.storage import archive_upload, get_bucket_name
 
 logger = setup_logging(name="ingestion.loader")
 
@@ -22,14 +22,14 @@ _SAFE_UPLOAD_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 
 
 @dataclass
-class PreparedIngestionPayload:
+class IngestPayload:
     chunks: List[Document]
     processed_files: List[str]
     collection_name: str
     embedding_model: str
 
 
-def sanitize_upload_filename(raw_filename: str) -> str:
+def sanitize_filename(raw_filename: str) -> str:
     """Strips path components and enforces a safe .pdf filename."""
     basename = os.path.basename((raw_filename or "").replace("\\", "/")).strip()
     cleaned = _SAFE_UPLOAD_NAME_RE.sub("_", basename).strip("._")
@@ -43,7 +43,7 @@ def sanitize_upload_filename(raw_filename: str) -> str:
     return cleaned
 
 
-def load_and_split_pdfs(
+def split_pdfs(
     pdf_paths: Union[str, List[str]], chunk_size: int = 1000, chunk_overlap: int = 200
 ) -> List[Document]:
     """Loads PDF documents and splits them into text chunks.
@@ -82,11 +82,7 @@ def load_and_split_pdfs(
     return all_chunks
 
 
-# Alias for backward compatibility
-load_and_split_pdf = load_and_split_pdfs
-
-
-def _parse_json_ingestion_body(
+def _parse_json_body(
     body: dict,
     default_collection: str,
     default_embedding: str,
@@ -107,12 +103,12 @@ def _parse_json_ingestion_body(
     return raw_server_paths, collection_name, embedding_model
 
 
-async def prepare_ingestion_payload(request: Request, uid: str) -> PreparedIngestionPayload:
+async def prepare_payload(request: Request, uid: str) -> IngestPayload:
     """Parses JSON or multipart PDF uploads, stages/archives files safely, splits chunks, and cleans /tmp."""
     content_type = request.headers.get("content-type", "")
     raw_server_paths: List[str] = []
     uploaded_files_info: List[Tuple[str, str, Optional[str]]] = []  # (local_path, display_name, gcs_uri)
-    collection_name = DEFAULT_COLLECTION_NAME
+    collection_name = DEFAULT_COLLECTION
     embedding_model = DEFAULT_EMBEDDING_MODEL
 
     upload_tmp_root = os.path.abspath(os.getenv("UPLOAD_TMP_ROOT", "/tmp/uploads"))
@@ -122,7 +118,7 @@ async def prepare_ingestion_payload(request: Request, uid: str) -> PreparedInges
     try:
         if "application/json" in content_type:
             body = await request.json()
-            raw_server_paths, collection_name, embedding_model = _parse_json_ingestion_body(
+            raw_server_paths, collection_name, embedding_model = _parse_json_body(
                 body, collection_name, embedding_model
             )
         elif "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
@@ -130,7 +126,7 @@ async def prepare_ingestion_payload(request: Request, uid: str) -> PreparedInges
                 raw_col = form.get("collection_name", collection_name)
                 if isinstance(raw_col, list):
                     raw_col = raw_col[0]
-                collection_name = str(raw_col).strip() if raw_col else DEFAULT_COLLECTION_NAME
+                collection_name = str(raw_col).strip() if raw_col else DEFAULT_COLLECTION
 
                 raw_embedding = form.get("embedding_model", embedding_model)
                 if isinstance(raw_embedding, list):
@@ -148,14 +144,14 @@ async def prepare_ingestion_payload(request: Request, uid: str) -> PreparedInges
                 if valid_uploads:
                     request_upload_dir = os.path.join(user_upload_dir, uuid.uuid4().hex)
                     os.makedirs(request_upload_dir, exist_ok=True)
-                    should_archive = bool(get_gcs_bucket_name()) and (
+                    should_archive = bool(get_bucket_name()) and (
                         os.getenv("ARCHIVE_UPLOADS_TO_GCS", "true").strip().lower()
                         in {"1", "true", "yes"}
                     )
 
                     used_names = set()
                     for idx, file_item in enumerate(valid_uploads):
-                        safe_name = sanitize_upload_filename(file_item.filename)
+                        safe_name = sanitize_filename(file_item.filename)
                         save_name = f"{idx}_{safe_name}" if safe_name in used_names else safe_name
                         used_names.add(save_name)
 
@@ -170,7 +166,7 @@ async def prepare_ingestion_payload(request: Request, uid: str) -> PreparedInges
                             f.write(content)
 
                         gcs_uri = (
-                            archive_user_upload_to_gcs(uid, save_path, safe_name)
+                            archive_upload(uid, save_path, safe_name)
                             if should_archive
                             else None
                         )
@@ -187,7 +183,7 @@ async def prepare_ingestion_payload(request: Request, uid: str) -> PreparedInges
         else:
             try:
                 body = await request.json()
-                raw_server_paths, collection_name, embedding_model = _parse_json_ingestion_body(
+                raw_server_paths, collection_name, embedding_model = _parse_json_body(
                     body, collection_name, embedding_model
                 )
             except Exception:
@@ -197,7 +193,7 @@ async def prepare_ingestion_payload(request: Request, uid: str) -> PreparedInges
                 )
 
         # Security guard: never allow arbitrary container filesystem reads in Cloud Run
-        if raw_server_paths and is_cloud_run_environment():
+        if raw_server_paths and is_cloud_run():
             logger.warning(
                 f"Blocked server-filesystem pdf_paths ingestion attempt in Cloud Run by uid='{uid}'."
             )
@@ -217,7 +213,7 @@ async def prepare_ingestion_payload(request: Request, uid: str) -> PreparedInges
 
         # 1. Load & split uploaded files (with sanitized source metadata)
         for save_path, display_name, gcs_uri in uploaded_files_info:
-            file_chunks = load_and_split_pdfs([save_path])
+            file_chunks = split_pdfs([save_path])
             for chunk in file_chunks:
                 chunk.metadata["source"] = display_name
                 if gcs_uri:
@@ -227,10 +223,10 @@ async def prepare_ingestion_payload(request: Request, uid: str) -> PreparedInges
 
         # 2. Load & split local server paths (local dev mode only)
         if raw_server_paths:
-            all_chunks.extend(load_and_split_pdfs(raw_server_paths))
+            all_chunks.extend(split_pdfs(raw_server_paths))
             processed_files.extend(raw_server_paths)
 
-        return PreparedIngestionPayload(
+        return IngestPayload(
             chunks=all_chunks,
             processed_files=processed_files,
             collection_name=collection_name,

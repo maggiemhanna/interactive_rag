@@ -4,21 +4,21 @@ from typing import Any, Dict, List
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
-from src.core.chroma import get_vectorstore, verify_collection_exists
-from src.core.config import DEFAULT_COLLECTION_NAME, DEFAULT_EMBEDDING_MODEL
+from src.core.chroma import get_vectorstore, require_collection
+from src.core.config import DEFAULT_COLLECTION, DEFAULT_EMBEDDING_MODEL
 from src.core.logger import setup_logging
-from src.core.storage import user_chroma_read_context, user_chroma_write_lock
+from src.core.storage import user_read_lock, user_write_lock
 
 logger = setup_logging(name="ingestion.service")
 
 
-def add_documents_to_vectorstore(
+def index_documents(
     documents: List[Document],
     persist_directory: str = "chroma_db",
-    collection_name: str = DEFAULT_COLLECTION_NAME,
+    collection_name: str = DEFAULT_COLLECTION,
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
 ) -> Chroma:
-    """Initializes or loads a Chroma vectorstore and adds documents to it.
+    """Initializes or loads a Chroma vectorstore and indexes document chunks into it.
 
     Args:
         documents: List of document chunks to add.
@@ -58,15 +58,15 @@ def add_documents_to_vectorstore(
         raise
 
 
-def ingest_user_documents(
+def ingest_documents(
     uid: str,
     documents: List[Document],
-    collection_name: str = DEFAULT_COLLECTION_NAME,
+    collection_name: str = DEFAULT_COLLECTION,
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
 ) -> None:
     """Mutates the user's isolated ChromaDB inside the GCS distributed write lock."""
-    with user_chroma_write_lock(uid) as persist_directory:
-        vectorstore = add_documents_to_vectorstore(
+    with user_write_lock(uid) as persist_directory:
+        vectorstore = index_documents(
             documents=documents,
             persist_directory=persist_directory,
             collection_name=collection_name,
@@ -75,16 +75,16 @@ def ingest_user_documents(
         del vectorstore
 
 
-def query_user_collection(
+def search_collection(
     uid: str,
     query: str,
-    collection_name: str = DEFAULT_COLLECTION_NAME,
+    collection_name: str = DEFAULT_COLLECTION,
     k: int = 5,
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
 ) -> List[Dict[str, Any]]:
     """Performs similarity search against a user's Chroma vectorstore collection."""
-    with user_chroma_read_context(uid) as persist_directory:
-        verify_collection_exists(persist_directory, collection_name)
+    with user_read_lock(uid) as persist_directory:
+        require_collection(persist_directory, collection_name)
         vectorstore = get_vectorstore(
             persist_directory=persist_directory,
             collection_name=collection_name,

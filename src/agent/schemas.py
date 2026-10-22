@@ -5,7 +5,7 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
 from src.core.config import (
-    DEFAULT_COLLECTION_NAME,
+    DEFAULT_COLLECTION,
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_LLM_MODEL,
 )
@@ -14,7 +14,7 @@ from src.core.config import (
 class AgentRequest(BaseModel):
     query: str = Field(..., description="Query or question for the Agentic RAG assistant")
     collection_name: str = Field(
-        default=DEFAULT_COLLECTION_NAME,
+        default=DEFAULT_COLLECTION,
         description="Name of the Chroma vectorstore collection",
     )
     thread_id: str = Field(default="1", description="LangGraph thread ID for session state")

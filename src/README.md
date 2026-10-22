@@ -46,10 +46,10 @@ This directory contains the unified Python backend packages for **InteractiveRAG
 
 ### Ingestion Pipeline
 ```python
-load_and_split_pdfs(pdf_paths, chunk_size=1000, chunk_overlap=200)
+split_pdfs(pdf_paths, chunk_size=1000, chunk_overlap=200)
     │
     ▼
-add_documents_to_vectorstore(documents, persist_directory="chroma_db", collection_name="stock_market_vs")
+index_documents(documents, persist_directory="chroma_db", collection_name="stock_market_vs")
 ```
 
 - **Chunk Size**: `1000` characters
@@ -193,9 +193,9 @@ curl -X POST "http://localhost:8001/agent/stream" \
 
 #### Example 3: Running in Interactive Python Mode
 ```python
-from src.agent.stream import run_agent_interactive
+from src.agent.stream import run_interactive
 
-run_agent_interactive(
+run_interactive(
     query="How did NVDA perform in 2024?",
     collection_name="stock_market_vs"
 )

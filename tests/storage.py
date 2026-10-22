@@ -14,12 +14,12 @@ from google.api_core import exceptions as gcs_exceptions
 from src.core import storage as chroma_storage
 from src.core.logger import setup_logging
 from src.core.storage import (
-    ChromaLockTimeoutError,
-    ensure_user_chroma_synced,
-    evict_inactive_tmp_dirs_if_needed,
-    release_chroma_client_cache,
-    user_chroma_read_context,
-    user_chroma_write_lock,
+    LockTimeoutError,
+    evict_tmp_cache,
+    release_client_cache,
+    sync_user_dir,
+    user_read_lock,
+    user_write_lock,
 )
 
 logger = setup_logging(name="test_storage")
@@ -141,7 +141,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
             if os.path.exists(root):
                 for entry in os.scandir(root):
                     if entry.is_dir():
-                        release_chroma_client_cache(entry.path)
+                        release_client_cache(entry.path)
                 shutil.rmtree(root, ignore_errors=True)
 
     def _env(self, local_root: str, **overrides) -> Dict[str, str]:
@@ -161,7 +161,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
             os.environ, self._env(self.container1_tmp), clear=False
         ):
             # Alice creates 'stock_market_vs' with 2 documents
-            with user_chroma_write_lock("user_alice") as alice_dir:
+            with user_write_lock("user_alice") as alice_dir:
                 client_a = chromadb.PersistentClient(path=alice_dir)
                 col_a = client_a.get_or_create_collection("stock_market_vs")
                 col_a.add(
@@ -171,7 +171,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
                 )
 
             # Bob creates 'stock_market_vs' with 1 completely different document
-            with user_chroma_write_lock("user_bob") as bob_dir:
+            with user_write_lock("user_bob") as bob_dir:
                 client_b = chromadb.PersistentClient(path=bob_dir)
                 col_b = client_b.get_or_create_collection("stock_market_vs")
                 col_b.add(
@@ -184,9 +184,9 @@ class TestPerUserChromaStorage(unittest.TestCase):
         with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container2_tmp), clear=False
         ):
-            alice_read_dir = ensure_user_chroma_synced("user_alice")
-            bob_read_dir = ensure_user_chroma_synced("user_bob")
-            charlie_read_dir = ensure_user_chroma_synced("user_charlie")
+            alice_read_dir = sync_user_dir("user_alice")
+            bob_read_dir = sync_user_dir("user_bob")
+            charlie_read_dir = sync_user_dir("user_charlie")
 
             self.assertFalse(os.path.exists(charlie_read_dir), "New user should have no DB directory yet")
 
@@ -202,7 +202,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
         with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container1_tmp), clear=False
         ):
-            with user_chroma_write_lock("user_alice") as dir_c1:
+            with user_write_lock("user_alice") as dir_c1:
                 col = chromadb.PersistentClient(path=dir_c1).get_or_create_collection("reports")
                 col.add(ids=["1"], documents=["Doc 1"], embeddings=[[0.1, 0.2, 0.3]])
 
@@ -210,14 +210,14 @@ class TestPerUserChromaStorage(unittest.TestCase):
         with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container2_tmp), clear=False
         ):
-            dir_c2 = ensure_user_chroma_synced("user_alice")
+            dir_c2 = sync_user_dir("user_alice")
             self.assertEqual(chromadb.PersistentClient(path=dir_c2).get_collection("reports").count(), 1)
 
         # Step 3: Container 1 adds a second doc -> bumps version.json in GCS
         with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container1_tmp), clear=False
         ):
-            with user_chroma_write_lock("user_alice") as dir_c1:
+            with user_write_lock("user_alice") as dir_c1:
                 col = chromadb.PersistentClient(path=dir_c1).get_collection("reports")
                 col.add(ids=["2"], documents=["Doc 2"], embeddings=[[0.4, 0.5, 0.6]])
 
@@ -225,7 +225,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
         with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container2_tmp), clear=False
         ):
-            dir_c2_refreshed = ensure_user_chroma_synced("user_alice")
+            dir_c2_refreshed = sync_user_dir("user_alice")
             self.assertEqual(
                 chromadb.PersistentClient(path=dir_c2_refreshed).get_collection("reports").count(),
                 2,
@@ -235,7 +235,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
         with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container1_tmp), clear=False
         ):
-            with user_chroma_write_lock("user_alice") as alice_dir:
+            with user_write_lock("user_alice") as alice_dir:
                 client = chromadb.PersistentClient(path=alice_dir)
                 c1 = client.create_collection("keep_me")
                 c1.add(ids=["1"], documents=["Keep"], embeddings=[[1.0, 0.0, 0.0]])
@@ -244,7 +244,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
 
             blobs_before = [b.name for b in self.fake_bucket.list_blobs("users/user_alice/chroma_db/")]
 
-            with user_chroma_write_lock("user_alice") as alice_dir:
+            with user_write_lock("user_alice") as alice_dir:
                 client = chromadb.PersistentClient(path=alice_dir)
                 client.delete_collection("delete_me")
 
@@ -255,7 +255,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
         with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container2_tmp), clear=False
         ):
-            restored_dir = ensure_user_chroma_synced("user_alice")
+            restored_dir = sync_user_dir("user_alice")
             cols = [c.name for c in chromadb.PersistentClient(path=restored_dir).list_collections()]
             self.assertEqual(cols, ["keep_me"])
 
@@ -277,7 +277,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
             os.environ, self._env(self.container1_tmp), clear=False
         ):
             # Should recover expired lock automatically and release it afterward
-            with user_chroma_write_lock("user_alice") as alice_dir:
+            with user_write_lock("user_alice") as alice_dir:
                 chromadb.PersistentClient(path=alice_dir).create_collection("recovered_col")
 
             self.assertFalse(
@@ -303,8 +303,8 @@ class TestPerUserChromaStorage(unittest.TestCase):
             self._env(self.container1_tmp, CHROMA_LOCK_TIMEOUT_SECONDS="0.4"),
             clear=False,
         ):
-            with self.assertRaises(ChromaLockTimeoutError):
-                with user_chroma_write_lock("user_bob"):
+            with self.assertRaises(LockTimeoutError):
+                with user_write_lock("user_bob"):
                     pass
 
     def test_05_lru_tmp_eviction_preserves_active_users_and_evicts_oldest_inactive(self):
@@ -312,20 +312,20 @@ class TestPerUserChromaStorage(unittest.TestCase):
             os.environ, self._env(self.container1_tmp), clear=False
         ):
             for uid in ("u_oldest", "u_middle", "u_newest"):
-                with user_chroma_write_lock(uid) as udir:
+                with user_write_lock(uid) as udir:
                     col = chromadb.PersistentClient(path=udir).create_collection("notes")
                     col.add(ids=["1"], documents=[f"Data for {uid}"], embeddings=[[0.2, 0.3, 0.5]])
                 time.sleep(0.02)
 
             # Pin `u_oldest` as actively reading so LRU must skip `u_oldest` and evict `u_middle` first!
-            with user_chroma_read_context("u_oldest"):
+            with user_read_lock("u_oldest"):
                 with patch.dict(os.environ, {"CHROMA_TMP_MAX_BYTES": "1"}, clear=False):
-                    evicted_while_pinned = evict_inactive_tmp_dirs_if_needed(exclude_uid="u_newest")
+                    evicted_while_pinned = evict_tmp_cache(exclude_uid="u_newest")
                     self.assertNotIn("u_oldest", evicted_while_pinned)
                     self.assertIn("u_middle", evicted_while_pinned)
 
             # Evicted `u_middle` still restores cleanly from GCS whenever requested again
-            restored_middle = ensure_user_chroma_synced("u_middle")
+            restored_middle = sync_user_dir("u_middle")
             self.assertEqual(
                 chromadb.PersistentClient(path=restored_middle).get_collection("notes").count(),
                 1,
