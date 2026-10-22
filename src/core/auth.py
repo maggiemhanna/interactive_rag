@@ -8,7 +8,7 @@ from fastapi import Depends, Header, HTTPException, status
 from firebase_admin import auth as firebase_auth
 from pydantic import BaseModel
 
-from utils.logging import setup_logging
+from src.core.logger import setup_logging
 
 logger = setup_logging(name="auth")
 

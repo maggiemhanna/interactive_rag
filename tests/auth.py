@@ -7,13 +7,13 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from firebase_admin import auth as firebase_auth
 
-from utils.auth import (
+from src.core.auth import (
     AuthenticatedUser,
     get_current_user,
     get_current_user_info,
     verify_bearer_token,
 )
-from utils.logging import setup_logging
+from src.core.logger import setup_logging
 
 load_dotenv(find_dotenv())
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -73,7 +73,7 @@ class TestBackendAuthModule(unittest.TestCase):
             "name": "Alice",
         }
         with patch.dict(os.environ, self.base_env, clear=False), patch(
-            "utils.auth.firebase_auth.verify_id_token", return_value=mock_claims
+            "src.core.auth.firebase_auth.verify_id_token", return_value=mock_claims
         ) as mock_verify:
             resp = self.client.get("/me", headers={"Authorization": "Bearer valid.jwt.token"})
             self.assertEqual(resp.status_code, 200)
@@ -85,7 +85,7 @@ class TestBackendAuthModule(unittest.TestCase):
 
     def test_05_expired_token_returns_401(self):
         with patch.dict(os.environ, self.base_env, clear=False), patch(
-            "utils.auth.firebase_auth.verify_id_token",
+            "src.core.auth.firebase_auth.verify_id_token",
             side_effect=firebase_auth.ExpiredIdTokenError("Token expired", cause=None),
         ):
             resp = self.client.get("/whoami", headers={"Authorization": "Bearer expired.jwt.token"})
@@ -104,7 +104,7 @@ class TestBackendAuthModule(unittest.TestCase):
         ]
         for bad_uid in unsafe_uids:
             with patch.dict(os.environ, self.base_env, clear=False), patch(
-                "utils.auth.firebase_auth.verify_id_token", return_value={"uid": bad_uid}
+                "src.core.auth.firebase_auth.verify_id_token", return_value={"uid": bad_uid}
             ):
                 resp = self.client.get("/whoami", headers={"Authorization": "Bearer token"})
                 self.assertEqual(resp.status_code, 401, f"Unsafe uid {bad_uid!r} should fail")

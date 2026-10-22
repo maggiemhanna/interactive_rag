@@ -11,8 +11,9 @@ from unittest.mock import patch
 import chromadb
 from google.api_core import exceptions as gcs_exceptions
 
-from utils import chroma_storage
-from utils.chroma_storage import (
+from src.core import storage as chroma_storage
+from src.core.logger import setup_logging
+from src.core.storage import (
     ChromaLockTimeoutError,
     ensure_user_chroma_synced,
     evict_inactive_tmp_dirs_if_needed,
@@ -20,9 +21,8 @@ from utils.chroma_storage import (
     user_chroma_read_context,
     user_chroma_write_lock,
 )
-from utils.logging import setup_logging
 
-logger = setup_logging(name="test_chroma_storage")
+logger = setup_logging(name="test_storage")
 
 
 class FakeGCSBlob:

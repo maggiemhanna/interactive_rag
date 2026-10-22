@@ -1,13 +1,13 @@
 # Copyright (c) 2024 Maggie Mhanna
 # All rights reserved.
 
-import logging
-import coloredlogs
-
-import sys
 import json
-from typing import Optional, Any
+import logging
+import sys
 from copy import deepcopy
+from typing import Any, Optional
+
+import coloredlogs
 
 # Define the constants for the log format
 # We use the same format string as before, coloredlogs handles the coloring automatically.
@@ -19,7 +19,8 @@ LOG_FORMAT = (
     "- %(message)s"              # The actual log message
 )
 
-DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
 
 def setup_logging(level=logging.INFO, name: Optional[str] = None) -> logging.Logger:
     """
@@ -27,18 +28,18 @@ def setup_logging(level=logging.INFO, name: Optional[str] = None) -> logging.Log
     """
     # Define custom styles for standard levels
     custom_level_styles = deepcopy(coloredlogs.DEFAULT_LEVEL_STYLES)
-    custom_level_styles['error'] = {'color': 'red'}
-    custom_level_styles['info'] = {'color': 'green', 'bold': True}
-    custom_level_styles['warning'] = {'color': 'yellow'}
+    custom_level_styles["error"] = {"color": "red"}
+    custom_level_styles["info"] = {"color": "green", "bold": True}
+    custom_level_styles["warning"] = {"color": "yellow"}
 
     # Define custom styles for fields
     custom_field_styles = deepcopy(coloredlogs.DEFAULT_FIELD_STYLES)
-    custom_field_styles['filename'] = {'color': 'cyan', 'bold': True}
-    custom_field_styles['funcName'] = {'color': 'white', 'bold': True}    
-    custom_field_styles['lineno'] = {'color': 'cyan', 'bold':  True} # e.g., make lineno cyan
-    
+    custom_field_styles["filename"] = {"color": "cyan", "bold": True}
+    custom_field_styles["funcName"] = {"color": "white", "bold": True}
+    custom_field_styles["lineno"] = {"color": "cyan", "bold": True}  # e.g., make lineno cyan
+
     root_logger = logging.getLogger()
-    
+
     if not root_logger.handlers:
         coloredlogs.install(
             level=level,
@@ -47,14 +48,15 @@ def setup_logging(level=logging.INFO, name: Optional[str] = None) -> logging.Log
             logger=root_logger,  # Ensure it configures the root logger,
             level_styles=custom_level_styles,
             field_styles=custom_field_styles,
-            stream=sys.stdout
+            stream=sys.stdout,
         )
-    
+
     # 2. Retrieve the specific logger instance
     logger = logging.getLogger(name)
-    logger.setLevel(level) # Ensure the retrieved logger uses the specified level
-    
+    logger.setLevel(level)  # Ensure the retrieved logger uses the specified level
+
     return logger
+
 
 def format_dict_for_logs(state_dict: Any, max_len: int = 100) -> str:
     """
@@ -68,14 +70,14 @@ def format_dict_for_logs(state_dict: Any, max_len: int = 100) -> str:
     def truncate_recursive(data):
         if isinstance(data, dict):
             return {k: truncate_recursive(v) for k, v in data.items()}
-        
+
         elif isinstance(data, list):
             return [truncate_recursive(item) for item in data]
-        
+
         elif isinstance(data, str) and len(data) > max_len:
             # 3. Perform truncation
             return data[:max_len] + f" ... (TRUNCATED, length {len(data)})"
-        
+
         else:
             # 4. Return other types (int, float, bool, None) as is
             return data

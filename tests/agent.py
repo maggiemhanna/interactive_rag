@@ -3,10 +3,10 @@ import json
 import requests
 
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
-from utils.logging import setup_logging
-from utils.messages_pretty_print import pretty_print_event
+from src.agent.display import pretty_print_event
+from src.core.logger import setup_logging
 
-logger = setup_logging(name="test_agentic_rag")
+logger = setup_logging(name="test_agent")
 
 
 def dict_to_message(msg_dict: dict):
@@ -96,13 +96,13 @@ def test_streaming_endpoint(url: str):
 
 if __name__ == "__main__":
     port = os.getenv("PORT", "8001")
-    url = f"http://localhost:{port}/agentic_rag"
+    url = f"http://localhost:{port}/agent"
 
     try:
         test_standard_endpoint(url)
         print("\n" + "=" * 80 + "\n")
         test_streaming_endpoint(url)
     except Exception as e:
-        logger.error(f"Error testing agentic_rag endpoint: {e}")
+        logger.error(f"Error testing agent endpoint: {e}")
         if hasattr(e, "response") and e.response is not None:
             logger.error(f"Error response details: {e.response.text}")

@@ -14,10 +14,10 @@ from typing import Any, Dict, Generator, List, Optional
 from google.api_core import exceptions as gcs_exceptions
 from google.cloud import storage
 
-from utils.auth import is_cloud_run_environment, validate_uid
-from utils.logging import setup_logging
+from src.core.auth import is_cloud_run_environment, validate_uid
+from src.core.logger import setup_logging
 
-logger = setup_logging(name="chroma_storage")
+logger = setup_logging(name="storage")
 
 VERSION_FILENAME = "version.json"
 SQLITE_FILENAME = "chroma.sqlite3"
@@ -498,7 +498,7 @@ def _push_user_dir_to_gcs(bucket: storage.Bucket, uid: str, user_dir: str) -> No
 
 @contextlib.contextmanager
 def user_chroma_write_lock(uid: str) -> Generator[str, None, None]:
-    """Transactional context manager for mutating a user's ChromaDB (`add_documents` / `delete_collection`).
+    """Transactional context manager for mutating a user's ChromaDB (`ingest` / `delete_collection`).
 
     1. Acquires per-user thread lock + distributed GCS lock (`if_generation_match=0` with TTL recovery).
     2. Pulls latest user snapshot from GCS into `/tmp/chroma_db/{uid}`.

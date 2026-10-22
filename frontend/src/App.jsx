@@ -471,7 +471,7 @@ export default function App() {
         formData.append('pdf_paths', pdfPaths.trim());
       }
 
-      const response = await authFetch(`${API_BASE}/add_documents`, {
+      const response = await authFetch(`${API_BASE}/ingest`, {
         method: 'POST',
         body: formData,
       });
@@ -591,7 +591,7 @@ export default function App() {
     setAgentLoading(true);
 
     try {
-      let agentUrl = `${AGENT_API_BASE}/agentic_rag`;
+      let agentUrl = `${AGENT_API_BASE}/agent`;
       let response;
       const requestBody = JSON.stringify({
         query: agentQuery.trim(),
@@ -607,7 +607,7 @@ export default function App() {
           body: requestBody,
         });
       } catch (err) {
-        agentUrl = `${API_BASE}/agentic_rag`;
+        agentUrl = `${API_BASE}/agent`;
         response = await authFetch(agentUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

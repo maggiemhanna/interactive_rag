@@ -12,7 +12,7 @@ resource "google_compute_network" "main" {
   ]
 }
 
-# Room 1: Dedicated Direct VPC Egress subnet for Document Ingestion API (src/add_documents.py)
+# Room 1: Dedicated Direct VPC Egress subnet for Document Ingestion API (src/ingestion/app.py)
 resource "google_compute_subnetwork" "ingestion" {
   name                     = "${var.app_name}-ingestion-subnet-${var.environment}"
   project                  = var.project_id
@@ -23,7 +23,7 @@ resource "google_compute_subnetwork" "ingestion" {
   description              = "Isolated Direct VPC Egress subnet for ingestion-api Cloud Run service."
 }
 
-# Room 2: Dedicated Direct VPC Egress subnet for Agentic RAG API (src/agentic_rag.py)
+# Room 2: Dedicated Direct VPC Egress subnet for Agentic RAG API (src/agent/app.py)
 resource "google_compute_subnetwork" "agent" {
   name                     = "${var.app_name}-agent-subnet-${var.environment}"
   project                  = var.project_id

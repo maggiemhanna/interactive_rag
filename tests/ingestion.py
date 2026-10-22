@@ -5,15 +5,15 @@ import os
 from langchain_chroma import Chroma
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-from utils.logging import setup_logging
+from src.core.logger import setup_logging
 
 load_dotenv(find_dotenv())
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-logger = setup_logging(name="test_add_documents")
+logger = setup_logging(name="test_ingestion")
 
 if __name__ == "__main__":
-    url = "http://localhost:8000/add_documents"
+    url = "http://localhost:8000/ingest"
     payload = {
         "pdf_paths": [
             "./data/Stock_Market_Performance_2024.pdf",

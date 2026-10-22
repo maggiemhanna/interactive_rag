@@ -10,12 +10,14 @@ from fastapi.testclient import TestClient
 from langchain_core.embeddings import Embeddings
 from langchain_core.messages import AIMessage
 
-from src import add_documents as ingestion_module
-from src import agentic_rag as agent_module
-from tests.chroma_storage import FakeGCSBucket
-from utils import chroma_storage
-from utils.chroma_storage import release_chroma_client_cache
-from utils.logging import setup_logging
+from src.agent import app as agent_module
+from src.agent import graph as agent_graph_module
+from src.core import chroma as chroma_module
+from src.core import storage as chroma_storage
+from src.core.logger import setup_logging
+from src.core.storage import release_chroma_client_cache
+from src.ingestion import app as ingestion_module
+from tests.storage import FakeGCSBucket
 
 logger = setup_logging(name="test_multi_tenant_api")
 
@@ -112,7 +114,7 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
         self.agent_tmp = tempfile.mkdtemp(prefix="agent_chroma_")
         self.uploads_tmp = tempfile.mkdtemp(prefix="uploads_tmp_")
         self.fake_bucket = FakeGCSBucket("interactive-rag-mt-bucket")
-        agent_module._MEMORY_SAVER.storage.clear()
+        agent_graph_module.MEMORY_SAVER.storage.clear()
 
         self.ingestion_client = TestClient(ingestion_module.app)
         self.agent_client = TestClient(agent_module.app)
@@ -151,23 +153,23 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
             # Every protected endpoint rejects unauthenticated requests with 401
             self.assertEqual(self.ingestion_client.get("/collections").status_code, 401)
             self.assertEqual(self.ingestion_client.delete("/collections/secret").status_code, 401)
-            self.assertEqual(self.ingestion_client.post("/add_documents", json={"pdf_paths": ["a.pdf"]}).status_code, 401)
+            self.assertEqual(self.ingestion_client.post("/ingest", json={"pdf_paths": ["a.pdf"]}).status_code, 401)
             self.assertEqual(self.ingestion_client.post("/query", json={"query": "hi"}).status_code, 401)
 
             self.assertEqual(self.agent_client.get("/collections").status_code, 401)
             self.assertEqual(self.agent_client.delete("/collections/secret").status_code, 401)
-            self.assertEqual(self.agent_client.post("/agentic_rag", json={"query": "hi"}).status_code, 401)
-            self.assertEqual(self.agent_client.post("/agentic_rag/stream", json={"query": "hi"}).status_code, 401)
+            self.assertEqual(self.agent_client.post("/agent", json={"query": "hi"}).status_code, 401)
+            self.assertEqual(self.agent_client.post("/agent/stream", json={"query": "hi"}).status_code, 401)
 
     def test_02_cloud_run_blocks_arbitrary_server_pdf_paths(self):
-        with patch("utils.auth.verify_bearer_token", side_effect=fake_verify_bearer_token), patch.object(
+        with patch("src.core.auth.verify_bearer_token", side_effect=fake_verify_bearer_token), patch.object(
             chroma_storage, "_get_bucket", return_value=self.fake_bucket
         ), patch.dict(os.environ, self._base_env(self.ingestion_tmp), clear=False):
             headers = {"Authorization": "Bearer token-alice"}
 
             # JSON pdf_paths attempt in Cloud Run -> 403 Forbidden
             res_json = self.ingestion_client.post(
-                "/add_documents",
+                "/ingest",
                 headers=headers,
                 json={"pdf_paths": ["/etc/passwd"], "collection_name": "hack"},
             )
@@ -175,7 +177,7 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
 
             # Multipart form pdf_paths attempt in Cloud Run -> 403 Forbidden
             res_form = self.ingestion_client.post(
-                "/add_documents",
+                "/ingest",
                 headers=headers,
                 data={"pdf_paths": "./data/Stock_Market_Performance_2024.pdf", "collection_name": "hack"},
             )
@@ -185,20 +187,18 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
         alice_headers = {"Authorization": "Bearer token-alice"}
         bob_headers = {"Authorization": "Bearer token-bob"}
 
-        with patch("utils.auth.verify_bearer_token", side_effect=fake_verify_bearer_token), patch.object(
+        with patch("src.core.auth.verify_bearer_token", side_effect=fake_verify_bearer_token), patch.object(
             chroma_storage, "_get_bucket", return_value=self.fake_bucket
         ), patch.object(
-            ingestion_module, "GoogleGenerativeAIEmbeddings", return_value=DeterministicFakeEmbeddings()
+            chroma_module, "GoogleGenerativeAIEmbeddings", return_value=DeterministicFakeEmbeddings()
         ), patch.object(
-            agent_module, "GoogleGenerativeAIEmbeddings", return_value=DeterministicFakeEmbeddings()
-        ), patch.object(
-            agent_module, "ChatGoogleGenerativeAI", side_effect=FakeToolCallingChatModel
+            agent_graph_module, "ChatGoogleGenerativeAI", side_effect=FakeToolCallingChatModel
         ):
             # 1. Alice uploads a confidential PDF on Container 1 (ingestion-api)
             with patch.dict(os.environ, self._base_env(self.ingestion_tmp), clear=False):
                 alice_pdf = make_test_pdf("Alice confidential acquisition target is Project Helios.")
                 res_ingest = self.ingestion_client.post(
-                    "/add_documents",
+                    "/ingest",
                     headers=alice_headers,
                     data={"collection_name": "confidential_a"},
                     files=[("files", ("../../alice_secret.pdf", alice_pdf, "application/pdf"))],
@@ -240,7 +240,7 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
                 # Bob uploads his own collection so Bob DOES have a Chroma SQLite DB
                 bob_pdf = make_test_pdf("Bob public travel itinerary for Rome.")
                 res_bob_ingest = self.ingestion_client.post(
-                    "/add_documents",
+                    "/ingest",
                     headers=bob_headers,
                     data={"collection_name": "bob_notes"},
                     files=[("files", ("bob_notes.pdf", bob_pdf, "application/pdf"))],
@@ -268,7 +268,7 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
                 # Bob gets 404 on both standard and SSE streaming agent calls against Alice's collection
                 self.assertEqual(
                     self.agent_client.post(
-                        "/agentic_rag",
+                        "/agent",
                         headers=bob_headers,
                         json={"query": "What is Project Helios?", "collection_name": "confidential_a", "stream": False},
                     ).status_code,
@@ -276,7 +276,7 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
                 )
                 self.assertEqual(
                     self.agent_client.post(
-                        "/agentic_rag",
+                        "/agent",
                         headers=bob_headers,
                         json={"query": "What is Project Helios?", "collection_name": "confidential_a", "stream": True},
                     ).status_code,
@@ -285,7 +285,7 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
 
                 # Alice queries agent-api using SSE streaming -> syncs from GCS and streams grounded answer!
                 res_sse = self.agent_client.post(
-                    "/agentic_rag",
+                    "/agent",
                     headers=alice_headers,
                     json={
                         "query": "What is Alice confidential target?",
@@ -307,7 +307,7 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
                 # Bob uses the EXACT same client `thread_id="shared-thread"` on his own collection ->
                 # verify LangGraph checkpointer namespaces keys as `user_alice:shared-thread` vs `user_bob:shared-thread`!
                 res_bob_agent = self.agent_client.post(
-                    "/agentic_rag",
+                    "/agent",
                     headers=bob_headers,
                     json={
                         "query": "Where is Bob traveling?",
@@ -321,7 +321,7 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
                 self.assertIn("Rome", bob_answer)
                 self.assertNotIn("Helios", bob_answer)
 
-                checkpoint_threads = set(agent_module._MEMORY_SAVER.storage.keys())
+                checkpoint_threads = set(agent_graph_module.MEMORY_SAVER.storage.keys())
                 self.assertIn("user_alice:shared-thread", checkpoint_threads)
                 self.assertIn("user_bob:shared-thread", checkpoint_threads)
                 self.assertNotIn("shared-thread", checkpoint_threads)

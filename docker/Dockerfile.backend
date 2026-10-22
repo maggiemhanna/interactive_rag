@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=8080 \
     LOCAL_CHROMA_ROOT=/tmp/chroma_db \
-    APP_MODULE=src.add_documents:app
+    APP_MODULE=src.ingestion.app:app
 
 WORKDIR /app
 
@@ -21,8 +21,7 @@ COPY requirements.txt ./
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
-# Copy backend source code and shared utilities
-COPY utils/ ./utils/
+# Copy backend source package (core, ingestion, agent)
 COPY src/ ./src/
 
 # Run as non-root user; /tmp remains world-writable (1777) for Cloud Run tmpfs
@@ -33,5 +32,5 @@ USER appuser
 
 EXPOSE 8080
 
-# Override APP_MODULE=src.agentic_rag:app for the Agentic RAG Cloud Run service
+# Override APP_MODULE=src.agent.app:app for the Agentic RAG Cloud Run service
 CMD ["sh", "-c", "exec uvicorn ${APP_MODULE} --host 0.0.0.0 --port ${PORT:-8080}"]

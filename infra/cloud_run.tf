@@ -16,7 +16,7 @@ locals {
   frontend_image = "${local.artifact_registry_url}/frontend:${var.image_tag}"
 }
 
-# 1. Document Ingestion & Collection Management Service (src/add_documents.py)
+# 1. Document Ingestion & Collection Management Service (src/ingestion/app.py)
 resource "google_cloud_run_v2_service" "ingestion_api" {
   name                 = local.ingestion_service_name
   location             = var.region
@@ -61,7 +61,7 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
 
       env {
         name  = "APP_MODULE"
-        value = "src.add_documents:app"
+        value = "src.ingestion.app:app"
       }
       env {
         name  = "GOOGLE_CLOUD_PROJECT"
@@ -100,7 +100,7 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
   ]
 }
 
-# 2. LangGraph Agentic RAG & SSE Streaming Service (src/agentic_rag.py)
+# 2. LangGraph Agentic RAG & SSE Streaming Service (src/agent/app.py)
 resource "google_cloud_run_v2_service" "agent_api" {
   name                 = local.agent_service_name
   location             = var.region
@@ -146,7 +146,7 @@ resource "google_cloud_run_v2_service" "agent_api" {
 
       env {
         name  = "APP_MODULE"
-        value = "src.agentic_rag:app"
+        value = "src.agent.app:app"
       }
       env {
         name  = "GOOGLE_CLOUD_PROJECT"

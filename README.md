@@ -1,8 +1,8 @@
 # InteractiveRAG
 
-**InteractiveRAG** is designed for multi-domain document intelligence, allowing users to organize different sets of PDF documents into isolated, dedicated Chroma vector store collections rather than pooling everything into a single shared index. Through either the React dashboard or the API endpoint (`POST /add_documents`), users can create a new collection simply by supplying a custom collection name along with their PDF files (e.g., separate collections for market analysis vs. annual reports). The backend parses the files,  computes dense embeddings using, and indexes the chunks directly into the designated collection. Users can also monitor all active collections and chunk counts or completely remove obsolete collections.
+**InteractiveRAG** is designed for multi-domain document intelligence, allowing users to organize different sets of PDF documents into isolated, dedicated Chroma vector store collections rather than pooling everything into a single shared index. Through either the React dashboard or the API endpoint (`POST /ingest`), users can create a new collection simply by supplying a custom collection name along with their PDF files (e.g., separate collections for market analysis vs. annual reports). The backend parses the files,  computes dense embeddings using, and indexes the chunks directly into the designated collection. Users can also monitor all active collections and chunk counts or completely remove obsolete collections.
 
-When it comes to querying, users can select a specific collection to keep retrieval strictly scoped to that exact document set, avoiding cross-domain noise. Users can perform direct top-$k$ semantic similarity searches on an indexed collection through (`POST /query`) to inspect raw matching text passages and metadata. Alternatively, users can interact with the LangGraph conversational assistant via (`POST /agentic_rag`), where we dynamically configure an autonomous retrieval tool bound exclusively to the target collection, enabling the Gemini agent to search, inspect relevant context chunks, and synthesize grounded answers in real time.
+When it comes to querying, users can select a specific collection to keep retrieval strictly scoped to that exact document set, avoiding cross-domain noise. Users can perform direct top-$k$ semantic similarity searches on an indexed collection through (`POST /query`) to inspect raw matching text passages and metadata. Alternatively, users can interact with the LangGraph conversational assistant via (`POST /agent`), where we dynamically configure an autonomous retrieval tool bound exclusively to the target collection, enabling the Gemini agent to search, inspect relevant context chunks, and synthesize grounded answers in real time.
 
 **InteractiveRAG** is an interactive, full-stack Agentic Retrieval-Augmented Generation (RAG) platform. It pairs a **LangGraph**-driven reasoning agent powered by **Google Cloud Vertex AI** (`gemini-2.5-flash` & `gemini-embedding-001`) and **ChromaDB** with a modern **React** web dashboard.
 
@@ -12,22 +12,23 @@ When it comes to querying, users can select a specific collection to keep retrie
 
 ```
 InteractiveRAG/
-├── src/                        # Backend service endpoints and core logic
-│   ├── add_documents.py        # Document ingestion, PDF splitting, embedding & ChromaDB API (Port 8000)
-│   ├── agentic_rag.py          # LangGraph agent workflow & streaming API (Port 8001)
+├── src/                        # Unified Python backend packages
+│   ├── core/                   # Shared auth, config, logger, GCS storage, Chroma & routes
+│   ├── ingestion/              # Document Ingestion & Vector Search API (Port 8000)
+│   ├── agent/                  # LangGraph Agentic RAG & SSE Streaming API (Port 8001)
 │   └── README.md               # Detailed technical documentation for /src
 ├── frontend/                   # React + Vite web user interface (Port 3000)
 │   ├── src/                    # UI components (App.jsx, index.css)
 │   └── package.json            # Frontend scripts and dependencies
-├── tests/                      # Integration and endpoint test scripts
-│   ├── add_documents.py        # Tests document ingestion and Chroma retrieval
-│   └── agentic_rag.py          # Tests standard and streaming (SSE) agent endpoints
-├── utils/                      # Helper modules
-│   ├── logging.py              # Colored log formatting configuration
-│   └── messages_pretty_print.py# Rich console rendering for agent events
-├── data/                       # Local data storage
-│   ├── uploads/                # Directory where uploaded PDFs are stored
-│   └── *.pdf                   # Sample financial and market report PDFs
+├── infra/                      # Terraform GCP Cloud Run, VPC, Load Balancer & IAM configs
+├── docker/                     # Backend & Frontend container definitions
+├── tests/                      # Unit, multi-tenant, and endpoint test suites
+│   ├── auth.py                 # Firebase JWT & local auth bypass unit tests
+│   ├── storage.py              # Per-user GCS sync & distributed lock unit tests
+│   ├── multi_tenant_api.py     # End-to-end multi-tenant API isolation tests
+│   ├── ingestion.py            # Live ingestion & Chroma retrieval smoke test
+│   └── agent.py                # Live standard & SSE agent endpoint smoke test
+├── data/                       # Local data storage & sample PDFs
 ├── chroma_db/                  # Local persistent Chroma vector store database
 ├── requirements.txt            # Python dependencies
 └── README.md                   # Project documentation
@@ -35,11 +36,11 @@ InteractiveRAG/
 
 ### Component Summary
 
-- **`src/add_documents.py` (Port 8000)**: FastAPI service that loads PDFs, chunks text using `RecursiveCharacterTextSplitter`, computes embeddings with `GoogleGenerativeAIEmbeddings` (`gemini-embedding-001`), and indexes them in `ChromaDB` into specified collections. Also provides collection management (`GET /collections`, `DELETE /collections/{name}`) and direct similarity search (`POST /query`).
-- **`src/agentic_rag.py` (Port 8001)**: FastAPI service running a LangGraph `StateGraph` agent with `ChatGoogleGenerativeAI` (`gemini-2.5-flash`). Dynamically binds a Chroma retriever tool, handles multi-turn conversation state with `InMemorySaver`, and streams responses over Server-Sent Events (SSE).
+- **`src/ingestion/` (Port 8000)**: FastAPI service (`app.py`, `loader.py`, `service.py`, `schemas.py`) that loads PDFs, chunks text using `RecursiveCharacterTextSplitter`, computes embeddings with `GoogleGenerativeAIEmbeddings` (`gemini-embedding-001`), and indexes them in `ChromaDB` into specified collections. Also provides collection management (`GET /collections`, `DELETE /collections/{name}`) and direct similarity search (`POST /query`).
+- **`src/agent/` (Port 8001)**: FastAPI service (`app.py`, `graph.py`, `tools.py`, `stream.py`, `display.py`, `schemas.py`) running a LangGraph `StateGraph` agent with `ChatGoogleGenerativeAI` (`gemini-2.5-flash`). Dynamically binds a Chroma retriever tool, handles multi-turn conversation state with `InMemorySaver`, and streams responses over Server-Sent Events (SSE).
+- **`src/core/`**: Shared backend modules (`config.py`, `auth.py`, `logger.py`, `storage.py`, `chroma.py`, `routes.py`) providing Firebase JWT verification, per-user GCS ↔ ChromaDB synchronization, Vertex AI embeddings, and deduplicated FastAPI setup.
 - **`frontend/` (Port 3000)**: React dashboard that allows users to upload PDF documents, manage vector store collections, perform semantic search, and chat interactively with the LangGraph agent in real time.
-- **`tests/`**: Integration test scripts to validate backend endpoints and retrieval performance.
-- **`utils/`**: Shared logging and rich terminal message visualizer.
+- **`tests/`**: Offline `unittest` suites (`auth.py`, `storage.py`, `multi_tenant_api.py`) and live endpoint smoke scripts (`ingestion.py`, `agent.py`).
 
 ---
 
@@ -55,7 +56,7 @@ gcloud auth application-default login
 export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
 ```
 
-Configure your `.env` file in the project root or `src/.env` and test/.env:
+Configure your `.env` file in the project root or `src/.env` and `tests/.env`:
 ```bash
 GOOGLE_CLOUD_PROJECT="interactive-rag"
 GOOGLE_CLOUD_LOCATION="us-central1"  # Optional, defaults to us-central1
@@ -86,12 +87,12 @@ To run the full stack, start each service in a separate terminal:
 
 ### Step 1: Start Document Ingestion API (Port 8000)
 ```bash
-python -m src.add_documents
+python -m src.ingestion
 ```
 
 ### Step 2: Start Agentic RAG API (Port 8001)
 ```bash
-python -m src.agentic_rag
+python -m src.agent
 ```
 
 ### Step 3: Start the Frontend UI (Port 3000)
@@ -105,20 +106,25 @@ Open **http://localhost:3000** in your browser.
 
 ## 🧪 How to Test the Application
 
-### 1. Automated Test Scripts
+### 1. Offline Unit & Multi-Tenant Isolation Tests
+```bash
+python -m unittest tests.auth tests.storage tests.multi_tenant_api -v
+```
 
-Ensure both backend services are running on ports 8000 and 8001 before executing the tests.
+### 2. Live Endpoint Test Scripts
+
+Ensure both backend services are running on ports 8000 and 8001 before executing the live smoke tests.
 
 #### A. Test Document Ingestion & Vector Retrieval
 Runs ingestion of sample PDFs into ChromaDB and verifies similarity search:
 ```bash
-python -m tests.add_documents
+python -m tests.ingestion
 ```
 
 #### B. Test Agentic RAG (Standard + SSE Streaming)
 Tests the LangGraph agent endpoint in both standard JSON mode and real-time Server-Sent Events (SSE) streaming mode with rich console output:
 ```bash
-python -m tests.agentic_rag
+python -m tests.agent
 ```
 
 ---
@@ -127,7 +133,7 @@ python -m tests.agentic_rag
 
 #### Ingest a PDF Document:
 ```bash
-curl -X POST "http://localhost:8000/add_documents" \
+curl -X POST "http://localhost:8000/ingest" \
   -H "Content-Type: application/json" \
   -d '{
     "pdf_paths": ["./data/Stock_Market_Performance_2024.pdf"],
@@ -148,7 +154,7 @@ curl -X POST "http://localhost:8000/query" \
 
 #### Query the Agentic RAG Assistant:
 ```bash
-curl -X POST "http://localhost:8001/agentic_rag" \
+curl -X POST "http://localhost:8001/agent" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "What is ARM Holdings and what was its financial performance in 2024?",
