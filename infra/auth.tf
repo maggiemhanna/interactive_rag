@@ -23,6 +23,7 @@ resource "google_identity_platform_config" "auth" {
       "${var.project_id}.firebaseapp.com",
       "${var.project_id}.web.app",
       local.frontend_deterministic_domain,
+      local.lb_domain,
     ],
     [
       for origin in var.extra_allowed_origins :

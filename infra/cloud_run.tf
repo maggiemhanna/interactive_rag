@@ -9,7 +9,7 @@ locals {
 
   allowed_origins_csv = join(
     ",",
-    distinct(concat([local.frontend_deterministic_url], var.extra_allowed_origins))
+    distinct(concat([local.lb_url, local.frontend_deterministic_url], var.extra_allowed_origins))
   )
 
   backend_image  = "${local.artifact_registry_url}/backend:${var.image_tag}"
@@ -21,7 +21,7 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
   name                 = local.ingestion_service_name
   location             = var.region
   project              = var.project_id
-  ingress              = "INGRESS_TRAFFIC_ALL"
+  ingress              = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
   invoker_iam_disabled = true
   deletion_protection  = false
 
@@ -29,6 +29,14 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
     service_account       = google_service_account.backend_sa.email
     execution_environment = "EXECUTION_ENVIRONMENT_GEN2"
     timeout               = "300s"
+
+    vpc_access {
+      egress = "ALL_TRAFFIC"
+      network_interfaces {
+        network    = google_compute_network.main.name
+        subnetwork = google_compute_subnetwork.ingestion.name
+      }
+    }
 
     scaling {
       min_instance_count = var.min_instance_count
@@ -75,6 +83,10 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
         name  = "ALLOWED_ORIGINS"
         value = local.allowed_origins_csv
       }
+      env {
+        name  = "ANONYMIZED_TELEMETRY"
+        value = "FALSE"
+      }
     }
   }
 
@@ -82,6 +94,9 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
     google_project_service.required_apis["run.googleapis.com"],
     google_project_iam_member.backend_vertex_ai_user,
     google_storage_bucket_iam_member.backend_chroma_bucket_object_user,
+    google_compute_route.private_googleapis,
+    google_dns_record_set.private_googleapis_a,
+    google_dns_record_set.googleapis_wildcard_cname,
   ]
 }
 
@@ -90,7 +105,7 @@ resource "google_cloud_run_v2_service" "agent_api" {
   name                 = local.agent_service_name
   location             = var.region
   project              = var.project_id
-  ingress              = "INGRESS_TRAFFIC_ALL"
+  ingress              = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
   invoker_iam_disabled = true
   deletion_protection  = false
 
@@ -99,6 +114,14 @@ resource "google_cloud_run_v2_service" "agent_api" {
     execution_environment = "EXECUTION_ENVIRONMENT_GEN2"
     timeout               = "300s"
     session_affinity      = true
+
+    vpc_access {
+      egress = "ALL_TRAFFIC"
+      network_interfaces {
+        network    = google_compute_network.main.name
+        subnetwork = google_compute_subnetwork.agent.name
+      }
+    }
 
     scaling {
       min_instance_count = var.min_instance_count
@@ -145,6 +168,10 @@ resource "google_cloud_run_v2_service" "agent_api" {
         name  = "ALLOWED_ORIGINS"
         value = local.allowed_origins_csv
       }
+      env {
+        name  = "ANONYMIZED_TELEMETRY"
+        value = "FALSE"
+      }
     }
   }
 
@@ -152,17 +179,21 @@ resource "google_cloud_run_v2_service" "agent_api" {
     google_project_service.required_apis["run.googleapis.com"],
     google_project_iam_member.backend_vertex_ai_user,
     google_storage_bucket_iam_member.backend_chroma_bucket_object_user,
+    google_compute_route.private_googleapis,
+    google_dns_record_set.private_googleapis_a,
+    google_dns_record_set.googleapis_wildcard_cname,
   ]
 }
 
 # 3. React SPA + Nginx Frontend Service
-# Note: Public HTTPS reachability uses invoker_iam_disabled = true (org-policy DRS safe);
-# all backend API endpoints enforce Firebase / Identity Platform JWT verification.
+# Note: Direct *.run.app reachability is blocked (INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER);
+# public traffic enters exclusively via the External HTTPS Load Balancer, and all backend API
+# endpoints enforce Firebase / Identity Platform JWT verification.
 resource "google_cloud_run_v2_service" "frontend" {
   name                 = local.frontend_service_name
   location             = var.region
   project              = var.project_id
-  ingress              = "INGRESS_TRAFFIC_ALL"
+  ingress              = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
   invoker_iam_disabled = true
   deletion_protection  = false
 
@@ -194,11 +225,11 @@ resource "google_cloud_run_v2_service" "frontend" {
 
       env {
         name  = "INGESTION_API_URL"
-        value = google_cloud_run_v2_service.ingestion_api.uri
+        value = "/api/ingest"
       }
       env {
         name  = "AGENT_API_URL"
-        value = google_cloud_run_v2_service.agent_api.uri
+        value = "/api/agent"
       }
       env {
         name  = "FIREBASE_API_KEY"

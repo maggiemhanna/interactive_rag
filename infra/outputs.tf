@@ -1,20 +1,30 @@
+output "load_balancer_url" {
+  description = "Primary public HTTPS URL for InteractiveRAG via the Global External Load Balancer."
+  value       = local.lb_url
+}
+
+output "load_balancer_ip" {
+  description = "Static global IPv4 address of the External HTTPS Load Balancer."
+  value       = google_compute_global_address.lb_ip.address
+}
+
 output "frontend_url" {
-  description = "Primary HTTPS URL for the InteractiveRAG React web dashboard (matches configured CORS origin)."
-  value       = local.frontend_deterministic_url
+  description = "Primary HTTPS URL for the InteractiveRAG React web dashboard (alias for load_balancer_url)."
+  value       = local.lb_url
 }
 
 output "frontend_service_uri" {
-  description = "Cloud Run default URI reported by Google Cloud for the frontend service."
+  description = "Internal Cloud Run URI for frontend (direct internet access blocked via INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER)."
   value       = google_cloud_run_v2_service.frontend.uri
 }
 
 output "ingestion_api_url" {
-  description = "HTTPS URL for the Document Ingestion & Collection Management API."
+  description = "Internal Cloud Run URI for ingestion-api (direct internet access blocked via INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER)."
   value       = google_cloud_run_v2_service.ingestion_api.uri
 }
 
 output "agent_api_url" {
-  description = "HTTPS URL for the LangGraph Agentic RAG & SSE Streaming API."
+  description = "Internal Cloud Run URI for agent-api (direct internet access blocked via INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER)."
   value       = google_cloud_run_v2_service.agent_api.uri
 }
 

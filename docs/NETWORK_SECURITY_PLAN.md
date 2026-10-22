@@ -124,22 +124,22 @@ flowchart TB
   - Add an HTTP (`80`) URL map + `google_compute_target_http_proxy` + port `80` forwarding rule that automatically 301-redirects `http://` visitors to `https://`.
 
 ### Phase 5: Lock Down Cloud Run & Wire Frontend / Auth
-- [ ] Update `infra/cloud_run.tf`:
+- [x] Update `infra/cloud_run.tf`:
   - Change `ingress` on `frontend`, `ingestion_api`, and `agent_api` from `"INGRESS_TRAFFIC_ALL"` to `"INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"`.
   - Attach `vpc_access` (`egress = "ALL_TRAFFIC"`) to `ingestion_api` (`ingestion-subnet`) and `agent_api` (`agent-subnet`).
   - Add `ANONYMIZED_TELEMETRY = "FALSE"` to `ingestion_api` and `agent_api` environment variables.
   - Set `frontend` environment variables to same-origin Load Balancer paths: `INGESTION_API_URL = "/api/ingest"` and `AGENT_API_URL = "/api/agent"`.
   - Update `ALLOWED_ORIGINS` to include the Load Balancer `https://` URL.
-- [ ] Update `infra/auth.tf`:
+- [x] Update `infra/auth.tf`:
   - Add the Load Balancer `sslip.io` domain to Identity Platform `authorized_domains` so Firebase Sign-In works immediately on the new domain.
-- [ ] Update `infra/outputs.tf`:
+- [x] Update `infra/outputs.tf`:
   - Output `load_balancer_ip` and `load_balancer_url` (`https://<IP-with-dashes>.sslip.io`) as the primary entry point.
 
 ### Phase 6: Deploy & Verify End-to-End
 - [ ] Run `make bootstrap` to enable `compute` & `dns` APIs and update deployer IAM roles.
-- [ ] Run `make plan` and `make deploy` to provision the VPC, Private Endpoints, Load Balancer, and locked-down Cloud Run revisions.
+- [ ] Run `make plan IMAGE_TAG=latest` and `make deploy IMAGE_TAG=latest` to provision the VPC, Private Endpoints, Load Balancer, and locked-down Cloud Run revisions using the existing container images.
 - [ ] *(If using Google Sign-In OAuth)* Add the new `https://<IP-with-dashes>.sslip.io` URL under **APIs & Services $\rightarrow$ Credentials $\rightarrow$ OAuth 2.0 Web Client $\rightarrow$ Authorized JavaScript origins** in the GCP Console.
-- [ ] Wait ~10–15 minutes on first creation for the Google-managed SSL certificate status to reach `ACTIVE`, then execute the verification playbook below.
+- [ ] Wait ~10–15 minutes on first creation for the Google-managed SSL certificate status to reach `ACTIVE` (`gcloud compute ssl-certificates list --project=interactive-rag`), then execute the verification playbook below.
 
 ---
 
@@ -161,18 +161,20 @@ flowchart TB
 
 ## 5. Security & Connectivity Verification Playbook
 
+First, inspect the deployed URLs via `make outputs` (or `gcloud run services list --project=interactive-rag`).
+
 1. **Verify Direct Cloud Run URLs Are Blocked (Network Segmentation)**
    ```bash
    # Fetching raw *.run.app URLs directly from the internet must now be forbidden:
-   curl -i "$(terraform -chdir=infra output -raw ingestion_api_url)/health"
-   curl -i "$(terraform -chdir=infra output -raw agent_api_url)/health"
-   curl -i "$(terraform -chdir=infra output -raw frontend_service_uri)/healthz"
-   # Expected on all 3: HTTP 403 Forbidden (or Google Front End access denied page)
+   curl -i "https://<INGESTION_RUN_APP_URL>/health"
+   curl -i "https://<AGENT_RUN_APP_URL>/health"
+   curl -i "https://<FRONTEND_RUN_APP_URL>/healthz"
+   # Expected on all 3: HTTP 403 Forbidden (Google Front End access denied)
    ```
 
 2. **Verify SSL Certificate Status & Single Public Front Door**
    ```bash
-   LB_URL="$(terraform -chdir=infra output -raw load_balancer_url)"
+   LB_URL="https://<IP-with-dashes>.sslip.io"
    curl -i "${LB_URL}/healthz"
    curl -i "${LB_URL}/api/ingest/health"
    curl -i "${LB_URL}/api/agent/health"
