@@ -93,9 +93,9 @@ Google-managed SSL certificates and Firebase Login both require an HTTPS domain 
 ## 3. Step-by-Step Implementation Phases
 
 ### Phase 1: Enable Networking APIs & Deployer Permissions
-- [ ] Add `compute.googleapis.com` and `dns.googleapis.com` to `infra/apis.tf` and the `bootstrap` target in `Makefile`.
-- [ ] Add networking & DNS IAM roles (`roles/compute.networkAdmin`, `roles/compute.loadBalancerAdmin`, `roles/compute.securityAdmin`, `roles/dns.admin`) to `TF_DEPLOYER_ROLES` in `Makefile` so automated Terraform deploys can manage VPC, DNS, and Load Balancer resources.
-- [ ] Add optional `lb_custom_domain` and subnet CIDR variables to `infra/variables.tf` and `infra/terraform.tfvars.example`.
+- [x] Add `compute.googleapis.com` and `dns.googleapis.com` to `infra/apis.tf` and the `bootstrap` target in `Makefile`.
+- [x] Add networking & DNS IAM roles (`roles/compute.networkAdmin`, `roles/compute.loadBalancerAdmin`, `roles/compute.securityAdmin`, `roles/dns.admin`) to `TF_DEPLOYER_ROLES` in `Makefile` so automated Terraform deploys can manage VPC, DNS, and Load Balancer resources.
+- [x] Add optional `lb_custom_domain` and subnet CIDR variables to `infra/variables.tf` and `infra/terraform.tfvars.example`.
 
 ### Phase 2: Build the Private VPC & Segmented Subnets (Concepts 1 & 2)
 - [ ] Create `infra/network.tf`:

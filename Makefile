@@ -32,6 +32,10 @@ TF_DEPLOYER_ROLES := \
 	roles/run.admin \
 	roles/storage.admin \
 	roles/artifactregistry.admin \
+	roles/compute.networkAdmin \
+	roles/compute.loadBalancerAdmin \
+	roles/compute.securityAdmin \
+	roles/dns.admin \
 	roles/iam.serviceAccountAdmin \
 	roles/iam.serviceAccountUser \
 	roles/resourcemanager.projectIamAdmin \
@@ -89,6 +93,8 @@ bootstrap: check-project ## Enable seed APIs, create GCS Terraform state bucket,
 		storage.googleapis.com \
 		artifactregistry.googleapis.com \
 		cloudbuild.googleapis.com \
+		compute.googleapis.com \
+		dns.googleapis.com \
 		iam.googleapis.com \
 		cloudresourcemanager.googleapis.com \
 		serviceusage.googleapis.com \

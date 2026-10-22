@@ -23,3 +23,9 @@ firebase_app_id  = ""
 enable_google_oauth                = true
 google_oauth_client_id_secret_name = "google_oauth_client_id"
 google_oauth_client_secret_name    = "google_oauth_client_secret"
+
+# VPC Subnets & HTTPS Load Balancer Domain
+# Leave lb_custom_domain = "" to automatically use "<LB_STATIC_IP>.sslip.io" with a free Google-managed SSL certificate.
+ingestion_subnet_cidr = "10.10.1.0/26"
+agent_subnet_cidr     = "10.10.2.0/26"
+lb_custom_domain      = ""

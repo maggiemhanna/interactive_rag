@@ -106,3 +106,31 @@ variable "google_oauth_client_secret_name" {
   type        = string
   default     = "google_oauth_client_secret"
 }
+
+variable "ingestion_subnet_cidr" {
+  description = "Private CIDR range for the ingestion-api Cloud Run Direct VPC Egress subnet (minimum /26 recommended)."
+  type        = string
+  default     = "10.10.1.0/26"
+
+  validation {
+    condition     = can(cidrhost(var.ingestion_subnet_cidr, 0))
+    error_message = "ingestion_subnet_cidr must be a valid IPv4 CIDR block (e.g., 10.10.1.0/26)."
+  }
+}
+
+variable "agent_subnet_cidr" {
+  description = "Private CIDR range for the agent-api Cloud Run Direct VPC Egress subnet (minimum /26 recommended)."
+  type        = string
+  default     = "10.10.2.0/26"
+
+  validation {
+    condition     = can(cidrhost(var.agent_subnet_cidr, 0))
+    error_message = "agent_subnet_cidr must be a valid IPv4 CIDR block (e.g., 10.10.2.0/26)."
+  }
+}
+
+variable "lb_custom_domain" {
+  description = "Optional custom domain for the HTTPS Load Balancer (e.g., 'rag.example.com'). If empty, defaults to '<LB_STATIC_IP>.sslip.io' for automatic free Google-managed HTTPS."
+  type        = string
+  default     = ""
+}
