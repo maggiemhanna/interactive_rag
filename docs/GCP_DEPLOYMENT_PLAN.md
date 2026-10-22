@@ -107,11 +107,11 @@ flowchart TB
 - [x] Add authenticated `authFetch` helper in `frontend/src/App.jsx` that attaches `Authorization: Bearer <ID_TOKEN>` to all REST and streaming `fetch` calls.
 
 ### Phase 6: Provision, Deploy & Verify on GCP
-- [x] Configure `infra/terraform.tfvars` (`project_id = "interactive-rag"` + Google OAuth credentials).
-- [ ] Run `make bootstrap` (enables seed APIs, creates Terraform remote state bucket & Artifact Registry).
-- [ ] Run `make build-push` (builds `linux/amd64` backend & frontend images via Cloud Build).
-- [ ] Run `make deploy` (executes `terraform apply` to deploy Identity Platform, GCS, IAM, auto-wired `FIREBASE_API_KEY`, and all 3 Cloud Run services).
-- [ ] Execute the Multi-Tenant Verification Playbook below.
+- [x] Configure `infra/terraform.tfvars` (`project_id = "interactive-rag"` + Google OAuth credentials via Secret Manager).
+- [x] Run `make bootstrap` (enables seed APIs, creates Terraform remote state bucket & Artifact Registry).
+- [x] Run `make build-push` (builds `linux/amd64` backend & frontend images via Cloud Build).
+- [x] Run `make deploy` (executes `terraform apply` to deploy Identity Platform, GCS, IAM, auto-wired `FIREBASE_API_KEY`, and all 3 Cloud Run services).
+- [x] Execute the Multi-Tenant Verification Playbook below.
 
 ---
 

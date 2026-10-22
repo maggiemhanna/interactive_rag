@@ -16,13 +16,20 @@ resource "google_identity_platform_config" "auth" {
   # Ensures Identity Platform generates & exposes client[0].api_key for the frontend
   client {}
 
-  authorized_domains = distinct([
-    "localhost",
-    "127.0.0.1",
-    "${var.project_id}.firebaseapp.com",
-    "${var.project_id}.web.app",
-    local.frontend_deterministic_domain,
-  ])
+  authorized_domains = distinct(concat(
+    [
+      "localhost",
+      "127.0.0.1",
+      "${var.project_id}.firebaseapp.com",
+      "${var.project_id}.web.app",
+      local.frontend_deterministic_domain,
+    ],
+    [
+      for origin in var.extra_allowed_origins :
+      split(":", replace(replace(origin, "https://", ""), "http://", ""))[0]
+      if origin != "*" && trimspace(origin) != ""
+    ]
+  ))
 
   depends_on = [
     google_project_service.required_apis["identitytoolkit.googleapis.com"],

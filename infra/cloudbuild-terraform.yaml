@@ -1,0 +1,58 @@
+steps:
+  - id: terraform
+    name: hashicorp/terraform:1.9.8
+    entrypoint: sh
+    args:
+      - -euc
+      - |
+        terraform init -input=false -reconfigure \
+          -backend-config="bucket=${_TF_STATE_BUCKET}" \
+          -backend-config="prefix=${_STATE_PREFIX}"
+
+        VAR_ARGS="-var=project_id=${_PROJECT_ID} -var=region=${_REGION} -var=image_tag=${_IMAGE_TAG}"
+        TARGET_ARG=""
+        if [ -n "${_TF_TARGET}" ]; then
+          TARGET_ARG="-target=${_TF_TARGET}"
+        fi
+
+        case "${_TF_ACTION}" in
+          plan|apply)
+            if [ -z "$${TARGET_ARG}" ]; then
+              if ! terraform state list 2>/dev/null | grep -q '^google_identity_platform_config\.auth$$'; then
+                terraform import -input=false $${VAR_ARGS} google_identity_platform_config.auth "projects/${_PROJECT_ID}/config" || true
+              fi
+              if ! terraform state list 2>/dev/null | grep -q '^google_identity_platform_default_supported_idp_config\.google_sign_in\[0\]$$'; then
+                terraform import -input=false $${VAR_ARGS} 'google_identity_platform_default_supported_idp_config.google_sign_in[0]' "projects/${_PROJECT_ID}/defaultSupportedIdpConfigs/google.com" || true
+              fi
+            fi
+            if [ "${_TF_ACTION}" = "plan" ]; then
+              terraform plan -input=false $${VAR_ARGS} $${TARGET_ARG}
+            else
+              terraform apply -input=false -auto-approve $${VAR_ARGS} $${TARGET_ARG}
+            fi
+            ;;
+          output)
+            terraform output
+            ;;
+          destroy)
+            terraform destroy -input=false -auto-approve $${VAR_ARGS}
+            ;;
+          validate)
+            terraform validate
+            ;;
+          *)
+            echo "Unknown _TF_ACTION: ${_TF_ACTION}" >&2
+            exit 1
+            ;;
+        esac
+
+substitutions:
+  _TF_ACTION: plan
+  _TF_STATE_BUCKET: ""
+  _STATE_PREFIX: interactive-rag/prod/state
+  _PROJECT_ID: interactive-rag
+  _REGION: us-central1
+  _IMAGE_TAG: latest
+  _TF_TARGET: ""
+
+logsBucket: gs://${_TF_STATE_BUCKET}/cloudbuild-logs

@@ -7,6 +7,7 @@ locals {
     "storage.googleapis.com",
     "iam.googleapis.com",
     "identitytoolkit.googleapis.com",
+    "apikeys.googleapis.com",
     "secretmanager.googleapis.com",
   ])
 

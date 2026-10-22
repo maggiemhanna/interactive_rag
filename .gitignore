@@ -8,10 +8,9 @@ ENV/
 env/
 .env
 
-# Database and Generated Files
+# Database, Local Data, and Generated Files
 chroma_db/
-data/uploads/*
-!data/uploads/.gitkeep
+data/
 
 # Node / Frontend
 frontend/node_modules/

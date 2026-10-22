@@ -1,5 +1,5 @@
 resource "google_storage_bucket" "chroma_persistence" {
-  name                        = var.project_id == var.app_name ? "${var.project_id}-chroma-${var.environment}" : "${var.project_id}-${var.app_name}-chroma-${var.environment}"
+  name                        = "${var.app_name}-chroma-${var.environment}-${data.google_project.current.number}"
   project                     = var.project_id
   location                    = var.region
   storage_class               = "STANDARD"

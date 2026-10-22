@@ -18,11 +18,12 @@ locals {
 
 # 1. Document Ingestion & Collection Management Service (src/add_documents.py)
 resource "google_cloud_run_v2_service" "ingestion_api" {
-  name                = local.ingestion_service_name
-  location            = var.region
-  project             = var.project_id
-  ingress             = "INGRESS_TRAFFIC_ALL"
-  deletion_protection = false
+  name                 = local.ingestion_service_name
+  location             = var.region
+  project              = var.project_id
+  ingress              = "INGRESS_TRAFFIC_ALL"
+  invoker_iam_disabled = true
+  deletion_protection  = false
 
   template {
     service_account       = google_service_account.backend_sa.email
@@ -86,11 +87,12 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
 
 # 2. LangGraph Agentic RAG & SSE Streaming Service (src/agentic_rag.py)
 resource "google_cloud_run_v2_service" "agent_api" {
-  name                = local.agent_service_name
-  location            = var.region
-  project             = var.project_id
-  ingress             = "INGRESS_TRAFFIC_ALL"
-  deletion_protection = false
+  name                 = local.agent_service_name
+  location             = var.region
+  project              = var.project_id
+  ingress              = "INGRESS_TRAFFIC_ALL"
+  invoker_iam_disabled = true
+  deletion_protection  = false
 
   template {
     service_account       = google_service_account.backend_sa.email
@@ -154,12 +156,15 @@ resource "google_cloud_run_v2_service" "agent_api" {
 }
 
 # 3. React SPA + Nginx Frontend Service
+# Note: Public HTTPS reachability uses invoker_iam_disabled = true (org-policy DRS safe);
+# all backend API endpoints enforce Firebase / Identity Platform JWT verification.
 resource "google_cloud_run_v2_service" "frontend" {
-  name                = local.frontend_service_name
-  location            = var.region
-  project             = var.project_id
-  ingress             = "INGRESS_TRAFFIC_ALL"
-  deletion_protection = false
+  name                 = local.frontend_service_name
+  location             = var.region
+  project              = var.project_id
+  ingress              = "INGRESS_TRAFFIC_ALL"
+  invoker_iam_disabled = true
+  deletion_protection  = false
 
   template {
     service_account       = google_service_account.frontend_sa.email
@@ -218,19 +223,4 @@ resource "google_cloud_run_v2_service" "frontend" {
     google_project_service.required_apis["run.googleapis.com"],
     google_identity_platform_config.auth,
   ]
-}
-
-# Allow public HTTPS reachability (user access to backend APIs is strictly enforced via Firebase JWT middleware)
-resource "google_cloud_run_v2_service_iam_member" "public_invoker" {
-  for_each = {
-    ingestion = google_cloud_run_v2_service.ingestion_api
-    agent     = google_cloud_run_v2_service.agent_api
-    frontend  = google_cloud_run_v2_service.frontend
-  }
-
-  project  = each.value.project
-  location = each.value.location
-  name     = each.value.name
-  role     = "roles/run.invoker"
-  member   = "allUsers"
 }

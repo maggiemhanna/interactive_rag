@@ -37,6 +37,6 @@ substitutions:
   _REGION: us-central1
   _REPO_NAME: interactive-rag-repo
   _IMAGE_TAG: latest
+  _LOGS_BUCKET: interactive-rag-tfstate
 
-options:
-  logging: CLOUD_LOGGING_ONLY
+logsBucket: gs://${_LOGS_BUCKET}/cloudbuild-logs
