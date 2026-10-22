@@ -7,20 +7,19 @@ environment = "prod"
 image_tag   = "latest"
 
 # Cloud Run Sizing
-backend_cpu         = "2"
-backend_memory      = "2Gi"
-frontend_cpu        = "1"
-frontend_memory     = "512Mi"
-min_instance_count  = 0
-max_instance_count  = 5
+backend_cpu          = "2"
+backend_memory       = "2Gi"
+frontend_cpu         = "1"
+frontend_memory      = "512Mi"
+min_instance_count   = 0
+max_instance_count   = 5
 bucket_force_destroy = false
 
-# Identity Platform / Firebase Web Config
-# Find `firebase_api_key` in GCP Console -> Identity Platform -> Settings -> Application setup details
+# Identity Platform / Firebase Web Config (auto-populated from Identity Platform if left empty)
 firebase_api_key = ""
 firebase_app_id  = ""
 
-# Optional: Enable Google OAuth Sign-In alongside Email/Password
-enable_google_oauth        = true
-google_oauth_client_id     = "564126575621-1s4iosttnh6oa492hqtkdcn6aj82sj55.apps.googleusercontent.com"
-google_oauth_client_secret = "REPLACE_WITH_GOOGLE_OAUTH_CLIENT_SECRET"
+# Google OAuth Sign-In (credentials loaded dynamically from GCP Secret Manager)
+enable_google_oauth                = true
+google_oauth_client_id_secret_name = "google_oauth_client_id"
+google_oauth_client_secret_name    = "google_oauth_client_secret"

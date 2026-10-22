@@ -29,14 +29,35 @@ resource "google_identity_platform_config" "auth" {
   ]
 }
 
+# Fetch OAuth 2.0 Web Client ID & Client Secret directly from GCP Secret Manager (version = "latest")
+data "google_secret_manager_secret_version" "oauth_client_id" {
+  count   = var.enable_google_oauth ? 1 : 0
+  project = var.project_id
+  secret  = var.google_oauth_client_id_secret_name
+
+  depends_on = [
+    google_project_service.required_apis["secretmanager.googleapis.com"],
+  ]
+}
+
+data "google_secret_manager_secret_version" "oauth_client_secret" {
+  count   = var.enable_google_oauth ? 1 : 0
+  project = var.project_id
+  secret  = var.google_oauth_client_secret_name
+
+  depends_on = [
+    google_project_service.required_apis["secretmanager.googleapis.com"],
+  ]
+}
+
 resource "google_identity_platform_default_supported_idp_config" "google_sign_in" {
   count         = var.enable_google_oauth ? 1 : 0
   provider      = google-beta
   project       = var.project_id
   enabled       = true
   idp_id        = "google.com"
-  client_id     = var.google_oauth_client_id
-  client_secret = var.google_oauth_client_secret
+  client_id     = trimspace(data.google_secret_manager_secret_version.oauth_client_id[0].secret_data)
+  client_secret = trimspace(data.google_secret_manager_secret_version.oauth_client_secret[0].secret_data)
 
   depends_on = [
     google_identity_platform_config.auth,

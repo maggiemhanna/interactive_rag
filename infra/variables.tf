@@ -90,20 +90,19 @@ variable "firebase_app_id" {
 }
 
 variable "enable_google_oauth" {
-  description = "Enable Google OAuth Sign-In provider in Identity Platform (requires google_oauth_client_id & secret)."
+  description = "Enable Google OAuth Sign-In provider in Identity Platform (loads credentials from GCP Secret Manager)."
   type        = bool
   default     = false
 }
 
-variable "google_oauth_client_id" {
-  description = "OAuth 2.0 Web Client ID for Google Sign-In."
+variable "google_oauth_client_id_secret_name" {
+  description = "Name of the GCP Secret Manager secret holding the Google OAuth 2.0 Web Client ID."
   type        = string
-  default     = ""
+  default     = "google_oauth_client_id"
 }
 
-variable "google_oauth_client_secret" {
-  description = "OAuth 2.0 Web Client Secret for Google Sign-In."
+variable "google_oauth_client_secret_name" {
+  description = "Name of the GCP Secret Manager secret holding the Google OAuth 2.0 Web Client Secret."
   type        = string
-  default     = ""
-  sensitive   = true
+  default     = "google_oauth_client_secret"
 }
