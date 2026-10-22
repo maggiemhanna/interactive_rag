@@ -72,17 +72,17 @@ flowchart TB
   - Support an explicit local-only bypass (`AUTH_DISABLED=true` + `DEV_USER_ID=local-dev` **only** when `K_SERVICE` is unset) if needed for offline unit tests.
 
 ### Phase 3: Per-User GCS ↔ ChromaDB Storage Manager (`utils/chroma_storage.py`)
-- [ ] Configure `LOCAL_CHROMA_ROOT` (default `/tmp/chroma_db` in Cloud Run, `./chroma_db` locally) and `GCS_BUCKET_NAME`.
-- [ ] Implement `ensure_user_chroma_synced(uid: str) -> str` (Read Path):
+- [x] Configure `LOCAL_CHROMA_ROOT` (default `/tmp/chroma_db` in Cloud Run, `./chroma_db/users` locally) and `GCS_BUCKET_NAME`.
+- [x] Implement `ensure_user_chroma_synced(uid: str) -> str` (Read Path):
   - When `GCS_BUCKET_NAME` is set, inspect `users/{uid}/chroma_db/version.json` in GCS.
   - Compare remote generation/version against `/tmp/chroma_db/{uid}/version.json`.
   - If missing or stale, reset cached Chroma client state for `uid`, download blobs under `users/{uid}/chroma_db/` into `/tmp/chroma_db/{uid}/`, and record the local version.
-- [ ] Implement `user_chroma_write_lock(uid: str)` context manager (Write Path):
+- [x] Implement `user_chroma_write_lock(uid: str)` context manager (Write Path):
   - Acquire `users/{uid}/locks/chroma.lock` in GCS using `if_generation_match=0` (with stale-lock TTL recovery if a previous container crashed).
   - Pull latest user snapshot via `ensure_user_chroma_synced(uid)`.
   - Yield the local `persist_directory` (`/tmp/chroma_db/{uid}`) for ChromaDB mutation.
   - Upload modified/new files in `/tmp/chroma_db/{uid}` to `users/{uid}/chroma_db/`, delete remote blobs removed locally (e.g., deleted collection HNSW folders), write updated `version.json`, and release `chroma.lock`.
-- [ ] Implement LRU `/tmp` eviction for inactive user directories when `/tmp` free space drops below threshold.
+- [x] Implement LRU `/tmp` eviction for inactive user directories when `/tmp` free space drops below threshold.
 
 ### Phase 4: Multi-Tenant Backend Hardening (`src/add_documents.py` & `src/agentic_rag.py`)
 - [ ] Inject `uid: str = Depends(get_current_user)` into all collection, ingestion, query, and agent endpoints.
