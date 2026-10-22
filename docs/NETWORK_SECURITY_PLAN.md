@@ -136,9 +136,9 @@ flowchart TB
   - Output `load_balancer_ip` and `load_balancer_url` (`https://<IP-with-dashes>.sslip.io`) as the primary entry point.
 
 ### Phase 6: Deploy & Verify End-to-End
-- [ ] Run `make bootstrap` to enable `compute` & `dns` APIs and update deployer IAM roles.
-- [ ] Run `make plan IMAGE_TAG=latest` and `make deploy IMAGE_TAG=latest` to provision the VPC, Private Endpoints, Load Balancer, and locked-down Cloud Run revisions using the existing container images.
-- [ ] *(If using Google Sign-In OAuth)* Add the new `https://<IP-with-dashes>.sslip.io` URL under **APIs & Services $\rightarrow$ Credentials $\rightarrow$ OAuth 2.0 Web Client $\rightarrow$ Authorized JavaScript origins** in the GCP Console.
+- [x] Run `make bootstrap` to enable `compute` & `dns` APIs and update deployer IAM roles.
+- [x] Run `make plan IMAGE_TAG=latest` and `make deploy IMAGE_TAG=latest` to provision the VPC, Private Endpoints, Load Balancer, and locked-down Cloud Run revisions using the existing container images.
+- [ ] *(If using Google Sign-In OAuth)* Add the new `https://136-81-158-54.sslip.io` URL under **APIs & Services $\rightarrow$ Credentials $\rightarrow$ OAuth 2.0 Web Client $\rightarrow$ Authorized JavaScript origins** in the GCP Console.
 - [ ] Wait ~10–15 minutes on first creation for the Google-managed SSL certificate status to reach `ACTIVE` (`gcloud compute ssl-certificates list --project=interactive-rag`), then execute the verification playbook below.
 
 ---
@@ -165,16 +165,16 @@ First, inspect the deployed URLs via `make outputs` (or `gcloud run services lis
 
 1. **Verify Direct Cloud Run URLs Are Blocked (Network Segmentation)**
    ```bash
-   # Fetching raw *.run.app URLs directly from the internet must now be forbidden:
-   curl -i "https://<INGESTION_RUN_APP_URL>/health"
-   curl -i "https://<AGENT_RUN_APP_URL>/health"
-   curl -i "https://<FRONTEND_RUN_APP_URL>/healthz"
-   # Expected on all 3: HTTP 403 Forbidden (Google Front End access denied)
+   # Fetching raw *.run.app URLs directly from the internet must now be rejected by Google Front End:
+   curl -i "https://interactive-rag-ingestion-prod-nzrnyir2mq-uc.a.run.app/health"
+   curl -i "https://interactive-rag-agent-prod-nzrnyir2mq-uc.a.run.app/health"
+   curl -i "https://interactive-rag-frontend-prod-nzrnyir2mq-uc.a.run.app/healthz"
+   # Expected on all 3: HTTP/2 404 (or 403) Google Front End rejection (never reaches Cloud Run)
    ```
 
 2. **Verify SSL Certificate Status & Single Public Front Door**
    ```bash
-   LB_URL="https://<IP-with-dashes>.sslip.io"
+   LB_URL="https://136-81-158-54.sslip.io"
    curl -i "${LB_URL}/healthz"
    curl -i "${LB_URL}/api/ingest/health"
    curl -i "${LB_URL}/api/agent/health"
