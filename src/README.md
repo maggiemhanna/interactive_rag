@@ -1,6 +1,6 @@
 # InteractiveRAG - Source Module Documentation (`/src`)
 
-This directory contains the unified Python backend packages for **InteractiveRAG**, an Agentic Retrieval-Augmented Generation system powered by **LangGraph**, **Google Cloud Vertex AI** (`gemini-2.5-flash` & `gemini-embedding-001`), **ChromaDB**, and **FastAPI**.
+This directory contains the unified Python backend packages for **InteractiveRAG**, an Agentic Retrieval-Augmented Generation system powered by **LangGraph**, **Google Cloud Vertex AI** (`gemini-3.8-flash` & `gemini-embedding-001`), **ChromaDB**, and **FastAPI**.
 
 ---
 
@@ -26,7 +26,7 @@ This directory contains the unified Python backend packages for **InteractiveRAG
 ## 1. `src/core/` - Shared Infrastructure & FastAPI Wiring
 
 `src/core/` centralizes cross-cutting backend logic shared by both Cloud Run services:
-- **`config.py`**: Loads `.env` configuration and defines default model names (`gemini-2.5-flash`, `gemini-embedding-001`) and local service ports.
+- **`config.py`**: Loads `.env` configuration and defines default model names (`gemini-3.8-flash`, `gemini-embedding-001`) and local service ports.
 - **`auth.py`**: Verifies Google Identity Platform / Firebase Bearer JWTs, enforces path-safe `uid` validation, and configures CORS origins.
 - **`logger.py`**: Configures colored structured logging (`setup_logging`, `format_dict_for_logs`).
 - **`storage.py`**: Manages per-user local `/tmp/chroma_db/{uid}` directories, GCS snapshot syncing, LRU `/tmp` cache eviction, and atomic `if_generation_match` distributed write locks.
@@ -115,7 +115,7 @@ curl -X POST "http://localhost:8000/query" \
 ### Core Responsibilities
 `src/agent/` implements an autonomous RAG agent using **LangGraph** and **Vertex AI**:
 1. **Dynamic Tool Creation (`tools.py`)**: Connects to the active ChromaDB vector store collection and creates a Gemini-safe retriever tool.
-2. **Tool-Calling Agent (`graph.py`)**: Compiles the LangGraph `StateGraph` (`gemini-2.5-flash` + `ToolNode`) with `InMemorySaver` checkpointing scoped per `{uid}:{thread_id}`.
+2. **Tool-Calling Agent (`graph.py`)**: Compiles the LangGraph `StateGraph` (`gemini-3.8-flash` + `ToolNode`) with `InMemorySaver` checkpointing scoped per `{uid}:{thread_id}`.
 3. **Real-Time Streaming (`stream.py`)**: Dispatches LangGraph message events in real time over Server-Sent Events (SSE).
 4. **Rich Terminal Formatting (`display.py`)**: Uses `rich` to render System, Human, AI, and Tool messages cleanly in terminal output.
 
@@ -219,7 +219,7 @@ run_interactive(
    Configure `.env` in the root directory or `src/.env`:
    ```bash
    GOOGLE_CLOUD_PROJECT="interactive-rag"
-   GOOGLE_CLOUD_LOCATION="us-central1"  # Optional, defaults to us-central1
+   GOOGLE_CLOUD_LOCATION="global"  # Optional, defaults to global
    ```
 
 3. **Dependencies**:

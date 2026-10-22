@@ -4,7 +4,7 @@
 
 When it comes to querying, users can select a specific collection to keep retrieval strictly scoped to that exact document set, avoiding cross-domain noise. Users can perform direct top-$k$ semantic similarity searches on an indexed collection through (`POST /query`) to inspect raw matching text passages and metadata. Alternatively, users can interact with the LangGraph conversational assistant via (`POST /agent`), where we dynamically configure an autonomous retrieval tool bound exclusively to the target collection, enabling the Gemini agent to search, inspect relevant context chunks, and synthesize grounded answers in real time.
 
-**InteractiveRAG** is an interactive, full-stack Agentic Retrieval-Augmented Generation (RAG) platform. It pairs a **LangGraph**-driven reasoning agent powered by **Google Cloud Vertex AI** (`gemini-2.5-flash` & `gemini-embedding-001`) and **ChromaDB** with a modern **React** web dashboard.
+**InteractiveRAG** is an interactive, full-stack Agentic Retrieval-Augmented Generation (RAG) platform. It pairs a **LangGraph**-driven reasoning agent powered by **Google Cloud Vertex AI** (`gemini-3.8-flash` & `gemini-embedding-001`) and **ChromaDB** with a modern **React** web dashboard.
 
 ---
 
@@ -37,7 +37,7 @@ InteractiveRAG/
 ### Component Summary
 
 - **`src/ingestion/` (Port 8000)**: FastAPI service (`app.py`, `loader.py`, `service.py`, `schemas.py`) that loads PDFs, chunks text using `RecursiveCharacterTextSplitter`, computes embeddings with `GoogleGenerativeAIEmbeddings` (`gemini-embedding-001`), and indexes them in `ChromaDB` into specified collections. Also provides collection management (`GET /collections`, `DELETE /collections/{name}`) and direct similarity search (`POST /query`).
-- **`src/agent/` (Port 8001)**: FastAPI service (`app.py`, `graph.py`, `tools.py`, `stream.py`, `display.py`, `schemas.py`) running a LangGraph `StateGraph` agent with `ChatGoogleGenerativeAI` (`gemini-2.5-flash`). Dynamically binds a Chroma retriever tool, handles multi-turn conversation state with `InMemorySaver`, and streams responses over Server-Sent Events (SSE).
+- **`src/agent/` (Port 8001)**: FastAPI service (`app.py`, `graph.py`, `tools.py`, `stream.py`, `display.py`, `schemas.py`) running a LangGraph `StateGraph` agent with `ChatGoogleGenerativeAI` (`gemini-3.8-flash`). Dynamically binds a Chroma retriever tool, handles multi-turn conversation state with `InMemorySaver`, and streams responses over Server-Sent Events (SSE).
 - **`src/core/`**: Shared backend modules (`config.py`, `auth.py`, `logger.py`, `storage.py`, `chroma.py`, `routes.py`) providing Firebase JWT verification, per-user GCS ↔ ChromaDB synchronization, Vertex AI embeddings, and deduplicated FastAPI setup.
 - **`frontend/` (Port 3000)**: React dashboard that allows users to upload PDF documents, manage vector store collections, perform semantic search, and chat interactively with the LangGraph agent in real time.
 - **`tests/`**: Offline `unittest` suites (`auth.py`, `storage.py`, `multi_tenant_api.py`) and live endpoint smoke scripts (`ingestion.py`, `agent.py`).
@@ -59,7 +59,7 @@ export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
 Configure your `.env` file in the project root or `src/.env` and `tests/.env`:
 ```bash
 GOOGLE_CLOUD_PROJECT="interactive-rag"
-GOOGLE_CLOUD_LOCATION="us-central1"  # Optional, defaults to us-central1
+GOOGLE_CLOUD_LOCATION="global"  # Optional, defaults to global
 ```
 
 ### 2. Python Environment Setup

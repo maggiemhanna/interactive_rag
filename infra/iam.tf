@@ -20,7 +20,7 @@ resource "google_service_account" "frontend_sa" {
   ]
 }
 
-# Allow backend services to invoke Vertex AI models (gemini-2.5-flash & gemini-embedding-001)
+# Allow backend services to invoke Vertex AI models (gemini-3.8-flash & gemini-embedding-001)
 resource "google_project_iam_member" "backend_vertex_ai_user" {
   project = var.project_id
   role    = "roles/aiplatform.user"

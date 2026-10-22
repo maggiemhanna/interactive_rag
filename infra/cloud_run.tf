@@ -69,7 +69,7 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
       }
       env {
         name  = "GOOGLE_CLOUD_LOCATION"
-        value = var.region
+        value = "global"
       }
       env {
         name  = "GCS_BUCKET_NAME"
@@ -154,7 +154,7 @@ resource "google_cloud_run_v2_service" "agent_api" {
       }
       env {
         name  = "GOOGLE_CLOUD_LOCATION"
-        value = var.region
+        value = "global"
       }
       env {
         name  = "GCS_BUCKET_NAME"

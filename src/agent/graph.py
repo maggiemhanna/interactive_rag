@@ -8,7 +8,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from src.agent.schemas import AgentState
-from src.core.config import DEFAULT_LLM_MODEL
+from src.core.config import DEFAULT_LLM_MODEL, DEFAULT_LOCATION
 
 # Module-scoped checkpointer persists multi-turn conversation history across warm requests;
 # every HTTP request namespaces thread_id as f"{uid}:{request.thread_id}".
@@ -25,7 +25,7 @@ def build_agent(
         model=model_name,
         temperature=0,
         project=os.getenv("GOOGLE_CLOUD_PROJECT"),
-        location=os.getenv("GOOGLE_CLOUD_LOCATION"),
+        location=os.getenv("GOOGLE_CLOUD_LOCATION", DEFAULT_LOCATION),
     )
 
     tools = [retriever_tool]

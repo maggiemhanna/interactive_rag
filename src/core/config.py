@@ -6,7 +6,8 @@ SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 DEFAULT_COLLECTION = "stock_market_vs"
 DEFAULT_EMBEDDING_MODEL = "gemini-embedding-001"
-DEFAULT_LLM_MODEL = "gemini-2.5-flash"
+DEFAULT_LLM_MODEL = "gemini-3.8-flash"
+DEFAULT_LOCATION = "global"
 
 INGESTION_PORT = 8000
 AGENT_PORT = 8001
