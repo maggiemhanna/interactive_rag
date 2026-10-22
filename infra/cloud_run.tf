@@ -197,7 +197,7 @@ resource "google_cloud_run_v2_service" "frontend" {
       }
       env {
         name  = "FIREBASE_API_KEY"
-        value = var.firebase_api_key
+        value = var.firebase_api_key != "" ? var.firebase_api_key : try(google_identity_platform_config.auth.client[0].api_key, "")
       }
       env {
         name  = "FIREBASE_AUTH_DOMAIN"
@@ -216,6 +216,7 @@ resource "google_cloud_run_v2_service" "frontend" {
 
   depends_on = [
     google_project_service.required_apis["run.googleapis.com"],
+    google_identity_platform_config.auth,
   ]
 }
 

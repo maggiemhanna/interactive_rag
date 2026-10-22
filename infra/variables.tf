@@ -1,6 +1,7 @@
 variable "project_id" {
   description = "GCP Project ID where InteractiveRAG will be deployed."
   type        = string
+  default     = "interactive-rag"
 }
 
 variable "region" {

@@ -32,3 +32,9 @@ output "backend_service_account_email" {
   description = "Least-privilege service account attached to backend Cloud Run services."
   value       = google_service_account.backend_sa.email
 }
+
+output "firebase_web_api_key" {
+  description = "Identity Platform / Firebase Web API Key (use `terraform -chdir=infra output -raw firebase_web_api_key`)."
+  value       = try(google_identity_platform_config.auth.client[0].api_key, "")
+  sensitive   = true
+}

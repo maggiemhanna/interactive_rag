@@ -1,6 +1,6 @@
 # Copy this file to `infra/terraform.tfvars` (gitignored) and populate values for your GCP project.
 
-project_id  = "your-gcp-project-id"
+project_id  = "interactive-rag"
 region      = "us-central1"
 app_name    = "interactive-rag"
 environment = "prod"
@@ -21,6 +21,6 @@ firebase_api_key = ""
 firebase_app_id  = ""
 
 # Optional: Enable Google OAuth Sign-In alongside Email/Password
-enable_google_oauth        = false
-google_oauth_client_id     = ""
-google_oauth_client_secret = ""
+enable_google_oauth        = true
+google_oauth_client_id     = "564126575621-1s4iosttnh6oa492hqtkdcn6aj82sj55.apps.googleusercontent.com"
+google_oauth_client_secret = "REPLACE_WITH_GOOGLE_OAUTH_CLIENT_SECRET"

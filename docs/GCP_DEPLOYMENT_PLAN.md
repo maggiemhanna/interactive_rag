@@ -63,9 +63,9 @@ flowchart TB
 - [x] Create `cloudbuild.yaml` and `Makefile` for reproducible bootstrap, image builds, and deployments.
 
 ### Phase 2: Backend Authentication Module (`utils/auth.py`)
-- [ ] Add `firebase-admin` and `google-cloud-storage` to `requirements.txt`.
-- [ ] Implement Firebase Admin initialization (using Cloud Run Application Default Credentials and `GOOGLE_CLOUD_PROJECT`).
-- [ ] Implement `get_current_user` FastAPI dependency:
+- [x] Add `firebase-admin` and `google-cloud-storage` to `requirements.txt`.
+- [x] Implement Firebase Admin initialization (using Cloud Run Application Default Credentials and `GOOGLE_CLOUD_PROJECT`).
+- [x] Implement `get_current_user` FastAPI dependency:
   - Validate `Authorization: Bearer <token>` header.
   - Verify token with `firebase_admin.auth.verify_id_token(token, check_revoked=False)`.
   - Validate `uid` matches `^[a-zA-Z0-9_-]{1,128}$` to prevent path traversal.
@@ -100,18 +100,17 @@ flowchart TB
   - Disable `reload=True` unless `UVICORN_RELOAD=true`.
 
 ### Phase 5: Frontend Authentication & Runtime Config (`frontend/`)
-- [ ] Load `<script src="/env-config.js"></script>` in `frontend/index.html` (with fallback to `import.meta.env.VITE_*` for local `npm run dev`).
-- [ ] Install `firebase` in `frontend/package.json` and initialize Firebase Auth (`src/firebase.js`).
-- [ ] Add Login / Sign-Up (Email & Password + optional Google Sign-In) and user header bar with Sign Out in `frontend/src/App.jsx`.
-- [ ] Clear React collection/chat state on sign-out or account switch.
-- [ ] Add authenticated `apiFetch` helper in `frontend/src/App.jsx` that attaches `Authorization: Bearer <ID_TOKEN>` to all REST and streaming `fetch` calls.
+- [x] Load `<script src="/env-config.js"></script>` in `frontend/index.html` (with fallback to `import.meta.env.VITE_*` for local `npm run dev`).
+- [x] Install `firebase` in `frontend/package.json` and initialize Firebase Auth (`src/firebase.js`).
+- [x] Add Login / Sign-Up (Google OAuth Sign-In + Email & Password) and user header bar with Sign Out in `frontend/src/AuthGate.jsx` & `frontend/src/App.jsx`.
+- [x] Clear React collection/chat state on sign-out or account switch.
+- [x] Add authenticated `authFetch` helper in `frontend/src/App.jsx` that attaches `Authorization: Bearer <ID_TOKEN>` to all REST and streaming `fetch` calls.
 
 ### Phase 6: Provision, Deploy & Verify on GCP
-- [ ] Configure `infra/terraform.tfvars` from `infra/terraform.tfvars.example`.
+- [x] Configure `infra/terraform.tfvars` (`project_id = "interactive-rag"` + Google OAuth credentials).
 - [ ] Run `make bootstrap` (enables seed APIs, creates Terraform remote state bucket & Artifact Registry).
 - [ ] Run `make build-push` (builds `linux/amd64` backend & frontend images via Cloud Build).
-- [ ] Run `make deploy` (executes `terraform apply` to deploy Identity Platform, GCS, IAM, and all 3 Cloud Run services).
-- [ ] Copy the Firebase Web API Key from GCP Console → Identity Platform into `infra/terraform.tfvars` and re-run `make deploy`.
+- [ ] Run `make deploy` (executes `terraform apply` to deploy Identity Platform, GCS, IAM, auto-wired `FIREBASE_API_KEY`, and all 3 Cloud Run services).
 - [ ] Execute the Multi-Tenant Verification Playbook below.
 
 ---
@@ -121,17 +120,17 @@ flowchart TB
 Prerequisites: `gcloud` CLI authenticated (`gcloud auth login` and `gcloud auth application-default login`) and `terraform >= 1.5`.
 
 ```bash
-# 1. Copy example variables and set your GCP project_id
+# 1. Copy example variables (pre-configured with project_id = "interactive-rag")
 cp infra/terraform.tfvars.example infra/terraform.tfvars
 
 # 2. Bootstrap Terraform state bucket + Artifact Registry
-make bootstrap PROJECT_ID=your-gcp-project-id
+make bootstrap PROJECT_ID=interactive-rag
 
 # 3. Build & push container images via Google Cloud Build
-make build-push PROJECT_ID=your-gcp-project-id
+make build-push PROJECT_ID=interactive-rag
 
 # 4. Provision all GCP resources & deploy Cloud Run services
-make deploy PROJECT_ID=your-gcp-project-id
+make deploy PROJECT_ID=interactive-rag
 ```
 
 ---

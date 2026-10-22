@@ -207,7 +207,7 @@ run_agent_interactive(
 2. **Environment Variables (`.env`)**:
    Configure `.env` in the root directory or `src/.env`:
    ```bash
-   GOOGLE_CLOUD_PROJECT="your-google-cloud-project-id"
+   GOOGLE_CLOUD_PROJECT="interactive-rag"
    GOOGLE_CLOUD_LOCATION="us-central1"  # Optional, defaults to us-central1
    ```
 

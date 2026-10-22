@@ -9,13 +9,13 @@ TFVARS_REGION  := $(shell [ -f $(TFVARS) ] && sed -n 's/^[[:space:]]*region[[:sp
 TFVARS_APP     := $(shell [ -f $(TFVARS) ] && sed -n 's/^[[:space:]]*app_name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' $(TFVARS) | head -n 1)
 TFVARS_ENV     := $(shell [ -f $(TFVARS) ] && sed -n 's/^[[:space:]]*environment[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' $(TFVARS) | head -n 1)
 
-PROJECT_ID ?= $(if $(TFVARS_PROJECT),$(TFVARS_PROJECT),$(shell gcloud config get-value project 2>/dev/null))
+PROJECT_ID ?= $(if $(TFVARS_PROJECT),$(TFVARS_PROJECT),interactive-rag)
 REGION     ?= $(if $(TFVARS_REGION),$(TFVARS_REGION),us-central1)
 APP_NAME   ?= $(if $(TFVARS_APP),$(TFVARS_APP),interactive-rag)
 ENV        ?= $(if $(TFVARS_ENV),$(TFVARS_ENV),prod)
 IMAGE_TAG  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo latest)
 
-TF_STATE_BUCKET ?= $(PROJECT_ID)-$(APP_NAME)-tfstate
+TF_STATE_BUCKET ?= $(if $(filter $(PROJECT_ID),$(APP_NAME)),$(PROJECT_ID)-tfstate,$(PROJECT_ID)-$(APP_NAME)-tfstate)
 REPO_NAME       := $(APP_NAME)-repo
 REGISTRY_URL    := $(REGION)-docker.pkg.dev/$(PROJECT_ID)/$(REPO_NAME)
 

@@ -13,13 +13,15 @@ resource "google_identity_platform_config" "auth" {
     }
   }
 
+  # Ensures Identity Platform generates & exposes client[0].api_key for the frontend
+  client {}
+
   authorized_domains = distinct([
     "localhost",
     "127.0.0.1",
     "${var.project_id}.firebaseapp.com",
     "${var.project_id}.web.app",
     local.frontend_deterministic_domain,
-    trimprefix(google_cloud_run_v2_service.frontend.uri, "https://"),
   ])
 
   depends_on = [

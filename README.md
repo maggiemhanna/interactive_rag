@@ -57,7 +57,7 @@ export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
 
 Configure your `.env` file in the project root or `src/.env` and test/.env:
 ```bash
-GOOGLE_CLOUD_PROJECT="your-google-cloud-project-id"
+GOOGLE_CLOUD_PROJECT="interactive-rag"
 GOOGLE_CLOUD_LOCATION="us-central1"  # Optional, defaults to us-central1
 ```
 

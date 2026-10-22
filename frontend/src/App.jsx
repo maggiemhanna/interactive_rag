@@ -23,11 +23,17 @@ import {
   Copy,
   Check,
   Trash2,
-  AlertTriangle
+  AlertTriangle,
+  LogOut,
+  User
 } from 'lucide-react';
-
-const API_BASE = 'http://localhost:8000';
-const AGENT_API_BASE = 'http://localhost:8001';
+import {
+  API_BASE,
+  AGENT_API_BASE,
+  subscribeToAuthChanges,
+  logoutUser,
+} from './firebase';
+import AuthGate from './AuthGate';
 
 function PrettyPrintEventStream({ events }) {
   const [viewMode, setViewMode] = useState('pretty'); // 'pretty' | 'json'
@@ -198,6 +204,9 @@ function PrettyPrintEventStream({ events }) {
 }
 
 export default function App() {
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authInitializing, setAuthInitializing] = useState(true);
+
   const [activeTab, setActiveTab] = useState('ingest'); // 'ingest' | 'query' | 'agent' | 'manage'
 
   const [collections, setCollections] = useState([]);
@@ -232,16 +241,87 @@ export default function App() {
   const [showStreamEvents, setShowStreamEvents] = useState(false);
 
   const fileInputRef = useRef(null);
+  const threadIdRef = useRef(`session-${Date.now()}`);
+
+  const resetTenantState = () => {
+    setCollections([]);
+    setCollectionDetails([]);
+    setDeletingCol(null);
+    setSelectedCollection('');
+    setNewCollectionName('');
+    setFiles([]);
+    setPdfPaths('');
+    setQueryCollection('');
+    setQueryText('');
+    setQueryResults(null);
+    setExpandedMeta({});
+    setAgentCollection('');
+    setAgentQuery('');
+    setAgentAnswer(null);
+    setAgentEvents([]);
+    setShowStreamEvents(false);
+    setNotification(null);
+    threadIdRef.current = `session-${Date.now()}`;
+  };
+
+  useEffect(() => {
+    const unsubscribe = subscribeToAuthChanges((firebaseUser) => {
+      resetTenantState();
+      setCurrentUser(firebaseUser);
+      setAuthInitializing(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  const handleSignOut = async () => {
+    try {
+      if (!currentUser?.isLocalDev) {
+        await logoutUser();
+      }
+    } finally {
+      resetTenantState();
+      setCurrentUser(null);
+    }
+  };
+
+  // Wrapper injecting Firebase ID Token (or X-Dev-User-Id in localhost dev mode)
+  const authFetch = async (url, options = {}) => {
+    const buildHeaders = async (forceRefresh = false) => {
+      const headers = new Headers(options.headers || {});
+      if (currentUser?.isLocalDev) {
+        headers.set('X-Dev-User-Id', currentUser.uid);
+      } else if (currentUser && typeof currentUser.getIdToken === 'function') {
+        const token = await currentUser.getIdToken(forceRefresh);
+        headers.set('Authorization', `Bearer ${token}`);
+      }
+      return headers;
+    };
+
+    let res = await fetch(url, {
+      ...options,
+      headers: await buildHeaders(false),
+    });
+
+    if (res.status === 401 && currentUser && typeof currentUser.getIdToken === 'function') {
+      res = await fetch(url, {
+        ...options,
+        headers: await buildHeaders(true),
+      });
+    }
+
+    return res;
+  };
 
   // Fetch collections from backend
   const fetchCollections = async () => {
+    if (!currentUser) return;
     try {
       setApiStatus('checking');
       let res;
       try {
-        res = await fetch(`${API_BASE}/collections`);
+        res = await authFetch(`${API_BASE}/collections`);
       } catch (e) {
-        res = await fetch(`${AGENT_API_BASE}/collections`);
+        res = await authFetch(`${AGENT_API_BASE}/collections`);
       }
       if (!res.ok) throw new Error('Failed to fetch collections');
       const data = await res.json();
@@ -265,7 +345,7 @@ export default function App() {
       setApiStatus('offline');
       setNotification({
         type: 'error',
-        message: 'Could not connect to FastAPI server on http://localhost:8000 or http://localhost:8001. Please ensure backend is running.'
+        message: `Could not connect to backend API (${API_BASE}). Please ensure backend is running and authenticated.`
       });
     }
   };
@@ -276,11 +356,11 @@ export default function App() {
     try {
       let res;
       try {
-        res = await fetch(`${API_BASE}/collections/${encodeURIComponent(colName)}`, {
+        res = await authFetch(`${API_BASE}/collections/${encodeURIComponent(colName)}`, {
           method: 'DELETE',
         });
       } catch (e) {
-        res = await fetch(`${AGENT_API_BASE}/collections/${encodeURIComponent(colName)}`, {
+        res = await authFetch(`${AGENT_API_BASE}/collections/${encodeURIComponent(colName)}`, {
           method: 'DELETE',
         });
       }
@@ -306,8 +386,10 @@ export default function App() {
   };
 
   useEffect(() => {
-    fetchCollections();
-  }, []);
+    if (currentUser?.uid) {
+      fetchCollections();
+    }
+  }, [currentUser?.uid]);
 
   const handleFileChange = (e) => {
     const selectedFiles = Array.from(e.target.files).filter(
@@ -389,7 +471,7 @@ export default function App() {
         formData.append('pdf_paths', pdfPaths.trim());
       }
 
-      const response = await fetch(`${API_BASE}/add_documents`, {
+      const response = await authFetch(`${API_BASE}/add_documents`, {
         method: 'POST',
         body: formData,
       });
@@ -451,7 +533,7 @@ export default function App() {
     setQueryLoading(true);
 
     try {
-      const response = await fetch(`${API_BASE}/query`, {
+      const response = await authFetch(`${API_BASE}/query`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -511,26 +593,25 @@ export default function App() {
     try {
       let agentUrl = `${AGENT_API_BASE}/agentic_rag`;
       let response;
+      const requestBody = JSON.stringify({
+        query: agentQuery.trim(),
+        collection_name: targetCollection,
+        thread_id: threadIdRef.current,
+        stream: true,
+      });
+
       try {
-        response = await fetch(agentUrl, {
+        response = await authFetch(agentUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            query: agentQuery.trim(),
-            collection_name: targetCollection,
-            stream: true,
-          }),
+          body: requestBody,
         });
       } catch (err) {
         agentUrl = `${API_BASE}/agentic_rag`;
-        response = await fetch(agentUrl, {
+        response = await authFetch(agentUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            query: agentQuery.trim(),
-            collection_name: targetCollection,
-            stream: true,
-          }),
+          body: requestBody,
         });
       }
 
@@ -604,6 +685,28 @@ export default function App() {
     }));
   };
 
+  if (authInitializing) {
+    return (
+      <div className="auth-screen">
+        <div className="glass-card" style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          <RefreshCw size={20} className="spinner" color="var(--primary)" />
+          <span>Checking authentication session...</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return (
+      <AuthGate
+        onLocalDevLogin={(devUser) => {
+          resetTenantState();
+          setCurrentUser(devUser);
+        }}
+      />
+    );
+  }
+
   return (
     <div className="app-container">
       {/* Header */}
@@ -618,12 +721,32 @@ export default function App() {
           </div>
         </div>
 
-        <div className="status-pill">
-          <span className={`status-dot ${apiStatus === 'online' ? 'online' : 'offline'}`}></span>
-          <span>{apiStatus === 'online' ? 'Backend Connected' : 'Backend Offline'}</span>
-          <button onClick={fetchCollections} className="refresh-btn" title="Check connection">
-            <RefreshCw size={14} className={apiStatus === 'checking' ? 'spinner' : ''} />
-          </button>
+        <div className="header-actions">
+          <div className="status-pill">
+            <span className={`status-dot ${apiStatus === 'online' ? 'online' : 'offline'}`}></span>
+            <span>{apiStatus === 'online' ? 'Backend Connected' : 'Backend Offline'}</span>
+            <button onClick={fetchCollections} className="refresh-btn" title="Check connection">
+              <RefreshCw size={14} className={apiStatus === 'checking' ? 'spinner' : ''} />
+            </button>
+          </div>
+
+          <div className="user-pill">
+            {currentUser.photoURL ? (
+              <img
+                src={currentUser.photoURL}
+                alt={currentUser.displayName || currentUser.email || 'User'}
+                className="user-avatar"
+                referrerPolicy="no-referrer"
+              />
+            ) : (
+              <User size={16} color="var(--primary)" />
+            )}
+            <span>{currentUser.email || currentUser.displayName || currentUser.uid}</span>
+            <button type="button" onClick={handleSignOut} className="signout-btn" title="Sign out">
+              <LogOut size={13} />
+              <span>Sign Out</span>
+            </button>
+          </div>
         </div>
       </header>
 
