@@ -23,7 +23,7 @@ flowchart TB
     Browser["User's Browser"]
     Auth["GCP Identity Platform / Firebase Auth"]
 
-    LB["Global External HTTPS Load Balancer\nSingle Public IP + Managed SSL Certificate\n(https://<IP>.sslip.io or Custom Domain)"]
+    LB["Global External HTTPS Load Balancer\nSingle Public IP + Managed SSL Certificate\n(https://<IP-with-dashes>.sslip.io)"]
 
     subgraph LockedCloudRun["Cloud Run (INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER)"]
         FE["frontend\n(Static React SPA + Nginx)"]
@@ -83,10 +83,9 @@ flowchart TB
 - A **Private Cloud DNS** zone for `googleapis.com.` maps `*.googleapis.com` to `199.36.153.8–11`.
 - Why `private.googleapis.com` is chosen: In addition to **Cloud Storage** (`storage.googleapis.com`) and **Vertex AI** (`*-aiplatform.googleapis.com`), Firebase Admin's `verify_id_token()` fetches public signing keys from `www.googleapis.com`, which works seamlessly over `private.googleapis.com` without internet access.
 
-### 2.4 HTTPS Certificate & Domain Options
-Google-managed SSL certificates and Firebase Login both require an HTTPS domain name (not a raw IP address). The Terraform setup will support two clean modes via a single `lb_custom_domain` variable:
-- **Default (No domain purchase needed)**: If `lb_custom_domain` is empty, Terraform automatically builds `<LB_STATIC_IP>.sslip.io` (e.g., `34-120-10-25.sslip.io`), a free wildcard DNS hostname that resolves directly to your Load Balancer IP so Google automatically issues and renews a trusted HTTPS certificate.
-- **Custom Domain**: If `lb_custom_domain = "rag.yourdomain.com"` is set, you point one DNS `A` record to the Load Balancer IP and Google issues the certificate for your domain.
+### 2.4 Free Automatic HTTPS Certificate (`sslip.io` — No Custom Domain Needed)
+- Google-managed SSL certificates and Firebase Login both require an HTTPS hostname (not a raw IP address).
+- Terraform automatically builds `<LB_IP_WITH_DASHES>.sslip.io` (e.g., `34-120-10-25.sslip.io`) directly from the Load Balancer's reserved static IP. `sslip.io` is a free public wildcard DNS service that automatically resolves that hostname back to your Load Balancer IP, allowing Google Cloud to automatically issue and renew a trusted HTTPS certificate at zero cost.
 
 ---
 
@@ -95,7 +94,7 @@ Google-managed SSL certificates and Firebase Login both require an HTTPS domain 
 ### Phase 1: Enable Networking APIs & Deployer Permissions
 - [x] Add `compute.googleapis.com` and `dns.googleapis.com` to `infra/apis.tf` and the `bootstrap` target in `Makefile`.
 - [x] Add networking & DNS IAM roles (`roles/compute.networkAdmin`, `roles/compute.loadBalancerAdmin`, `roles/compute.securityAdmin`, `roles/dns.admin`) to `TF_DEPLOYER_ROLES` in `Makefile` so automated Terraform deploys can manage VPC, DNS, and Load Balancer resources.
-- [x] Add optional `lb_custom_domain` and subnet CIDR variables to `infra/variables.tf` and `infra/terraform.tfvars.example`.
+- [x] Add `ingestion_subnet_cidr` and `agent_subnet_cidr` variables to `infra/variables.tf` and `infra/terraform.tfvars.example`.
 
 ### Phase 2: Build the Private VPC & Segmented Subnets (Concepts 1 & 2)
 - [ ] Create `infra/network.tf`:
@@ -113,8 +112,8 @@ Google-managed SSL certificates and Firebase Login both require an HTTPS domain 
 ### Phase 4: Provision the Global External HTTPS Load Balancer (Concept 2)
 - [ ] Create `infra/load_balancer.tf`:
   - Reserve a global static IPv4 address (`google_compute_global_address.lb_ip`).
-  - Compute the Load Balancer hostname (`var.lb_custom_domain != "" ? var.lb_custom_domain : "${replace(google_compute_global_address.lb_ip.address, ".", "-")}.sslip.io"`).
-  - Create a Google-managed SSL certificate (`google_compute_managed_ssl_certificate.lb_cert`) for that hostname.
+  - Derive the automatic Load Balancer hostname `"${replace(google_compute_global_address.lb_ip.address, ".", "-")}.sslip.io"`.
+  - Create a Google-managed SSL certificate (`google_compute_managed_ssl_certificate.lb_cert`) for that `sslip.io` hostname.
   - Create 3 Serverless Network Endpoint Groups (`google_compute_region_network_endpoint_group`) pointing to `frontend`, `ingestion_api`, and `agent_api`.
   - Create 3 Backend Services (`google_compute_backend_service` with `load_balancing_scheme = "EXTERNAL_MANAGED"`).
   - Create the HTTPS URL Map (`google_compute_url_map.https_router`) routing:
@@ -132,14 +131,14 @@ Google-managed SSL certificates and Firebase Login both require an HTTPS domain 
   - Set `frontend` environment variables to same-origin Load Balancer paths: `INGESTION_API_URL = "/api/ingest"` and `AGENT_API_URL = "/api/agent"`.
   - Update `ALLOWED_ORIGINS` to include the Load Balancer `https://` URL.
 - [ ] Update `infra/auth.tf`:
-  - Add the Load Balancer domain to Identity Platform `authorized_domains` so Firebase Sign-In works immediately on the new domain.
+  - Add the Load Balancer `sslip.io` domain to Identity Platform `authorized_domains` so Firebase Sign-In works immediately on the new domain.
 - [ ] Update `infra/outputs.tf`:
-  - Output `load_balancer_ip` and `load_balancer_url` (`https://<domain>`) as the primary entry point.
+  - Output `load_balancer_ip` and `load_balancer_url` (`https://<IP-with-dashes>.sslip.io`) as the primary entry point.
 
 ### Phase 6: Deploy & Verify End-to-End
 - [ ] Run `make bootstrap` to enable `compute` & `dns` APIs and update deployer IAM roles.
 - [ ] Run `make plan` and `make deploy` to provision the VPC, Private Endpoints, Load Balancer, and locked-down Cloud Run revisions.
-- [ ] *(If using Google Sign-In OAuth)* Add the new `https://<LB_DOMAIN>` URL under **APIs & Services $\rightarrow$ Credentials $\rightarrow$ OAuth 2.0 Web Client $\rightarrow$ Authorized JavaScript origins** in the GCP Console.
+- [ ] *(If using Google Sign-In OAuth)* Add the new `https://<IP-with-dashes>.sslip.io` URL under **APIs & Services $\rightarrow$ Credentials $\rightarrow$ OAuth 2.0 Web Client $\rightarrow$ Authorized JavaScript origins** in the GCP Console.
 - [ ] Wait ~10–15 minutes on first creation for the Google-managed SSL certificate status to reach `ACTIVE`, then execute the verification playbook below.
 
 ---
@@ -150,12 +149,12 @@ Google-managed SSL certificates and Firebase Login both require an HTTPS domain 
 | :--- | :--- | :--- |
 | `Makefile` | Modify | Enable `compute` & `dns` APIs; add network/LB/DNS roles to deployer SA |
 | `infra/apis.tf` | Modify | Track `compute.googleapis.com` and `dns.googleapis.com` in Terraform |
-| `infra/variables.tf` | Modify | Add `lb_custom_domain`, `ingestion_subnet_cidr`, and `agent_subnet_cidr` |
-| `infra/terraform.tfvars.example` | Modify | Document optional `lb_custom_domain` setting |
+| `infra/variables.tf` | Modify | Add `ingestion_subnet_cidr` and `agent_subnet_cidr` |
+| `infra/terraform.tfvars.example` | Modify | Document subnet CIDR settings |
 | `infra/network.tf` | **Create** | Custom VPC (no internet route), segmented subnets, Private Google Access route, and Private Cloud DNS (`*.googleapis.com`) |
-| `infra/load_balancer.tf` | **Create** | Static IP, Managed SSL cert, 3 Serverless NEGs, 3 Backend Services, `/api/ingest/*` & `/api/agent/*` URL rewrites, HTTPS + HTTP-redirect proxies |
+| `infra/load_balancer.tf` | **Create** | Static IP, `sslip.io` Managed SSL cert, 3 Serverless NEGs, 3 Backend Services, `/api/ingest/*` & `/api/agent/*` URL rewrites, HTTPS + HTTP-redirect proxies |
 | `infra/cloud_run.tf` | Modify | Lock `ingress` to Load Balancer only, attach Direct VPC Egress (`ALL_TRAFFIC`), wire `/api/ingest` & `/api/agent`, disable Chroma telemetry |
-| `infra/auth.tf` | Modify | Authorize the Load Balancer domain in Identity Platform |
+| `infra/auth.tf` | Modify | Authorize the Load Balancer `sslip.io` domain in Identity Platform |
 | `infra/outputs.tf` | Modify | Expose `load_balancer_url` and `load_balancer_ip` |
 
 ---

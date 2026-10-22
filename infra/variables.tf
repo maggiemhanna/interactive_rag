@@ -128,9 +128,3 @@ variable "agent_subnet_cidr" {
     error_message = "agent_subnet_cidr must be a valid IPv4 CIDR block (e.g., 10.10.2.0/26)."
   }
 }
-
-variable "lb_custom_domain" {
-  description = "Optional custom domain for the HTTPS Load Balancer (e.g., 'rag.example.com'). If empty, defaults to '<LB_STATIC_IP>.sslip.io' for automatic free Google-managed HTTPS."
-  type        = string
-  default     = ""
-}
