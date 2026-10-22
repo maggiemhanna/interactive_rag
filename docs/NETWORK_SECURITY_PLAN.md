@@ -103,7 +103,7 @@ flowchart TB
   - Provision `agent-subnet` (`10.10.2.0/26`) in `var.region` with `private_ip_google_access = true`.
 
 ### Phase 3: Configure Private Endpoints & Private Cloud DNS (Concept 3)
-- [ ] In `infra/network.tf` (or `infra/dns.tf`):
+- [x] In `infra/network.tf`:
   - Add a static VPC route (`google_compute_route.private_googleapis`) sending `199.36.153.8/30` to `default-internet-gateway` (Google's internal next-hop for Private Google Access).
   - Create a private Cloud DNS zone (`google_dns_managed_zone.googleapis`, `dns_name = "googleapis.com."`, `visibility = "private"`) bound to `google_compute_network.main`.
   - Add DNS `A` record `private.googleapis.com.` $\rightarrow$ `["199.36.153.8", "199.36.153.9", "199.36.153.10", "199.36.153.11"]`.
