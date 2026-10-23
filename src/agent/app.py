@@ -16,7 +16,8 @@ from src.core.chroma import require_collection
 from src.core.config import AGENT_PORT, is_reload_enabled
 from src.core.logger import setup_logging
 from src.core.routes import create_app
-from src.core.storage import user_read_lock
+from src.core.security import INTERNAL_ERROR_MESSAGE
+from src.core.storage import LockTimeoutError, user_read_lock
 
 logger = setup_logging(name="agent")
 
@@ -76,14 +77,16 @@ def agent(
             "collection_name": request.collection_name,
             "messages": formatted_messages,
         }
+    except LockTimeoutError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except FileNotFoundError as e:
         logger.error(f"Collection not found for uid='{uid}': {e}")
         raise HTTPException(status_code=404, detail=str(e))
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error running Agentic RAG for uid='{uid}': {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception(f"Error running Agentic RAG for uid='{uid}'")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_MESSAGE)
 
 
 @app.post("/agent/stream")

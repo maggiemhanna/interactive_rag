@@ -154,11 +154,11 @@ flowchart TB
     - `output_guard`: Runs Model Armor + Cloud DLP `sanitize_model_output` on the final `AIMessage` before emitting/persisting final output.
 
 ### Phase 5: Streaming Redaction, Recursion Cap & Sanitized Errors (`src/agent/stream.py` & `app.py`)
-- [ ] Update `src/agent/stream.py`:
+- [x] Update `src/agent/stream.py`:
   - Pass `"recursion_limit": AGENT_RECURSION_LIMIT` in `RunnableConfig`.
   - Catch `GraphRecursionError` gracefully and yield a clear user-facing message explaining the search-step limit was reached.
   - Ensure streamed SSE events emit the post-`output_guard` redacted `AIMessage` and sanitize unexpected streaming errors instead of leaking stack traces.
-- [ ] Update `src/agent/app.py` to return sanitized HTTP `500` details while logging full exceptions internally.
+- [x] Update `src/agent/app.py` to return sanitized HTTP `500` details while logging full exceptions internally.
 
 ### Phase 6: Automated Unit Tests & Live Cloud Verification
 - [ ] Create `tests/ai_security.py` offline `unittest` suite covering:

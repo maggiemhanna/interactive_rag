@@ -2,8 +2,9 @@ import json
 import os
 from typing import Any, Dict, Generator, Optional
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.errors import GraphRecursionError
 
 from src.agent.display import print_event, print_header
 from src.agent.graph import build_agent
@@ -14,8 +15,10 @@ from src.core.config import (
     DEFAULT_COLLECTION,
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_LLM_MODEL,
+    get_agent_recursion_limit,
 )
 from src.core.logger import setup_logging
+from src.core.security import INTERNAL_ERROR_MESSAGE, RECURSION_LIMIT_MESSAGE
 from src.core.storage import user_read_lock
 
 logger = setup_logging(name="agent.stream")
@@ -56,32 +59,66 @@ def _stream_events(
     )
     agent = build_agent(retriever_tool, model_name=model_name)
 
-    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    recursion_limit = get_agent_recursion_limit()
+    config: RunnableConfig = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": recursion_limit,
+    }
     input_messages = [HumanMessage(content=query)]
+    emitted_keys = set()
 
-    for event in agent.stream(
-        {"messages": input_messages}, config, stream_mode="values"
-    ):
-        messages = event.get("messages", [])
-        if messages:
-            last_msg = messages[-1]
-            # Print all components of the message using src/agent/display.py
-            print_event(last_msg)
+    try:
+        for event in agent.stream(
+            {"messages": input_messages}, config, stream_mode="values"
+        ):
+            messages = event.get("messages", [])
+            if messages:
+                last_msg = messages[-1]
+                msg_id = getattr(last_msg, "id", None)
+                dedup_key = (
+                    msg_id
+                    if msg_id is not None
+                    else (
+                        getattr(last_msg, "type", "unknown"),
+                        extract_text(getattr(last_msg, "content", "")),
+                        repr(getattr(last_msg, "tool_calls", None)),
+                    )
+                )
+                if dedup_key in emitted_keys:
+                    continue
+                emitted_keys.add(dedup_key)
 
-            msg_dict = {
-                "type": getattr(last_msg, "type", "unknown"),
-                "content": extract_text(getattr(last_msg, "content", "")),
-            }
-            if getattr(last_msg, "tool_calls", None):
-                msg_dict["tool_calls"] = last_msg.tool_calls
-            if getattr(last_msg, "name", None):
-                msg_dict["name"] = last_msg.name
+                # Print all components of the message using src/agent/display.py
+                print_event(last_msg)
 
-            yield {
-                "event": "message",
-                "message": msg_dict,
-                "raw_message": last_msg,
-            }
+                msg_dict = {
+                    "type": getattr(last_msg, "type", "unknown"),
+                    "content": extract_text(getattr(last_msg, "content", "")),
+                }
+                if getattr(last_msg, "tool_calls", None):
+                    msg_dict["tool_calls"] = last_msg.tool_calls
+                if getattr(last_msg, "name", None):
+                    msg_dict["name"] = last_msg.name
+
+                yield {
+                    "event": "message",
+                    "message": msg_dict,
+                    "raw_message": last_msg,
+                }
+    except GraphRecursionError:
+        logger.warning(
+            f"Agent reached recursion_limit={recursion_limit} for thread_id='{thread_id}'."
+        )
+        fallback_msg = AIMessage(content=RECURSION_LIMIT_MESSAGE)
+        print_event(fallback_msg)
+        yield {
+            "event": "message",
+            "message": {
+                "type": "ai",
+                "content": RECURSION_LIMIT_MESSAGE,
+            },
+            "raw_message": fallback_msg,
+        }
 
 
 def stream_events(
@@ -123,20 +160,35 @@ def stream_sse(
     scoped_thread_id: str,
 ) -> Generator[str, None, None]:
     """Generator yielding Server-Sent Events (SSE) payloads while pinning user Chroma cache."""
-    with user_read_lock(uid) as stream_persist_dir:
-        for evt in stream_events(
-            query=request.query,
-            collection_name=request.collection_name,
-            thread_id=scoped_thread_id,
-            model_name=request.model_name,
-            embedding_model=request.embedding_model,
-            persist_directory=stream_persist_dir,
-        ):
-            data = {
-                "event": evt["event"],
-                "message": evt["message"],
-            }
-            yield f"data: {json.dumps(data)}\n\n"
+    try:
+        with user_read_lock(uid) as stream_persist_dir:
+            for evt in stream_events(
+                query=request.query,
+                collection_name=request.collection_name,
+                thread_id=scoped_thread_id,
+                model_name=request.model_name,
+                embedding_model=request.embedding_model,
+                persist_directory=stream_persist_dir,
+            ):
+                data = {
+                    "event": evt["event"],
+                    "message": evt["message"],
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+        yield "data: [DONE]\n\n"
+    except Exception:
+        logger.exception(
+            f"Unexpected error streaming Agentic RAG SSE for uid='{uid}' (thread_id='{scoped_thread_id}')"
+        )
+        err_data = {
+            "event": "error",
+            "error": INTERNAL_ERROR_MESSAGE,
+            "message": {
+                "type": "ai",
+                "content": INTERNAL_ERROR_MESSAGE,
+            },
+        }
+        yield f"data: {json.dumps(err_data)}\n\n"
         yield "data: [DONE]\n\n"
 
 
