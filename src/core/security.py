@@ -289,17 +289,24 @@ def _inspect_sanitization_result(
     return ScreeningDecision(allowed=True, text=original_text)
 
 
+def _is_model_armor_fail_closed() -> bool:
+    """Returns True when unconfigured Model Armor should fail closed (`MODEL_ARMOR_FAIL_CLOSED=true`)."""
+    return os.getenv("MODEL_ARMOR_FAIL_CLOSED", "").strip().lower() in {"1", "true", "yes"}
+
+
 def screen_user_prompt(prompt: str) -> ScreeningDecision:
     """Screens an incoming user prompt via Google Cloud Model Armor (`sanitize_user_prompt`)."""
     target = _resolve_model_armor_target()
     if target is None:
-        if is_cloud_run():
-            logger.error("MODEL_ARMOR_TEMPLATE_ID is unset in Cloud Run; failing closed.")
+        if _is_model_armor_fail_closed():
+            logger.error("MODEL_ARMOR_TEMPLATE_ID is unset with MODEL_ARMOR_FAIL_CLOSED=true; failing closed.")
             return ScreeningDecision(
                 allowed=False,
                 text=PROMPT_BLOCKED_MESSAGE,
                 blocked_reason="missing_model_armor_config",
             )
+        if is_cloud_run():
+            logger.warning("MODEL_ARMOR_TEMPLATE_ID is unset in Cloud Run; skipping Model Armor prompt check.")
         return ScreeningDecision(allowed=True, text=prompt)
 
     template_name, location = target
@@ -339,13 +346,15 @@ def sanitize_model_output(
 
     target = _resolve_model_armor_target()
     if target is None:
-        if is_cloud_run():
-            logger.error("MODEL_ARMOR_TEMPLATE_ID is unset in Cloud Run; failing closed.")
+        if _is_model_armor_fail_closed():
+            logger.error("MODEL_ARMOR_TEMPLATE_ID is unset with MODEL_ARMOR_FAIL_CLOSED=true; failing closed.")
             return ScreeningDecision(
                 allowed=False,
                 text=SAFETY_REFUSAL_MESSAGE,
                 blocked_reason="missing_model_armor_config",
             )
+        if is_cloud_run():
+            logger.warning("MODEL_ARMOR_TEMPLATE_ID is unset in Cloud Run; skipping Model Armor output check.")
         return ScreeningDecision(allowed=True, text=output_text)
 
     template_name, location = target

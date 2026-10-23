@@ -143,9 +143,9 @@ flowchart TB
 - [x] Update `src/ingestion/app.py` to replace raw `detail=str(e)` `500` responses with safe error messages and server-side `logger.exception(...)`.
 
 ### Phase 4: XML Spotlighting, Grounding, Citations & Content Safety (`src/agent/`)
-- [ ] Update `src/agent/tools.py` (`get_retriever_tool`):
+- [x] Update `src/agent/tools.py` (`get_retriever_tool`):
   - Replace `create_retriever_tool` with a custom structured `@tool` returning chunks wrapped in `<retrieved_chunk source="..." page="...">...</retrieved_chunk>` (1-indexed page numbers, escaped `<` / `>` inside chunk content, explicit empty-result marker when no chunks match).
-- [ ] Update `src/agent/graph.py` (`build_agent`):
+- [x] Update `src/agent/graph.py` (`build_agent`):
   - Configure `ChatGoogleGenerativeAI` with explicit `safety_settings` mapped from `GEMINI_SAFETY_THRESHOLD`.
   - Harden `SystemMessage` with XML spotlighting hierarchy rules, strict grounding (abstain if unsupported by `<retrieved_chunk>`), and mandatory `[source, p.X]` inline citations.
   - Inspect `response.response_metadata` (`finish_reason`) in `model_call` and substitute a polite safety refusal fallback when Gemini blocks generation.

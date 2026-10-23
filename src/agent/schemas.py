@@ -1,4 +1,4 @@
-from typing import Annotated, Sequence, TypedDict
+from typing import Annotated, NotRequired, Optional, Sequence, TypedDict
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
@@ -62,3 +62,5 @@ class AgentState(TypedDict):
     """State definition for the RAG Agent workflow."""
 
     messages: Annotated[Sequence[BaseMessage], add_messages]
+    pending_response: NotRequired[Optional[BaseMessage]]
+    input_blocked: NotRequired[bool]
