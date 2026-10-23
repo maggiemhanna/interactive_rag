@@ -27,3 +27,15 @@ google_oauth_client_secret_name    = "google_oauth_client_secret"
 # VPC Subnets (Direct VPC Egress for ingestion-api and agent-api)
 ingestion_subnet_cidr = "10.10.1.0/26"
 agent_subnet_cidr     = "10.10.2.0/26"
+
+# AI-Specific Security (Model Allowlists, Model Armor, Content Safety & Guardrail Ceilings)
+allowed_llm_models         = "gemini-3.8-flash,gemini-2.5-flash,gemini-2.5-pro"
+allowed_embedding_models   = "gemini-embedding-001,text-embedding-005"
+gemini_safety_threshold    = "BLOCK_LOW_AND_ABOVE"
+model_armor_pi_confidence  = "MEDIUM_AND_ABOVE"
+model_armor_rai_confidence = "MEDIUM_AND_ABOVE"
+max_upload_mb              = 20
+max_files_per_request      = 10
+max_chunks_per_ingest      = 1000
+max_query_chars            = 4000
+agent_recursion_limit      = 6

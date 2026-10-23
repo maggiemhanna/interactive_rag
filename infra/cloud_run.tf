@@ -87,6 +87,26 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
         name  = "ANONYMIZED_TELEMETRY"
         value = "FALSE"
       }
+      env {
+        name  = "ALLOWED_EMBEDDING_MODELS"
+        value = var.allowed_embedding_models
+      }
+      env {
+        name  = "MAX_UPLOAD_MB"
+        value = tostring(var.max_upload_mb)
+      }
+      env {
+        name  = "MAX_FILES_PER_REQUEST"
+        value = tostring(var.max_files_per_request)
+      }
+      env {
+        name  = "MAX_CHUNKS_PER_INGEST"
+        value = tostring(var.max_chunks_per_ingest)
+      }
+      env {
+        name  = "MAX_QUERY_CHARS"
+        value = tostring(var.max_query_chars)
+      }
     }
   }
 
@@ -172,13 +192,44 @@ resource "google_cloud_run_v2_service" "agent_api" {
         name  = "ANONYMIZED_TELEMETRY"
         value = "FALSE"
       }
+      env {
+        name  = "MODEL_ARMOR_TEMPLATE_ID"
+        value = google_model_armor_template.rag_guard.id
+      }
+      env {
+        name  = "MODEL_ARMOR_LOCATION"
+        value = var.region
+      }
+      env {
+        name  = "GEMINI_SAFETY_THRESHOLD"
+        value = var.gemini_safety_threshold
+      }
+      env {
+        name  = "ALLOWED_LLM_MODELS"
+        value = var.allowed_llm_models
+      }
+      env {
+        name  = "ALLOWED_EMBEDDING_MODELS"
+        value = var.allowed_embedding_models
+      }
+      env {
+        name  = "MAX_QUERY_CHARS"
+        value = tostring(var.max_query_chars)
+      }
+      env {
+        name  = "AGENT_RECURSION_LIMIT"
+        value = tostring(var.agent_recursion_limit)
+      }
     }
   }
 
   depends_on = [
     google_project_service.required_apis["run.googleapis.com"],
     google_project_iam_member.backend_vertex_ai_user,
+    google_project_iam_member.backend_model_armor_user,
+    google_project_iam_member.backend_dlp_user,
     google_storage_bucket_iam_member.backend_chroma_bucket_object_user,
+    google_model_armor_template.rag_guard,
     google_compute_route.private_googleapis,
     google_dns_record_set.private_googleapis_a,
     google_dns_record_set.googleapis_wildcard_cname,

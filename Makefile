@@ -42,6 +42,8 @@ TF_DEPLOYER_ROLES := \
 	roles/serviceusage.serviceUsageAdmin \
 	roles/serviceusage.apiKeysAdmin \
 	roles/identityplatform.admin \
+	roles/modelarmor.admin \
+	roles/dlp.admin \
 	roles/secretmanager.secretAccessor \
 	roles/secretmanager.viewer \
 	roles/browser \
@@ -103,6 +105,8 @@ bootstrap: check-project ## Enable seed APIs, create GCS Terraform state bucket,
 		apikeys.googleapis.com \
 		run.googleapis.com \
 		aiplatform.googleapis.com \
+		modelarmor.googleapis.com \
+		dlp.googleapis.com \
 		--project="$(PROJECT_ID)"
 	@echo "==> Ensuring Terraform remote state bucket gs://$(TF_STATE_BUCKET) exists..."
 	@if ! gcloud storage buckets describe "gs://$(TF_STATE_BUCKET)" --project="$(PROJECT_ID)" >/dev/null 2>&1; then \

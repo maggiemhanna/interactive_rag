@@ -6,6 +6,8 @@ locals {
     "compute.googleapis.com",
     "dns.googleapis.com",
     "aiplatform.googleapis.com",
+    "modelarmor.googleapis.com",
+    "dlp.googleapis.com",
     "storage.googleapis.com",
     "iam.googleapis.com",
     "identitytoolkit.googleapis.com",

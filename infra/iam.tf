@@ -33,3 +33,17 @@ resource "google_storage_bucket_iam_member" "backend_chroma_bucket_object_user" 
   role   = "roles/storage.objectUser"
   member = "serviceAccount:${google_service_account.backend_sa.email}"
 }
+
+# Allow backend services to invoke Google Cloud Model Armor prompt & response screening templates
+resource "google_project_iam_member" "backend_model_armor_user" {
+  project = var.project_id
+  role    = "roles/modelarmor.user"
+  member  = "serviceAccount:${google_service_account.backend_sa.email}"
+}
+
+# Allow backend services to invoke Sensitive Data Protection (Cloud DLP) inspection & de-identification
+resource "google_project_iam_member" "backend_dlp_user" {
+  project = var.project_id
+  role    = "roles/dlp.user"
+  member  = "serviceAccount:${google_service_account.backend_sa.email}"
+}

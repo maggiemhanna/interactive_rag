@@ -48,3 +48,18 @@ output "firebase_web_api_key" {
   value       = try(google_identity_platform_config.auth.client[0].api_key, "")
   sensitive   = true
 }
+
+output "model_armor_template_id" {
+  description = "Full resource ID of the provisioned Google Cloud Model Armor template."
+  value       = google_model_armor_template.rag_guard.id
+}
+
+output "dlp_inspect_template_id" {
+  description = "Full resource ID of the Sensitive Data Protection (Cloud DLP) inspect template."
+  value       = google_data_loss_prevention_inspect_template.ai_output_inspect.id
+}
+
+output "dlp_deidentify_template_id" {
+  description = "Full resource ID of the Sensitive Data Protection (Cloud DLP) de-identify template."
+  value       = google_data_loss_prevention_deidentify_template.ai_output_deidentify.id
+}

@@ -128,3 +128,81 @@ variable "agent_subnet_cidr" {
     error_message = "agent_subnet_cidr must be a valid IPv4 CIDR block (e.g., 10.10.2.0/26)."
   }
 }
+
+variable "allowed_llm_models" {
+  description = "Comma-separated allowlist of approved Vertex AI generative LLM models."
+  type        = string
+  default     = "gemini-3.8-flash,gemini-2.5-flash,gemini-2.5-pro"
+}
+
+variable "allowed_embedding_models" {
+  description = "Comma-separated allowlist of approved Vertex AI embedding models."
+  type        = string
+  default     = "gemini-embedding-001,text-embedding-005"
+}
+
+variable "gemini_safety_threshold" {
+  description = "Gemini HarmBlockThreshold applied to all content safety categories."
+  type        = string
+  default     = "BLOCK_LOW_AND_ABOVE"
+
+  validation {
+    condition = contains(
+      ["BLOCK_LOW_AND_ABOVE", "BLOCK_MEDIUM_AND_ABOVE", "BLOCK_ONLY_HIGH"],
+      var.gemini_safety_threshold
+    )
+    error_message = "gemini_safety_threshold must be BLOCK_LOW_AND_ABOVE, BLOCK_MEDIUM_AND_ABOVE, or BLOCK_ONLY_HIGH."
+  }
+}
+
+variable "model_armor_pi_confidence" {
+  description = "Model Armor detection confidence threshold for Prompt Injection and Jailbreak screening."
+  type        = string
+  default     = "MEDIUM_AND_ABOVE"
+
+  validation {
+    condition     = contains(["LOW_AND_ABOVE", "MEDIUM_AND_ABOVE", "HIGH"], var.model_armor_pi_confidence)
+    error_message = "model_armor_pi_confidence must be LOW_AND_ABOVE, MEDIUM_AND_ABOVE, or HIGH."
+  }
+}
+
+variable "model_armor_rai_confidence" {
+  description = "Model Armor detection confidence threshold for Responsible AI harm categories."
+  type        = string
+  default     = "MEDIUM_AND_ABOVE"
+
+  validation {
+    condition     = contains(["LOW_AND_ABOVE", "MEDIUM_AND_ABOVE", "HIGH"], var.model_armor_rai_confidence)
+    error_message = "model_armor_rai_confidence must be LOW_AND_ABOVE, MEDIUM_AND_ABOVE, or HIGH."
+  }
+}
+
+variable "max_upload_mb" {
+  description = "Maximum allowed file size (in MiB) per uploaded PDF."
+  type        = number
+  default     = 20
+}
+
+variable "max_files_per_request" {
+  description = "Maximum number of PDF files accepted in a single ingestion request."
+  type        = number
+  default     = 10
+}
+
+variable "max_chunks_per_ingest" {
+  description = "Maximum total text chunks allowed in a single ingestion request."
+  type        = number
+  default     = 1000
+}
+
+variable "max_query_chars" {
+  description = "Maximum character length allowed for user search and agent queries."
+  type        = number
+  default     = 4000
+}
+
+variable "agent_recursion_limit" {
+  description = "LangGraph recursion_limit ceiling bounding back-and-forth retrieval loops."
+  type        = number
+  default     = 6
+}

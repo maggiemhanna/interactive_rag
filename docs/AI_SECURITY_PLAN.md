@@ -111,8 +111,8 @@ flowchart TB
 ## 4. Step-by-Step Implementation Phases
 
 ### Phase 1: Enable GCP Security APIs & Provision Model Armor + Cloud DLP (Terraform)
-- [ ] Update `Makefile` (`bootstrap` APIs and `TF_DEPLOYER_ROLES`) and `infra/apis.tf` to enable `modelarmor.googleapis.com` and `dlp.googleapis.com`, and grant deployer roles (`roles/modelarmor.admin`, `roles/dlp.admin`).
-- [ ] Create `infra/ai_security.tf`:
+- [x] Update `Makefile` (`bootstrap` APIs and `TF_DEPLOYER_ROLES`) and `infra/apis.tf` to enable `modelarmor.googleapis.com` and `dlp.googleapis.com`, and grant deployer roles (`roles/modelarmor.admin`, `roles/dlp.admin`).
+- [x] Create `infra/ai_security.tf`:
   - Provision `google_project_service_identity` for `modelarmor.googleapis.com` and grant its service agent `roles/dlp.user` + `roles/dlp.reader` so Model Armor can invoke Cloud DLP templates.
   - Provision `google_data_loss_prevention_inspect_template` and `google_data_loss_prevention_deidentify_template` (`[INFO_TYPE]` masking for common PII & credentials).
   - Provision regional `google_model_armor_template` (`location = var.region`) enabling:
@@ -120,8 +120,8 @@ flowchart TB
     - `sdp_settings { advanced_config { inspect_template = ... deidentify_template = ... } }`
     - `malicious_uri_filter_settings` (`ENABLED`)
     - `rai_settings` (`HATE_SPEECH`, `HARASSMENT`, `SEXUALLY_EXPLICIT`, `DANGEROUS` at `MEDIUM_AND_ABOVE`)
-- [ ] Update `infra/iam.tf`: Grant existing `backend_sa` `roles/modelarmor.user` and `roles/dlp.user` *(keeping the single `backend_sa` per scope decision)*.
-- [ ] Update `infra/variables.tf`, `infra/terraform.tfvars.example`, `infra/cloud_run.tf`, and `infra/outputs.tf` to inject `MODEL_ARMOR_TEMPLATE_ID`, `MODEL_ARMOR_LOCATION`, `GEMINI_SAFETY_THRESHOLD`, model allowlists, and guardrail ceilings into Cloud Run.
+- [x] Update `infra/iam.tf`: Grant existing `backend_sa` `roles/modelarmor.user` and `roles/dlp.user` *(keeping the single `backend_sa` per scope decision)*.
+- [x] Update `infra/variables.tf`, `infra/terraform.tfvars.example`, `infra/cloud_run.tf`, and `infra/outputs.tf` to inject `MODEL_ARMOR_TEMPLATE_ID`, `MODEL_ARMOR_LOCATION`, `GEMINI_SAFETY_THRESHOLD`, model allowlists, and guardrail ceilings into Cloud Run.
   *(Note: Existing `*.googleapis.com -> private.googleapis.com` Private DNS in `infra/network.tf` already routes `modelarmor.<region>.rep.googleapis.com` and `dlp.googleapis.com` privately—no VPC changes needed.)*
 
 ### Phase 2: Centralize AI Security Config, Model Allowlists & Validators
