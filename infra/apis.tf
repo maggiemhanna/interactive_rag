@@ -5,6 +5,7 @@ locals {
     "cloudbuild.googleapis.com",
     "compute.googleapis.com",
     "dns.googleapis.com",
+    "networkconnectivity.googleapis.com",
     "aiplatform.googleapis.com",
     "modelarmor.googleapis.com",
     "dlp.googleapis.com",
@@ -27,7 +28,6 @@ resource "google_project_service" "required_apis" {
 
 data "google_project" "current" {
   project_id = var.project_id
-  depends_on = [google_project_service.required_apis]
 }
 
 resource "google_artifact_registry_repository" "docker_repo" {

@@ -18,7 +18,7 @@ This document is the step-by-step blueprint for upgrading **InteractiveRAG** wit
 - **Unfiltered outputs & raw errors:** PII inside PDFs can be echoed verbatim, HTTP `500` responses return raw `str(e)` exceptions, and Gemini safety blocks return empty `""` answers.
 
 ### After
-- Every query, retrieved passage, model invocation, and streamed response passes through layered application and managed Google Cloud security checkpoints—traveling strictly over the existing private `199.36.153.8/30` (`private.googleapis.com`) VPC tunnel.
+- Every query, retrieved passage, model invocation, and streamed response passes through layered application and managed Google Cloud security checkpoints—traveling strictly inside the zero-internet VPC over Private Google Access (`*.googleapis.com -> 199.36.153.8/30`) and a dedicated Regional Private Service Connect endpoint (`modelarmor.<region>.rep.googleapis.com -> 10.10.3.0/28`).
 
 ```mermaid
 flowchart TB
@@ -37,9 +37,9 @@ flowchart TB
         OutGuard["4. output_guard & Stream Filter\n- Model Armor + Cloud DLP Masking\n- Unified JSON & SSE Redaction\n- Sanitized 500 Error Handler"]
     end
 
-    subgraph GooglePrivateBackbone["Google Private Backbone (*.googleapis.com -> 199.36.153.8/30)"]
-        Armor["Google Cloud Model Armor\nPrompt Injection & Jailbreak Filter"]
-        DLP["Sensitive Data Protection (Cloud DLP)\nInspect + De-identify ([REDACTED])"]
+    subgraph GooglePrivateBackbone["Google Private Backbone (PGA 199.36.153.8/30 + Regional PSC 10.10.3.0/28)"]
+        Armor["Google Cloud Model Armor\nPrompt Injection & Jailbreak Filter (Regional PSC)"]
+        DLP["Sensitive Data Protection (Cloud DLP)\nInspect + De-identify ([INFO_TYPE])"]
         Vertex["Vertex AI\nApproved Gemini & Embedding Models"]
         GCS["Cloud Storage + Per-User ChromaDB"]
     end
@@ -111,7 +111,7 @@ flowchart TB
 ## 4. Step-by-Step Implementation Phases
 
 ### Phase 1: Enable GCP Security APIs & Provision Model Armor + Cloud DLP (Terraform)
-- [x] Update `Makefile` (`bootstrap` APIs and `TF_DEPLOYER_ROLES`) and `infra/apis.tf` to enable `modelarmor.googleapis.com` and `dlp.googleapis.com`, and grant deployer roles (`roles/modelarmor.admin`, `roles/dlp.admin`).
+- [x] Update `Makefile` (`bootstrap` APIs and `TF_DEPLOYER_ROLES`) and `infra/apis.tf` to enable `modelarmor.googleapis.com`, `dlp.googleapis.com`, and `networkconnectivity.googleapis.com`, and grant deployer roles (`roles/modelarmor.admin`, `roles/dlp.admin`, `roles/networkconnectivity.regionalEndpointAdmin`).
 - [x] Create `infra/ai_security.tf`:
   - Provision `google_project_service_identity` for `modelarmor.googleapis.com` and grant its service agent `roles/dlp.user` + `roles/dlp.reader` so Model Armor can invoke Cloud DLP templates.
   - Provision `google_data_loss_prevention_inspect_template` and `google_data_loss_prevention_deidentify_template` (`[INFO_TYPE]` masking for common PII & credentials).
@@ -121,8 +121,8 @@ flowchart TB
     - `malicious_uri_filter_settings` (`ENABLED`)
     - `rai_settings` (`HATE_SPEECH`, `HARASSMENT`, `SEXUALLY_EXPLICIT`, `DANGEROUS` at `MEDIUM_AND_ABOVE`)
 - [x] Update `infra/iam.tf`: Grant existing `backend_sa` `roles/modelarmor.user` and `roles/dlp.user` *(keeping the single `backend_sa` per scope decision)*.
+- [x] Update `infra/network.tf`: Provision a dedicated `psc_subnet_cidr` (`10.10.3.0/28`), `google_network_connectivity_regional_endpoint` (`modelarmor.<region>.rep.googleapis.com`), and Private Cloud DNS zone (`modelarmor.<region>.rep.googleapis.com.`) because Google's `private.googleapis.com` (`199.36.153.8/30`) VIP excludes regional `*.rep.googleapis.com` endpoints.
 - [x] Update `infra/variables.tf`, `infra/terraform.tfvars.example`, `infra/cloud_run.tf`, and `infra/outputs.tf` to inject `MODEL_ARMOR_TEMPLATE_ID`, `MODEL_ARMOR_LOCATION`, `GEMINI_SAFETY_THRESHOLD`, model allowlists, and guardrail ceilings into Cloud Run.
-  *(Note: Existing `*.googleapis.com -> private.googleapis.com` Private DNS in `infra/network.tf` already routes `modelarmor.<region>.rep.googleapis.com` and `dlp.googleapis.com` privately—no VPC changes needed.)*
 
 ### Phase 2: Centralize AI Security Config, Model Allowlists & Validators
 - [x] Add `google-cloud-modelarmor` (and `google-cloud-dlp` if needed for direct fallback) to `requirements.txt`.
@@ -169,7 +169,7 @@ flowchart TB
   - `input_guard` Model Armor prompt-injection blocking & `output_guard` DLP PII redaction across both JSON and SSE `/agent` responses (using mocked `ModelArmorClient`).
   - `GraphRecursionError` handling when tool calls exceed `AGENT_RECURSION_LIMIT`.
   - Gemini `finish_reason="SAFETY"` refusal fallback and sanitized HTTP `500` responses.
-- [ ] Run `make bootstrap`, `make build-push`, and `make deploy`, then execute the live verification playbook below.
+- [x] Run `make bootstrap`, `make build-push`, and `make deploy`, then execute the live verification playbook below.
 
 ---
 
@@ -179,14 +179,15 @@ flowchart TB
 | :--- | :--- | :--- |
 | `docs/AI_SECURITY_PLAN.md` | **Create** | Architectural & phased implementation blueprint for AI-Specific Security |
 | `requirements.txt` | Modify | Add `google-cloud-modelarmor` client dependency |
-| `Makefile` | Modify | Enable `modelarmor` & `dlp` APIs; add Model Armor & DLP admin roles to deployer SA |
-| `infra/apis.tf` | Modify | Track `modelarmor.googleapis.com` and `dlp.googleapis.com` in Terraform |
+| `Makefile` | Modify | Enable `modelarmor`, `dlp`, & `networkconnectivity` APIs; add Model Armor, DLP, & Regional Endpoint admin roles to deployer SA |
+| `infra/apis.tf` | Modify | Track `modelarmor.googleapis.com`, `dlp.googleapis.com`, and `networkconnectivity.googleapis.com` in Terraform |
 | `infra/ai_security.tf` | **Create** | Provision Cloud DLP Inspect/De-identify templates, Model Armor template, and service agent bindings |
+| `infra/network.tf` | Modify | Provision dedicated `psc_subnet_cidr`, regional PSC endpoint for `modelarmor.<region>.rep.googleapis.com`, and private DNS zone |
 | `infra/iam.tf` | Modify | Grant `backend_sa` `roles/modelarmor.user` and `roles/dlp.user` |
-| `infra/variables.tf` | Modify | Add configurable security thresholds, model lists, and upload/guardrail limits |
-| `infra/terraform.tfvars.example` | Modify | Document AI security Terraform settings |
+| `infra/variables.tf` | Modify | Add `psc_subnet_cidr`, configurable security thresholds, model lists, and upload/guardrail limits |
+| `infra/terraform.tfvars.example` | Modify | Document `psc_subnet_cidr` and AI security Terraform settings |
 | `infra/cloud_run.tf` | Modify | Pass `MODEL_ARMOR_TEMPLATE_ID`, safety thresholds, and guardrail env vars to Cloud Run |
-| `infra/outputs.tf` | Modify | Output provisioned `model_armor_template_id` |
+| `infra/outputs.tf` | Modify | Output provisioned `model_armor_template_id`, DLP template IDs, and `model_armor_psc_endpoint_ip` |
 | `src/core/config.py` | Modify | Define `ALLOWED_LLM_MODELS`, `ALLOWED_EMBEDDING_MODELS`, safety thresholds, and guardrail constants |
 | `src/core/security.py` | **Create** | Shared schema validators + Google Cloud Model Armor & DLP screening/redaction client |
 | `src/core/routes.py` | Modify | Validate `collection_name` on delete and sanitize HTTP `500` errors |

@@ -233,6 +233,8 @@ resource "google_cloud_run_v2_service" "agent_api" {
     google_compute_route.private_googleapis,
     google_dns_record_set.private_googleapis_a,
     google_dns_record_set.googleapis_wildcard_cname,
+    google_network_connectivity_regional_endpoint.modelarmor_psc,
+    google_dns_record_set.modelarmor_rep_a,
   ]
 }
 

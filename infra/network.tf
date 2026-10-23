@@ -90,3 +90,60 @@ resource "google_dns_record_set" "googleapis_wildcard_cname" {
   ttl          = 300
   rrdatas      = ["private.googleapis.com."]
 }
+
+# Room 3: Dedicated internal subnet for Regional Private Service Connect (PSC) Google API endpoints.
+# Note: Google's private.googleapis.com (199.36.153.8/30) covers *.googleapis.com but excludes
+# regional *.rep.googleapis.com endpoints such as modelarmor.<region>.rep.googleapis.com.
+resource "google_compute_subnetwork" "psc_endpoints" {
+  name                     = "${var.app_name}-psc-subnet-${var.environment}"
+  project                  = var.project_id
+  region                   = var.region
+  network                  = google_compute_network.main.id
+  ip_cidr_range            = var.psc_subnet_cidr
+  private_ip_google_access = true
+  description              = "Dedicated internal subnet for regional Private Service Connect Google API endpoints."
+}
+
+resource "google_network_connectivity_regional_endpoint" "modelarmor_psc" {
+  name              = "${var.app_name}-modelarmor-psc-${var.environment}"
+  project           = var.project_id
+  location          = var.region
+  target_google_api = "modelarmor.${var.region}.rep.googleapis.com"
+  access_type       = "REGIONAL"
+  network           = google_compute_network.main.id
+  subnetwork        = google_compute_subnetwork.psc_endpoints.id
+  description       = "Private Service Connect regional endpoint for Model Armor (modelarmor.${var.region}.rep.googleapis.com)."
+
+  depends_on = [
+    google_project_service.required_apis["networkconnectivity.googleapis.com"],
+    google_project_service.required_apis["modelarmor.googleapis.com"],
+  ]
+}
+
+resource "google_dns_managed_zone" "modelarmor_rep" {
+  name          = "${var.app_name}-modelarmor-rep-${var.environment}"
+  project       = var.project_id
+  dns_name      = "modelarmor.${var.region}.rep.googleapis.com."
+  description   = "Private DNS zone routing regional Model Armor endpoint to internal PSC endpoint IP."
+  visibility    = "private"
+  force_destroy = true
+
+  private_visibility_config {
+    networks {
+      network_url = google_compute_network.main.id
+    }
+  }
+
+  depends_on = [
+    google_project_service.required_apis["dns.googleapis.com"],
+  ]
+}
+
+resource "google_dns_record_set" "modelarmor_rep_a" {
+  name         = "modelarmor.${var.region}.rep.googleapis.com."
+  project      = var.project_id
+  managed_zone = google_dns_managed_zone.modelarmor_rep.name
+  type         = "A"
+  ttl          = 300
+  rrdatas      = [google_network_connectivity_regional_endpoint.modelarmor_psc.address]
+}

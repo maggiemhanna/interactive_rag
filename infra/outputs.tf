@@ -63,3 +63,8 @@ output "dlp_deidentify_template_id" {
   description = "Full resource ID of the Sensitive Data Protection (Cloud DLP) de-identify template."
   value       = google_data_loss_prevention_deidentify_template.ai_output_deidentify.id
 }
+
+output "model_armor_psc_endpoint_ip" {
+  description = "Internal VPC IPv4 address of the regional Private Service Connect endpoint for Model Armor."
+  value       = google_network_connectivity_regional_endpoint.modelarmor_psc.address
+}

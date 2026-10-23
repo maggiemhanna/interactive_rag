@@ -29,7 +29,7 @@ resource "google_data_loss_prevention_inspect_template" "ai_output_inspect" {
   description  = "Inspects LLM outputs for PII, financial identifiers, and credentials."
 
   inspect_config {
-    min_likelihood = "LIKELY"
+    min_likelihood = "POSSIBLE"
 
     info_types {
       name = "EMAIL_ADDRESS"

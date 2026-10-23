@@ -44,6 +44,7 @@ TF_DEPLOYER_ROLES := \
 	roles/identityplatform.admin \
 	roles/modelarmor.admin \
 	roles/dlp.admin \
+	roles/networkconnectivity.regionalEndpointAdmin \
 	roles/secretmanager.secretAccessor \
 	roles/secretmanager.viewer \
 	roles/browser \
@@ -97,6 +98,7 @@ bootstrap: check-project ## Enable seed APIs, create GCS Terraform state bucket,
 		cloudbuild.googleapis.com \
 		compute.googleapis.com \
 		dns.googleapis.com \
+		networkconnectivity.googleapis.com \
 		iam.googleapis.com \
 		cloudresourcemanager.googleapis.com \
 		serviceusage.googleapis.com \

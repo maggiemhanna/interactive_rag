@@ -24,9 +24,10 @@ enable_google_oauth                = true
 google_oauth_client_id_secret_name = "google_oauth_client_id"
 google_oauth_client_secret_name    = "google_oauth_client_secret"
 
-# VPC Subnets (Direct VPC Egress for ingestion-api and agent-api)
+# VPC Subnets (Direct VPC Egress for ingestion-api and agent-api + Regional PSC Endpoints)
 ingestion_subnet_cidr = "10.10.1.0/26"
 agent_subnet_cidr     = "10.10.2.0/26"
+psc_subnet_cidr       = "10.10.3.0/28"
 
 # AI-Specific Security (Model Allowlists, Model Armor, Content Safety & Guardrail Ceilings)
 allowed_llm_models         = "gemini-3.8-flash,gemini-2.5-flash,gemini-2.5-pro"

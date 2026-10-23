@@ -129,6 +129,17 @@ variable "agent_subnet_cidr" {
   }
 }
 
+variable "psc_subnet_cidr" {
+  description = "Private CIDR range for internal regional Private Service Connect endpoints (e.g., Model Armor)."
+  type        = string
+  default     = "10.10.3.0/28"
+
+  validation {
+    condition     = can(cidrhost(var.psc_subnet_cidr, 0))
+    error_message = "psc_subnet_cidr must be a valid IPv4 CIDR block (e.g., 10.10.3.0/28)."
+  }
+}
+
 variable "allowed_llm_models" {
   description = "Comma-separated allowlist of approved Vertex AI generative LLM models."
   type        = string
