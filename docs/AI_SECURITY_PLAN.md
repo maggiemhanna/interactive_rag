@@ -125,11 +125,11 @@ flowchart TB
   *(Note: Existing `*.googleapis.com -> private.googleapis.com` Private DNS in `infra/network.tf` already routes `modelarmor.<region>.rep.googleapis.com` and `dlp.googleapis.com` privately—no VPC changes needed.)*
 
 ### Phase 2: Centralize AI Security Config, Model Allowlists & Validators
-- [ ] Add `google-cloud-modelarmor` (and `google-cloud-dlp` if needed for direct fallback) to `requirements.txt`.
-- [ ] Update `src/core/config.py` with:
+- [x] Add `google-cloud-modelarmor` (and `google-cloud-dlp` if needed for direct fallback) to `requirements.txt`.
+- [x] Update `src/core/config.py` with:
   - `ALLOWED_LLM_MODELS` (multiple vetted Gemini models, default `gemini-3.8-flash`) and `ALLOWED_EMBEDDING_MODELS` (multiple vetted embedding models, default `gemini-embedding-001`).
   - `COLLECTION_NAME_PATTERN` (`^[a-zA-Z0-9_-]{1,64}$`), `MAX_QUERY_CHARS`, `AGENT_RECURSION_LIMIT`, `MAX_UPLOAD_MB`, `MAX_FILES_PER_REQUEST`, `MAX_CHUNKS_PER_INGEST`, `GEMINI_SAFETY_THRESHOLD`, and `MODEL_ARMOR_TEMPLATE_ID` / `MODEL_ARMOR_LOCATION`.
-- [ ] Create `src/core/security.py`:
+- [x] Create `src/core/security.py`:
   - Shared validators: `validate_collection_name()`, `validate_llm_model()`, `validate_embedding_model()`, `validate_query_text()`.
   - Managed GCP wrapper: `screen_user_prompt(text)` and `sanitize_model_output(text)` using `ModelArmorClient` (`modelarmor.<location>.rep.googleapis.com`), returning structured allow/block decisions and DLP-redacted text (with deterministic no-op/configurable behavior in offline unit tests when `MODEL_ARMOR_TEMPLATE_ID` is unset).
 

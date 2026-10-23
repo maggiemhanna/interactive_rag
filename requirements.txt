@@ -17,3 +17,4 @@ langgraph==1.2.10
 python-dotenv==1.0.1
 firebase-admin==7.7.0
 google-cloud-storage==3.13.0
+google-cloud-modelarmor==0.7.3
