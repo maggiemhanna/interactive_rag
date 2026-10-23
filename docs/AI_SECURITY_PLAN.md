@@ -161,7 +161,7 @@ flowchart TB
 - [x] Update `src/agent/app.py` to return sanitized HTTP `500` details while logging full exceptions internally.
 
 ### Phase 6: Automated Unit Tests & Live Cloud Verification
-- [ ] Create `tests/ai_security.py` offline `unittest` suite covering:
+- [x] Create `tests/ai_security.py` offline `unittest` suite covering:
   - Approved vs. unapproved `model_name` and `embedding_model` requests (multiple valid options + rejected unknown model).
   - Malicious `collection_name` injection rejection across `/ingest`, `/query`, `/agent`, and `DELETE /collections/{name}`.
   - XML spotlighting formatting, 1-indexed page citations, and `</retrieved_chunk>` breakout escaping.
