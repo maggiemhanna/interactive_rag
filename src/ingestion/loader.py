@@ -12,13 +12,21 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.core.auth import is_cloud_run
-from src.core.config import DEFAULT_COLLECTION, DEFAULT_EMBEDDING_MODEL
+from src.core.config import (
+    DEFAULT_COLLECTION,
+    DEFAULT_EMBEDDING_MODEL,
+    get_max_chunks_per_ingest,
+    get_max_files_per_request,
+    get_max_upload_mb,
+)
 from src.core.logger import setup_logging
+from src.core.security import validate_collection_name, validate_embedding_model
 from src.core.storage import archive_upload, get_bucket_name
 
 logger = setup_logging(name="ingestion.loader")
 
 _SAFE_UPLOAD_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+_PDF_MAGIC_PREFIX = b"%PDF-"
 
 
 @dataclass
@@ -103,13 +111,28 @@ def _parse_json_body(
     return raw_server_paths, collection_name, embedding_model
 
 
+def _validate_ingest_params(collection_name: str, embedding_model: str) -> Tuple[str, str]:
+    """Validates `collection_name` and `embedding_model`, raising HTTP 422 on invalid input."""
+    try:
+        safe_col = validate_collection_name(collection_name)
+        safe_emb = validate_embedding_model(embedding_model)
+        return safe_col, safe_emb
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
 async def prepare_payload(request: Request, uid: str) -> IngestPayload:
-    """Parses JSON or multipart PDF uploads, stages/archives files safely, splits chunks, and cleans /tmp."""
+    """Parses JSON or multipart PDF uploads, enforces upload ceilings, splits chunks, and cleans /tmp."""
     content_type = request.headers.get("content-type", "")
     raw_server_paths: List[str] = []
     uploaded_files_info: List[Tuple[str, str, Optional[str]]] = []  # (local_path, display_name, gcs_uri)
     collection_name = DEFAULT_COLLECTION
     embedding_model = DEFAULT_EMBEDDING_MODEL
+
+    max_files = get_max_files_per_request()
+    max_upload_mb = get_max_upload_mb()
+    max_upload_bytes = max_upload_mb * 1024 * 1024
+    max_chunks = get_max_chunks_per_ingest()
 
     upload_tmp_root = os.path.abspath(os.getenv("UPLOAD_TMP_ROOT", "/tmp/uploads"))
     user_upload_dir = os.path.join(upload_tmp_root, uid)
@@ -120,6 +143,9 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
             body = await request.json()
             raw_server_paths, collection_name, embedding_model = _parse_json_body(
                 body, collection_name, embedding_model
+            )
+            collection_name, embedding_model = _validate_ingest_params(
+                collection_name, embedding_model
             )
         elif "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
             async with request.form() as form:
@@ -134,6 +160,18 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                 embedding_model = (
                     str(raw_embedding).strip() if raw_embedding else DEFAULT_EMBEDDING_MODEL
                 )
+                collection_name, embedding_model = _validate_ingest_params(
+                    collection_name, embedding_model
+                )
+
+                # Handle pdf_paths field if provided in form
+                paths_param = form.getlist("pdf_paths")
+                for p in paths_param:
+                    if isinstance(p, str) and p.strip():
+                        for single_p in p.replace("\r\n", "\n").split("\n"):
+                            single_p = single_p.strip()
+                            if single_p:
+                                raw_server_paths.append(single_p)
 
                 # Handle uploaded files in an isolated per-user, per-request /tmp directory
                 files = form.getlist("files")
@@ -141,6 +179,16 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                     files = form.getlist("file")
 
                 valid_uploads = [f for f in files if hasattr(f, "filename") and f.filename]
+                total_requested_files = len(valid_uploads) + len(raw_server_paths)
+                if total_requested_files > max_files:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Too many PDF files in a single request (received {total_requested_files}, "
+                            f"maximum allowed is {max_files})."
+                        ),
+                    )
+
                 if valid_uploads:
                     request_upload_dir = os.path.join(user_upload_dir, uuid.uuid4().hex)
                     os.makedirs(request_upload_dir, exist_ok=True)
@@ -155,13 +203,28 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                         save_name = f"{idx}_{safe_name}" if safe_name in used_names else safe_name
                         used_names.add(save_name)
 
-                        save_path = os.path.join(request_upload_dir, save_name)
-                        content = await file_item.read()
+                        # Bounded read: read at most max_upload_bytes + 1 so oversized uploads fail fast
+                        content = await file_item.read(max_upload_bytes + 1)
                         if not content:
                             raise HTTPException(
                                 status_code=400,
                                 detail=f"Uploaded PDF '{safe_name}' is empty.",
                             )
+                        if len(content) > max_upload_bytes:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=(
+                                    f"Uploaded PDF '{safe_name}' exceeds the maximum allowed size "
+                                    f"of {max_upload_mb} MB."
+                                ),
+                            )
+                        if not content.lstrip().startswith(_PDF_MAGIC_PREFIX):
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Uploaded file '{safe_name}' is not a valid PDF document.",
+                            )
+
+                        save_path = os.path.join(request_upload_dir, save_name)
                         with open(save_path, "wb") as f:
                             f.write(content)
 
@@ -171,15 +234,6 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                             else None
                         )
                         uploaded_files_info.append((save_path, safe_name, gcs_uri))
-
-                # Handle pdf_paths field if provided in form
-                paths_param = form.getlist("pdf_paths")
-                for p in paths_param:
-                    if isinstance(p, str) and p.strip():
-                        for single_p in p.replace("\r\n", "\n").split("\n"):
-                            single_p = single_p.strip()
-                            if single_p:
-                                raw_server_paths.append(single_p)
         else:
             try:
                 body = await request.json()
@@ -191,6 +245,9 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                     status_code=400,
                     detail="Unsupported Content-Type. Please send application/json or multipart/form-data.",
                 )
+            collection_name, embedding_model = _validate_ingest_params(
+                collection_name, embedding_model
+            )
 
         # Security guard: never allow arbitrary container filesystem reads in Cloud Run
         if raw_server_paths and is_cloud_run():
@@ -202,6 +259,15 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                 detail="Server-side filesystem 'pdf_paths' ingestion is disabled in Cloud Run. Please upload PDF files directly.",
             )
 
+        if len(raw_server_paths) > max_files:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Too many PDF files in a single request (received {len(raw_server_paths)}, "
+                    f"maximum allowed is {max_files})."
+                ),
+            )
+
         if not uploaded_files_info and not raw_server_paths:
             raise HTTPException(
                 status_code=400,
@@ -211,7 +277,7 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
         all_chunks: List[Document] = []
         processed_files: List[str] = []
 
-        # 1. Load & split uploaded files (with sanitized source metadata)
+        # 1. Load & split uploaded files (preserving source, page, and gcs_uri metadata)
         for save_path, display_name, gcs_uri in uploaded_files_info:
             file_chunks = split_pdfs([save_path])
             for chunk in file_chunks:
@@ -219,12 +285,29 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                 if gcs_uri:
                     chunk.metadata["gcs_uri"] = gcs_uri
             all_chunks.extend(file_chunks)
+            if len(all_chunks) > max_chunks:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Ingestion exceeded the maximum allowed {max_chunks} chunks per request "
+                        f"(already reached {len(all_chunks)} chunks). Please upload smaller or fewer PDFs."
+                    ),
+                )
             processed_files.append(display_name)
 
         # 2. Load & split local server paths (local dev mode only)
-        if raw_server_paths:
-            all_chunks.extend(split_pdfs(raw_server_paths))
-            processed_files.extend(raw_server_paths)
+        for server_path in raw_server_paths:
+            file_chunks = split_pdfs([server_path])
+            all_chunks.extend(file_chunks)
+            if len(all_chunks) > max_chunks:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Ingestion exceeded the maximum allowed {max_chunks} chunks per request "
+                        f"(already reached {len(all_chunks)} chunks). Please upload smaller or fewer PDFs."
+                    ),
+                )
+            processed_files.append(server_path)
 
         return IngestPayload(
             chunks=all_chunks,

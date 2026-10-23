@@ -7,6 +7,7 @@ from src.core.auth import get_current_user
 from src.core.config import INGESTION_PORT, is_reload_enabled
 from src.core.logger import setup_logging
 from src.core.routes import create_app
+from src.core.security import INTERNAL_ERROR_MESSAGE
 from src.core.storage import LockTimeoutError
 from src.ingestion.loader import prepare_payload
 from src.ingestion.schemas import QueryRequest
@@ -49,9 +50,9 @@ async def ingest(request: Request, uid: str = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail=str(e))
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Failed to ingest documents for uid='{uid}': {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception(f"Failed to ingest documents for uid='{uid}'")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_MESSAGE)
 
 
 @app.post("/query")
@@ -76,11 +77,11 @@ def query(request: QueryRequest, uid: str = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail=str(e))
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(
-            f"Failed to query vectorstore collection '{request.collection_name}' for uid='{uid}': {e}"
+    except Exception:
+        logger.exception(
+            f"Failed to query vectorstore collection '{request.collection_name}' for uid='{uid}'"
         )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_MESSAGE)
 
 
 def main() -> None:

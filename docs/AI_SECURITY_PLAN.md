@@ -134,13 +134,13 @@ flowchart TB
   - Managed GCP wrapper: `screen_user_prompt(text)` and `sanitize_model_output(text)` using `ModelArmorClient` (`modelarmor.<location>.rep.googleapis.com`), returning structured allow/block decisions and DLP-redacted text (with deterministic no-op/configurable behavior in offline unit tests when `MODEL_ARMOR_TEMPLATE_ID` is unset).
 
 ### Phase 3: Ingestion Guardrails & Schema Enforcement (`src/ingestion/` & `src/core/routes.py`)
-- [ ] Update `src/ingestion/schemas.py` (`IngestRequest`, `QueryRequest`) and `src/agent/schemas.py` (`AgentRequest`) to enforce `collection_name`, `query`, `model_name`, and `embedding_model` validators.
-- [ ] Update `src/core/routes.py` (`DELETE /collections/{collection_name}`) to validate `collection_name` and sanitize `500` error responses.
-- [ ] Update `src/ingestion/loader.py` (`prepare_payload`):
+- [x] Update `src/ingestion/schemas.py` (`IngestRequest`, `QueryRequest`) and `src/agent/schemas.py` (`AgentRequest`) to enforce `collection_name`, `query`, `model_name`, and `embedding_model` validators.
+- [x] Update `src/core/routes.py` (`DELETE /collections/{collection_name}`) to validate `collection_name` and sanitize `500` error responses.
+- [x] Update `src/ingestion/loader.py` (`prepare_payload`):
   - Validate `collection_name` and `embedding_model` against the server allowlist in both JSON and multipart requests.
   - Enforce `MAX_FILES_PER_REQUEST`, `MAX_UPLOAD_MB` (streaming/bounded byte check + `%PDF-` signature check), and `MAX_CHUNKS_PER_INGEST` (returning HTTP `413` / `400` with clear user messages).
   - Preserve existing chunk metadata (`source`, `page`, `gcs_uri`) without scrubbing `gcs_uri`.
-- [ ] Update `src/ingestion/app.py` to replace raw `detail=str(e)` `500` responses with safe error messages and server-side `logger.exception(...)`.
+- [x] Update `src/ingestion/app.py` to replace raw `detail=str(e)` `500` responses with safe error messages and server-side `logger.exception(...)`.
 
 ### Phase 4: XML Spotlighting, Grounding, Citations & Content Safety (`src/agent/`)
 - [ ] Update `src/agent/tools.py` (`get_retriever_tool`):
