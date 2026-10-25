@@ -57,39 +57,63 @@ flowchart TB
 
 ### 1. Multi-Tenant Cloud Deployment & Persistence ([`docs/GCP_DEPLOYMENT_PLAN.md`](docs/GCP_DEPLOYMENT_PLAN.md))
 
-Multiple authenticated users share the cloud deployment safely—each tenant gets isolated storage and conversation state while serverless instances scale to zero when idle.
+Multiple authenticated users share the cloud deployment safely—each tenant gets isolated storage and conversation state while serverless instances scale to zero when idle without losing persisted indexes.
 
-- **Serverless Microservices (`Cloud Run` + `Terraform`)**
-  - Three independent Cloud Run services—`frontend` (React SPA), `ingestion-api` (PDF indexing & search), and `agent-api` (LangGraph assistant)—provisioned reproducibly with **Terraform** (`infra/`) and **Cloud Build** (`cloudbuild.yaml`).
-- **Identity & Multi-Tenant Isolation (`Identity Platform`)**
-  - Authenticates users via **Google OAuth** or **Email/Password** using **Google Cloud Identity Platform** (Firebase Auth).
-  - Backend endpoints verify Bearer ID tokens (`src/core/auth.py`) and scope all storage paths and conversation threads to the verified `uid`, preventing cross-tenant access even when collection names match.
-- **Persistent Vector Storage Sync (`Cloud Storage` ↔ `ChromaDB`)**
-  - Persists each user's PDFs and ChromaDB indexes under `gs://<bucket>/users/{uid}/` in **Google Cloud Storage**, syncing active indexes to local `/tmp` memory with distributed write locks (`src/core/storage.py`) so data survives scale-to-zero events safely.
-- **Runtime Frontend Configuration (`/env-config.js`)**
-  - Container startup injects live API endpoints and Firebase credentials into `/env-config.js` (`docker/entrypoint-frontend.sh`), allowing a single frontend image to deploy across environments without rebuilding.
+- **Serverless Microservices (`Cloud Run Gen2` + `Terraform`)**
+  - Deployed as three independent auto-scaling Cloud Run services—`frontend` (Nginx serving the React SPA), `ingestion-api` (PDF parsing, embedding, and collection management), and `agent-api` (stateful LangGraph agent and SSE streaming)—provisioned reproducibly with **Terraform** (`infra/`) and **Cloud Build** (`cloudbuild.yaml`).
+- **Zero-Trust Identity & Tenant Isolation (`Identity Platform` / `Firebase Auth`)**
+  - Users sign in via **Google OAuth** or **Email/Password** (`frontend/src/AuthGate.jsx`), and `authFetch` (`frontend/src/App.jsx`) attaches `Authorization: Bearer <ID_TOKEN>` to every REST and SSE call (automatically refreshing expired tokens on `401`).
+  - On the backend, `get_current_user` (`src/core/auth.py`) cryptographically verifies the JWT and extracts the immutable `uid`. Storage paths (`/tmp/chroma_db/{uid}`, `gs://<bucket>/users/{uid}/`) and LangGraph checkpoint threads (`{uid}:{thread_id}`) are derived strictly server-side from that verified `uid`—never from client request payloads—so different users can create collections with identical names without collision or cross-tenant visibility.
+  - When running on Cloud Run, server-filesystem `pdf_paths` ingestion is disabled so callers can only upload their own multipart PDF files.
+- **Per-User GCS ↔ `/tmp` ChromaDB Synchronization (`src/core/storage.py`)**
+  - **Why not mount Cloud Storage directly?** ChromaDB uses SQLite (`chroma.sqlite3`) and memory-mapped HNSW index segments, whereas Cloud Storage lacks POSIX byte-range file locking—sharing a direct FUSE mount across `ingestion-api` and `agent-api` risks SQLite lock failures and corruption, while Cloud Run's local `/tmp` memory is wiped whenever instances scale to zero.
+  - **Coherent Sync & Distributed Locking:** Each user's authoritative ChromaDB snapshot is persisted under `gs://<bucket>/users/{uid}/chroma_db/` with a `version.json` marker:
+    - **Read path (`/query`, `/agent`, `/collections`):** Checks remote `version.json` against `/tmp/chroma_db/{uid}/version.json`, downloading updated blobs into fast in-memory `tmpfs` only when stale and evicting inactive tenant caches via LRU when `/tmp` space is low.
+    - **Write path (`/ingest`, `DELETE /collections`):** Acquires an atomic GCS lock (`users/{uid}/locks/chroma.lock` via `if_generation_match=0` with stale-lock TTL recovery), syncs the latest snapshot, performs ChromaDB writes locally, uploads modified segments + increments `version.json`, and releases the lock so `agent-api` immediately sees newly ingested documents.
+- **Startup Runtime Frontend Configuration (`/env-config.js`)**
+  - Standard Vite builds bake `VITE_*` variables into static JavaScript during `docker build`, creating a chicken-and-egg dependency because images are built *before* Terraform provisions the Load Balancer URL and Identity Platform web API key.
+  - Instead, `docker/entrypoint-frontend.sh` reads Cloud Run environment variables injected by Terraform (`infra/cloud_run.tf`) at container startup (`INGESTION_API_URL="/api/ingest"`, `AGENT_API_URL="/api/agent"`, `FIREBASE_API_KEY`, etc.) and writes `/usr/share/nginx/html/env-config.js` (`window.__ENV__`), allowing one immutable frontend image to run across any environment without rebuilding.
 
 ### 2. Zero-Internet VPC & Network Security ([`docs/NETWORK_SECURITY_PLAN.md`](docs/NETWORK_SECURITY_PLAN.md))
 
-External traffic enters exclusively through a single managed HTTPS Load Balancer, while backend services run inside an isolated VPC with no public internet access.
+External traffic enters exclusively through a single managed HTTPS Load Balancer, while backend containers run inside a segmented private VPC with zero outbound access to the public internet.
 
-- **Single HTTPS Entry Point (`Global External Application Load Balancer`)**
-  - Encrypts browser traffic over `https://` and decrypts incoming requests at the Load Balancer (`TLS termination`) using a free, auto-renewed Google-managed TLS certificate issued for the Load Balancer's `<IP>.sslip.io` domain, while automatically redirecting plain `http://` requests to `https://` (`infra/load_balancer.tf`).
-  - Because the React UI runs in the user's browser after initial page load, the Load Balancer routes browser requests on a single domain by URL path—`/*` to `frontend`, `/api/ingest/*` to `ingestion-api`, and `/api/agent/*` to `agent-api`—connecting to dynamic Cloud Run containers via **Serverless Network Endpoint Groups (NEGs)**.
-- **Locked Cloud Run Ingress**
-  - Direct public access to all three `*.run.app` URLs is disabled—Cloud Run only accepts traffic forwarded by the Load Balancer (`infra/cloud_run.tf`).
-- **Segmented Zero-Internet VPC (`Direct VPC Egress`)**
-  - `ingestion-api` and `agent-api` run in separate subnets inside a custom VPC with the default internet route removed, blocking all outbound public internet traffic (`infra/network.tf`).
-- **Private Google API Connectivity (`Private Google Access`, `PSC` & `Cloud DNS`)**
-  - **Standard Google APIs (`Cloud Storage`, `Vertex AI`, `Identity Platform`)**: Private Cloud DNS and an explicit VPC route keep `*.googleapis.com` calls strictly on Google's internal network via **Private Google Access**.
-  - **Regional Model Armor API**: Because Private Google Access does not cover regional `*.rep.googleapis.com` endpoints, a **Regional Private Service Connect (PSC)** endpoint and private DNS zone route Model Armor calls to an internal VPC IP.
+- **Single HTTPS Entry Point (`Global External Application Load Balancer` — `infra/load_balancer.tf`)**
+  - **TLS Termination & Managed `sslip.io` Certificate:** Reserves a global static Anycast IP and derives `<IP-with-dashes>.sslip.io` (a wildcard DNS hostname resolving back to that IP so Certificate Authorities and Firebase Auth have a valid domain without buying one). Google Cloud automatically provisions and renews a free trusted TLS certificate (`lb_cert`), decrypts incoming `https://` traffic at the Load Balancer (`https_proxy`), and redirects plain port-80 `http://` requests to `https://` with HTTP `301`.
+  - **Single-Origin Path Routing & Serverless NEGs:** Once `frontend` serves the React bundle, UI actions execute in the user's browser over the internet. The Load Balancer's URL map (`https_router`) exposes the UI and APIs on one HTTPS origin—routing `/*` to `frontend`, rewriting `/api/ingest/*` $\rightarrow$ `/*` for `ingestion-api`, and rewriting `/api/agent/*` $\rightarrow$ `/*` for `agent-api`—connecting to dynamic Cloud Run containers via **Serverless Network Endpoint Groups (NEGs)** with edge CDN disabled (`enable_cdn = false`) so authenticated responses and SSE streams are never cached.
+- **Locked Cloud Run Ingress (`infra/cloud_run.tf`)**
+  - All three Cloud Run services set `ingress = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"`, blocking direct internet requests to raw `*.run.app` service URLs at Google's edge while accepting requests forwarded by the Load Balancer.
+- **Segmented Zero-Internet VPC (`Direct VPC Egress` — `infra/network.tf`)**
+  - `ingestion-api` (`10.10.1.0/26`, which parses untrusted PDFs) and `agent-api` (`10.10.2.0/26`) route all outbound traffic (`ALL_TRAFFIC`) via **Cloud Run Direct VPC Egress** into separate subnets inside a custom VPC configured with `delete_default_routes_on_create = true`. Removing the `0.0.0.0/0` default internet route drops packets to any external internet IP, preventing outbound data exfiltration.
+- **Private Google API Connectivity (`Private Google Access` vs. `Regional PSC` — `infra/network.tf`)**
+  - **Standard `*.googleapis.com` APIs (`Cloud Storage`, `Vertex AI`, `Identity Platform`):** Requires two paired layers inside the zero-internet VPC:
+    1. *Private Cloud DNS (`googleapis.com.`)* overrides `*.googleapis.com` lookups to return Google's 4 Private Google Access Virtual IPs (`199.36.153.8`–`.11`) instead of unroutable public Google IPs (Google Front End load balancers route to the right service using the TLS SNI / HTTP `Host` header).
+    2. *Explicit VPC Route (`199.36.153.8/30`)* permits packets only to that `/30` VIP range onto Google's internal backbone while leaving all other external IPs unreachable.
+  - **Regional Model Armor API (`modelarmor.<region>.rep.googleapis.com`):** Because Google's `199.36.153.8/30` VIPs do not support regional `*.rep.googleapis.com` endpoints, Terraform pairs:
+    1. *Regional Private Service Connect (`modelarmor_psc`)* to allocate a dedicated internal IP (`10.10.3.2` in `psc-subnet`) wired directly to the regional Model Armor backend (routable locally within the VPC without an extra `google_compute_route`).
+    2. *Specific Private DNS Zone (`modelarmor.<region>.rep.googleapis.com.`)* that overrides the broader `*.googleapis.com.` wildcard via longest-suffix matching and resolves the regional hostname to `10.10.3.2` while keeping TLS hostname verification valid.
 
 ### 3. AI-Specific Security — 5 Pillars ([`docs/AI_SECURITY_PLAN.md`](docs/AI_SECURITY_PLAN.md))
-1. **Prompt Injection Mitigation**: Pre-LLM screening in LangGraph's `input_guard` node via **Google Cloud Model Armor** (`sanitizeUserPrompt`), XML spotlighting (`<retrieved_chunk source="..." page="...">`) with `<`/`>` tag-breakout escaping (`src/agent/tools.py`), hardened `SystemMessage` instruction hierarchy (`src/agent/graph.py`), and strict `^[a-zA-Z0-9_-]{1,64}$` collection-name validation.
-2. **Model Access Controls**: Server-enforced multi-option catalogs (`ALLOWED_LLM_MODELS` & `ALLOWED_EMBEDDING_MODELS`) validated across `/ingest`, `/query`, and `/agent`, rejecting unapproved models with HTTP `422`.
-3. **AI & Ingestion Guardrails**: Mandatory 1-indexed `[source, p.X]` inline citations and explicit abstention when evidence is absent; `MAX_QUERY_CHARS`, `%PDF-` magic-byte checks, `MAX_UPLOAD_MB` (`413`), `MAX_FILES_PER_REQUEST`, `MAX_CHUNKS_PER_INGEST`, and bounded LangGraph tool loops (`AGENT_RECURSION_LIMIT=6`).
-4. **Output Filtering & Safe Errors**: Post-LLM `output_guard` masks sensitive PII and credentials (`[EMAIL_ADDRESS]`, `[PHONE_NUMBER]`, `[CREDIT_CARD_NUMBER]`, `[US_SOCIAL_SECURITY_NUMBER]`, `[IBAN_CODE]`, `[GCP_API_KEY]`, `[AUTH_TOKEN]`) via **Model Armor + Cloud DLP** (`sanitizeModelResponse`) across both JSON and live SSE responses, while unexpected server exceptions return sanitized HTTP `500` messages.
-5. **Content Safety**: Explicit, configurable Gemini `safety_settings` (`GEMINI_SAFETY_THRESHOLD`, default `BLOCK_LOW_AND_ABOVE`) across all harm categories paired with clear, polite refusal fallbacks (`is_safety_blocked`) instead of blank responses.
+
+Every query and retrieved document passage flows through a hardened LangGraph pipeline (`START -> input_guard -> model_call <-> tools -> output_guard -> END`) enforcing five defense-in-depth pillars:
+
+1. **Prompt Injection Mitigation (Pre-LLM Screening + XML Data Isolation)**
+   - **Managed Front-Door Screening (`input_guard`):** Before invoking Gemini, `screen_user_prompt()` (`src/core/security.py`) calls **Google Cloud Model Armor** (`sanitizeUserPrompt`) over Regional PSC to detect prompt-injection, jailbreak, and malicious-URI payloads—short-circuiting blocked prompts directly to `END` without consuming LLM tokens.
+   - **XML Spotlighting & Tag Escaping (`src/agent/tools.py`):** Retrieved PDF passages are enclosed in `<retrieved_chunk source="report.pdf" page="1">...</retrieved_chunk>` with embedded `<` and `>` characters escaped (`&lt;` / `&gt;`) so a malicious PDF cannot forge a closing `</retrieved_chunk>` tag to break out of the data boundary.
+   - **Instruction Hierarchy & Identifier Validation:** `SYSTEM_PROMPT` (`src/agent/graph.py`) instructs Gemini to treat all `<retrieved_chunk>` content and user messages strictly as untrusted data, while `validate_collection_name()` enforces `^[a-zA-Z0-9_-]{1,64}$` across all endpoints so instructions cannot be smuggled into tool descriptions via collection names.
+2. **Model Access Controls (Server-Enforced Multi-Option Catalogs)**
+   - Instead of allowing callers to pass arbitrary Vertex AI model IDs, `src/core/config.py` defines curated server allowlists (`ALLOWED_LLM_MODELS`: `gemini-3.8-flash`, `gemini-2.5-flash`, `gemini-2.5-pro`; `ALLOWED_EMBEDDING_MODELS`: `gemini-embedding-001`, `text-embedding-005`).
+   - Pydantic request schemas and multipart upload parsers across `/ingest`, `/query`, and `/agent` apply safe defaults when omitted and reject unapproved models immediately with HTTP `422`.
+3. **AI & Ingestion Guardrails (Grounding, Citations, Upload & Loop Ceilings)**
+   - **Strict Grounding & Mandatory `[source, p.X]` Citations:** The retriever converts PyPDF's 0-indexed page metadata into 1-indexed `page` attributes, and the system prompt requires every factual statement to rely exclusively on retrieved chunks with inline `[filename.pdf, p.X]` citations—or explicitly abstain when evidence is missing.
+   - **Input, Upload & Loop Ceilings:** Enforces `MAX_QUERY_CHARS` (`4000`), `%PDF-` magic-byte signature checks (rejecting disguised non-PDF files with `400`), `MAX_UPLOAD_MB` (`20` MB per PDF, returning `413`), `MAX_FILES_PER_REQUEST` (`10`), `MAX_CHUNKS_PER_INGEST` (`1000`), and a LangGraph `recursion_limit` (`AGENT_RECURSION_LIMIT=6` in `src/agent/stream.py`) that cleanly halts runaway tool-calling loops.
+4. **Output Filtering & Sanitized Errors (Cloud DLP + Model Armor Across JSON & SSE)**
+   - **Managed PII & Secret Masking (`output_guard`):** Provisioned in `infra/ai_security.tf`, a **Cloud DLP Inspect + De-identify Template** integrated into Model Armor (`sanitizeModelResponse`) automatically masks `EMAIL_ADDRESS`, `PHONE_NUMBER`, `CREDIT_CARD_NUMBER`, `US_SOCIAL_SECURITY_NUMBER`, `IBAN_CODE`, `GCP_API_KEY`, and `AUTH_TOKEN` matches with `[INFO_TYPE]` placeholders.
+   - **Unified REST & Live SSE Redaction:** `model_call` holds candidate final answers in `pending_response` so `output_guard` sanitizes the message *before* committing it to `messages` or yielding SSE frames in `stream_sse`—ensuring unredacted PII never leaks in either `stream=false` JSON or `stream=true` SSE mode.
+   - **Sanitized `500` Responses:** Unexpected exceptions across FastAPI endpoints and SSE generators log full tracebacks privately on the server while returning a safe `"An internal server error occurred. Please try again later."` message to clients.
+5. **Content Safety (Pinned Harm Thresholds & Polite Refusal Fallbacks)**
+   - Configures `ChatGoogleGenerativeAI` explicitly across `HATE_SPEECH`, `HARASSMENT`, `SEXUALLY_EXPLICIT`, and `DANGEROUS_CONTENT` using `GEMINI_SAFETY_THRESHOLD` (default `BLOCK_LOW_AND_ABOVE`), alongside Model Armor's RAI filters.
+   - Checks `is_safety_blocked(response)` on model outputs (`finish_reason` in `SAFETY`, `PROHIBITED_CONTENT`, `SPII`, `BLOCKLIST`) and substitutes a clear, polite refusal fallback instead of returning a blank answer.
 
 ---
 
