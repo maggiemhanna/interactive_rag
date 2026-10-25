@@ -1,4 +1,10 @@
-# Private Custom VPC with no default public internet route
+# ==============================================================================
+# 1. Zero-Internet Custom VPC & Segmented Cloud Run Subnets
+# ==============================================================================
+
+# Custom VPC with `delete_default_routes_on_create = true` to remove the 0.0.0.0/0
+# default internet route. Any packet addressed outside local VPC subnets (10.10.x.x)
+# is dropped unless an explicit `google_compute_route` exists below.
 resource "google_compute_network" "main" {
   name                            = "${var.app_name}-vpc-${var.environment}"
   project                         = var.project_id
@@ -12,7 +18,7 @@ resource "google_compute_network" "main" {
   ]
 }
 
-# Room 1: Dedicated Direct VPC Egress subnet for Document Ingestion API (src/ingestion/app.py)
+# Isolated Direct VPC Egress subnet for `ingestion-api` (processes untrusted user PDFs).
 resource "google_compute_subnetwork" "ingestion" {
   name                     = "${var.app_name}-ingestion-subnet-${var.environment}"
   project                  = var.project_id
@@ -23,7 +29,7 @@ resource "google_compute_subnetwork" "ingestion" {
   description              = "Isolated Direct VPC Egress subnet for ingestion-api Cloud Run service."
 }
 
-# Room 2: Dedicated Direct VPC Egress subnet for Agentic RAG API (src/agent/app.py)
+# Isolated Direct VPC Egress subnet for `agent-api` (runs LangGraph & Vertex AI calls).
 resource "google_compute_subnetwork" "agent" {
   name                     = "${var.app_name}-agent-subnet-${var.environment}"
   project                  = var.project_id
@@ -34,9 +40,16 @@ resource "google_compute_subnetwork" "agent" {
   description              = "Isolated Direct VPC Egress subnet for agent-api Cloud Run service."
 }
 
-# Private Tunnel Route: Allows traffic ONLY to Google's Private Google Access VIP range (199.36.153.8/30).
-# Note: In GCP, 'default-internet-gateway' for 199.36.153.8/30 is Google's internal virtual hop
-# that keeps packets strictly on Google's private backbone without granting public internet access.
+# ==============================================================================
+# 2. Private Google Access for Standard `*.googleapis.com` APIs
+#    (Requires BOTH a Layer-3 VPC Route AND Private Cloud DNS records)
+# ==============================================================================
+
+# Step A — Layer-3 Packet Route:
+# Because `199.36.153.8/30` sits outside our `10.10.x.x` subnets and `0.0.0.0/0` was deleted,
+# this route explicitly permits packets ONLY to Google's Private Google Access VIP range.
+# For `199.36.153.8/30`, GCP treats `default-internet-gateway` as an internal virtual hop
+# onto Google's private backbone without granting public internet access.
 resource "google_compute_route" "private_googleapis" {
   name             = "${var.app_name}-private-googleapis-${var.environment}"
   project          = var.project_id
@@ -47,8 +60,9 @@ resource "google_compute_route" "private_googleapis" {
   description      = "Routes private.googleapis.com (199.36.153.8/30) traffic privately inside Google's backbone."
 }
 
-# Private Address Book (Cloud DNS): Directs all *.googleapis.com calls (Cloud Storage, Vertex AI,
-# Identity Platform, Google public JWT certs) into the private 199.36.153.8/30 tunnel.
+# Step B — Authoritative Private DNS Zone for `googleapis.com.`:
+# Creates the empty DNS container scoped to our VPC so `*.googleapis.com` queries do not
+# resolve to public Google IPs (e.g., `142.250.x.x`), which have no route in this VPC.
 resource "google_dns_managed_zone" "googleapis" {
   name          = "${var.app_name}-googleapis-${var.environment}"
   project       = var.project_id
@@ -68,6 +82,11 @@ resource "google_dns_managed_zone" "googleapis" {
   ]
 }
 
+# DNS Record 1 (`A`): Maps Google's official `private.googleapis.com.` tier to its 4 Virtual IPs.
+# All 4 VIPs are identical Anycast addresses fronting Google Front End (GFE) load balancers
+# (provided for DNS round-robin load spreading). A single VIP serves hundreds of Google APIs
+# by reading the original hostname (`storage.googleapis.com`, `aiplatform.googleapis.com`, etc.)
+# from the TLS SNI handshake and HTTPS `Host` header.
 resource "google_dns_record_set" "private_googleapis_a" {
   name         = "private.googleapis.com."
   project      = var.project_id
@@ -82,6 +101,9 @@ resource "google_dns_record_set" "private_googleapis_a" {
   ]
 }
 
+# DNS Record 2 (`CNAME`): Wildcard alias pointing all `*.googleapis.com.` hostnames to
+# `private.googleapis.com.` (Google's 2-record reference pattern—keeps `dig` output explicit
+# vs. `restricted.googleapis.com.` and avoids repeating raw IP lists if overrides/IPv6 are added).
 resource "google_dns_record_set" "googleapis_wildcard_cname" {
   name         = "*.googleapis.com."
   project      = var.project_id
@@ -91,9 +113,15 @@ resource "google_dns_record_set" "googleapis_wildcard_cname" {
   rrdatas      = ["private.googleapis.com."]
 }
 
-# Room 3: Dedicated internal subnet for Regional Private Service Connect (PSC) Google API endpoints.
-# Note: Google's private.googleapis.com (199.36.153.8/30) covers *.googleapis.com but excludes
-# regional *.rep.googleapis.com endpoints such as modelarmor.<region>.rep.googleapis.com.
+# ==============================================================================
+# 3. Regional Private Service Connect (PSC) for Model Armor
+#    Why needed: Google's `199.36.153.8/30` VIPs do NOT support regional
+#    `*.rep.googleapis.com` endpoints (`modelarmor.<region>.rep.googleapis.com`).
+# ==============================================================================
+
+# Dedicated internal VPC subnet (`10.10.3.0/28`) hosting regional PSC endpoint IPs.
+# Because this subnet lives inside `google_compute_network.main`, GCP creates a local
+# subnet route automatically—no extra `google_compute_route` is required.
 resource "google_compute_subnetwork" "psc_endpoints" {
   name                     = "${var.app_name}-psc-subnet-${var.environment}"
   project                  = var.project_id
@@ -104,6 +132,10 @@ resource "google_compute_subnetwork" "psc_endpoints" {
   description              = "Dedicated internal subnet for regional Private Service Connect Google API endpoints."
 }
 
+# Step A — Network Connection (PSC Endpoint):
+# Allocates a private IP inside `psc_endpoints` (e.g., `10.10.3.2`) wired directly to
+# Google's regional Model Armor backend. Note: PSC only creates the IP connection—it
+# does NOT configure DNS, so application code still needs the DNS override below.
 resource "google_network_connectivity_regional_endpoint" "modelarmor_psc" {
   name              = "${var.app_name}-modelarmor-psc-${var.environment}"
   project           = var.project_id
@@ -120,6 +152,9 @@ resource "google_network_connectivity_regional_endpoint" "modelarmor_psc" {
   ]
 }
 
+# Step B — More-Specific Private DNS Zone for `modelarmor.<region>.rep.googleapis.com.`:
+# Cloud DNS uses longest-suffix matching, so this zone takes precedence over the broader
+# `googleapis.com.` wildcard zone above and prevents Model Armor queries from going to `199.36.153.8`.
 resource "google_dns_managed_zone" "modelarmor_rep" {
   name          = "${var.app_name}-modelarmor-rep-${var.environment}"
   project       = var.project_id
@@ -139,6 +174,9 @@ resource "google_dns_managed_zone" "modelarmor_rep" {
   ]
 }
 
+# DNS Record (`A`): Resolves `modelarmor.<region>.rep.googleapis.com.` to the internal PSC IP
+# (`modelarmor_psc.address`) so `ModelArmorClient` connects over the private PSC endpoint while
+# keeping the real hostname for valid TLS certificate verification.
 resource "google_dns_record_set" "modelarmor_rep_a" {
   name         = "modelarmor.${var.region}.rep.googleapis.com."
   project      = var.project_id

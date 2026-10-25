@@ -1,10 +1,30 @@
+# ==============================================================================
+# Global External Application Load Balancer (Single Public HTTPS Front Door)
+#
+# End-to-end request flow:
+#   Browser -> Global Static IP (`lb_ip:443`)
+#           -> Forwarding Rule (`https`)
+#           -> Target HTTPS Proxy (`https_proxy` + Managed TLS Cert `lb_cert`)
+#           -> URL Map (`https_router`: path routing + `/api/*` prefix stripping)
+#           -> Backend Services (`*_backend`)
+#           -> Serverless NEGs (`*_neg`)
+#           -> Cloud Run (`frontend`, `ingestion-api`, `agent-api`)
+# ==============================================================================
+
+# ==============================================================================
+# 1. Static Global IPv4 Address & Automatic `sslip.io` Hostname
+# ==============================================================================
+
 locals {
-  # Automatic wildcard DNS hostname resolving directly to the Load Balancer's static IP
+  # Public Certificate Authorities and Firebase Auth require a domain name rather
+  # than a raw IP. `sslip.io` is a free wildcard DNS service that automatically
+  # resolves `<IP-with-dashes>.sslip.io` (e.g., `136-81-158-54.sslip.io`) back to
+  # `lb_ip.address`, enabling zero-config HTTPS without purchasing a custom domain.
   lb_domain = "${replace(google_compute_global_address.lb_ip.address, ".", "-")}.sslip.io"
   lb_url    = "https://${local.lb_domain}"
 }
 
-# 1. Permanent Public Static IPv4 Address (Single Front Door)
+# Reserves a permanent global Anycast IPv4 address at Google's edge.
 resource "google_compute_global_address" "lb_ip" {
   name         = "${var.app_name}-lb-ip-${var.environment}"
   project      = var.project_id
@@ -17,7 +37,13 @@ resource "google_compute_global_address" "lb_ip" {
   ]
 }
 
-# 2. Free Google-Managed SSL Certificate for <LB_IP_WITH_DASHES>.sslip.io
+# ==============================================================================
+# 2. Google-Managed TLS/HTTPS Certificate
+# ==============================================================================
+
+# Provisions and auto-renews a free, publicly trusted TLS certificate for `local.lb_domain`.
+# Once port 443 (`https` forwarding rule below) is live, Google verifies DNS points to
+# `lb_ip` and flips certificate status from `PROVISIONING` to `ACTIVE` (~10–15 min on first deploy).
 resource "google_compute_managed_ssl_certificate" "lb_cert" {
   name        = "${var.app_name}-lb-cert-${var.environment}"
   project     = var.project_id
@@ -27,12 +53,21 @@ resource "google_compute_managed_ssl_certificate" "lb_cert" {
     domains = [local.lb_domain]
   }
 
+  # Managed SSL certificates are immutable, and GCP blocks deleting a cert while
+  # `https_proxy` still references it. `create_before_destroy` provisions any replacement
+  # cert first, repoints `https_proxy`, and deletes the old cert with zero downtime.
   lifecycle {
     create_before_destroy = true
   }
 }
 
-# 3. Serverless Network Endpoint Groups (NEGs) connecting Load Balancer to Cloud Run
+# ==============================================================================
+# 3. Serverless Network Endpoint Groups (NEGs) — Bridge Into Cloud Run
+# ==============================================================================
+
+# Instead of VM IP:port backends, a `SERVERLESS` NEG lets the Global Load Balancer
+# forward requests privately into regional Cloud Run services (whose direct `*.run.app`
+# URLs are locked down via `INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER` in `cloud_run.tf`).
 resource "google_compute_region_network_endpoint_group" "frontend_neg" {
   name                  = "${var.app_name}-fe-neg-${var.environment}"
   project               = var.project_id
@@ -66,7 +101,14 @@ resource "google_compute_region_network_endpoint_group" "agent_neg" {
   }
 }
 
-# 4. Global External Managed Backend Services
+# ==============================================================================
+# 4. Backend Services (`EXTERNAL_MANAGED`)
+# ==============================================================================
+
+# Wraps each Serverless NEG into an Envoy-backed Global Application Load Balancer target
+# (also the attachment point if Cloud Armor WAF policies are added later).
+# `enable_cdn = false` ensures authenticated API responses, `/env-config.js`, and live
+# Server-Sent Events (SSE) streams are never cached at Google's edge.
 resource "google_compute_backend_service" "frontend_backend" {
   name                  = "${var.app_name}-fe-backend-${var.environment}"
   project               = var.project_id
@@ -103,7 +145,16 @@ resource "google_compute_backend_service" "agent_backend" {
   }
 }
 
-# 5. HTTPS URL Map (Path Routing + Prefix Rewriting)
+# ==============================================================================
+# 5. HTTPS URL Map — Single-Origin Path Routing & Prefix Rewriting
+# ==============================================================================
+
+# Serves the React UI and both backend APIs under one HTTPS origin:
+# - `/api/ingest/*` -> strips `/api/ingest` (`path_prefix_rewrite = "/"`) and forwards
+#   to `ingestion-api` (e.g., `/api/ingest/collections` arrives at FastAPI as `/collections`).
+# - `/api/agent/*`  -> strips `/api/agent` (`path_prefix_rewrite = "/"`) and forwards
+#   to `agent-api` (e.g., `/api/agent/agent` arrives at FastAPI as `/agent`).
+# - `/*` (default)  -> forwards directly to `frontend` (React SPA).
 resource "google_compute_url_map" "https_router" {
   name            = "${var.app_name}-https-urlmap-${var.environment}"
   project         = var.project_id
@@ -143,7 +194,12 @@ resource "google_compute_url_map" "https_router" {
   }
 }
 
+# ==============================================================================
 # 6. HTTPS Target Proxy & Port 443 Global Forwarding Rule
+# ==============================================================================
+
+# Terminates TLS at Google's edge using `lb_cert` and passes decrypted HTTP/2
+# requests to `https_router` for path-based routing.
 resource "google_compute_target_https_proxy" "https_proxy" {
   name             = "${var.app_name}-https-proxy-${var.environment}"
   project          = var.project_id
@@ -151,6 +207,7 @@ resource "google_compute_target_https_proxy" "https_proxy" {
   ssl_certificates = [google_compute_managed_ssl_certificate.lb_cert.id]
 }
 
+# Public listener binding `lb_ip:443` to `https_proxy`.
 resource "google_compute_global_forwarding_rule" "https" {
   name                  = "${var.app_name}-https-fwd-${var.environment}"
   project               = var.project_id
@@ -161,7 +218,13 @@ resource "google_compute_global_forwarding_rule" "https" {
   target                = google_compute_target_https_proxy.https_proxy.id
 }
 
-# 7. HTTP-to-HTTPS 301 Redirect on Port 80
+# ==============================================================================
+# 7. Port 80 HTTP-to-HTTPS `301` Redirect
+# ==============================================================================
+
+# Returns an edge `301 Moved Permanently` redirect to `https://` for any plain `http://`
+# visitor on port 80 (preserving URL paths and query parameters via `strip_query = false`),
+# ensuring unencrypted requests never reach Cloud Run.
 resource "google_compute_url_map" "http_redirect" {
   name        = "${var.app_name}-http-redirect-${var.environment}"
   project     = var.project_id
