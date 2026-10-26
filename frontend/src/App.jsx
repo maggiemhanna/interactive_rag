@@ -11,13 +11,11 @@ import {
   FolderPlus,
   X,
   FileCheck,
-  Server,
   Search,
   Sparkles,
   ChevronDown,
   ChevronUp,
   Bot,
-  Terminal,
   Code2,
   Copy,
   Check,
@@ -28,7 +26,14 @@ import {
   AlignLeft,
   Highlighter,
   BookOpen,
-  Zap
+  Zap,
+  MessageSquare,
+  MessageSquarePlus,
+  RotateCcw,
+  Send,
+  CornerDownLeft,
+  Square,
+  History
 } from 'lucide-react';
 import {
   API_BASE,
@@ -502,7 +507,7 @@ function renderInlineMarkdown(text, options = {}, keyPrefix = 'in') {
                     type="button"
                     className={`md-citation-badge interactive ${isActive ? 'active' : ''}`}
                     onClick={() => onSelectCitation(cit, citKey)}
-                    title={`Click to ${isActive ? 'hide' : 'preview'} retrieved passage from ${cit.source}${cit.pageLabel ? ` (${cit.pageLabel})` : ''}`}
+                    title={`${isActive ? 'Hide' : 'View'} source excerpt from ${cit.source}${cit.pageLabel ? ` (${cit.pageLabel})` : ''}`}
                   >
                     {badgeInner}
                   </button>
@@ -716,7 +721,7 @@ function AgentMarkdownView({
   if (!markdown) {
     return (
       <div className="agent-response-content">
-        <span style={{ color: 'var(--text-muted)' }}>Processing query response...</span>
+        <span style={{ color: 'var(--text-muted)' }}>Preparing answer...</span>
       </div>
     );
   }
@@ -852,11 +857,11 @@ function AgentMarkdownView({
           <div className="agent-sources-header">
             <span className="agent-sources-label">
               <BookOpen size={13} />
-              Sources Cited ({citationsSummary.length})
+              Sources ({citationsSummary.length})
             </span>
             {retrievedChunks.length > 0 && (
               <span className="agent-sources-hint">
-                Click a citation or page to inspect retrieved passage
+                Click any citation or page number to view the source excerpt
               </span>
             )}
           </div>
@@ -891,7 +896,7 @@ function AgentMarkdownView({
                             type="button"
                             className={`agent-source-page-btn ${isPageActive ? 'active' : ''}`}
                             onClick={() => handleSelectCitation(pageCit, pageKey)}
-                            title={`Preview retrieved passage for ${srcItem.source} (p. ${p})`}
+                            title={`View excerpt from ${srcItem.source} (p. ${p})`}
                           >
                             p. {p}
                           </button>
@@ -916,7 +921,7 @@ function AgentMarkdownView({
                           )
                         }
                       >
-                        View passage
+                        View excerpt
                       </button>
                     )
                   )}
@@ -930,7 +935,7 @@ function AgentMarkdownView({
               <div className="agent-citation-preview-header">
                 <div className="agent-citation-preview-title">
                   <BookOpen size={14} color="var(--accent-cyan)" />
-                  <span>Grounded Evidence — {selectedCitation.citation.source}</span>
+                  <span>Source Excerpt — {selectedCitation.citation.source}</span>
                   {selectedCitation.citation.pageLabel && (
                     <span className="result-page-badge">
                       {selectedCitation.citation.pageLabel}
@@ -938,7 +943,7 @@ function AgentMarkdownView({
                   )}
                   {!previewMatch.exact && (
                     <span className="agent-citation-fallback-note">
-                      (showing retrieved chunk(s) from this document)
+                      (matching excerpts from this document)
                     </span>
                   )}
                 </div>
@@ -957,7 +962,7 @@ function AgentMarkdownView({
                   <div key={cIdx} className="agent-citation-chunk-item">
                     {previewMatch.chunks.length > 1 || !previewMatch.exact ? (
                       <div className="agent-citation-chunk-meta">
-                        <span>Retrieved Chunk #{cIdx + 1}</span>
+                        <span>Excerpt #{cIdx + 1}</span>
                         <span className="result-page-badge">p. {chunk.page}</span>
                       </div>
                     ) : null}
@@ -978,12 +983,312 @@ function AgentMarkdownView({
   );
 }
 
-function PrettyPrintEventStream({ events }) {
+const STARTER_PROMPTS = [
+  'Summarize the main topics and key takeaways across these documents.',
+  'What are the main risks, challenges, or limitations discussed?',
+  'List the key recommendations or conclusions with page references.',
+];
+
+function createThreadId() {
+  const rand = Math.random().toString(36).slice(2, 7);
+  return `thread-${Date.now().toString(36)}-${rand}`;
+}
+
+function createConversationThread(collectionName = '') {
+  const now = Date.now();
+  return {
+    id: createThreadId(),
+    collection: collectionName || '',
+    title: 'New Chat',
+    createdAt: now,
+    updatedAt: now,
+    turns: [],
+  };
+}
+
+function summarizeThreadTitle(query) {
+  const cleaned = (query || '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return 'New Chat';
+  return cleaned.length > 48 ? `${cleaned.slice(0, 47).trimEnd()}…` : cleaned;
+}
+
+function getThreadStorageKey(uid) {
+  return `irag_agent_threads_v1_${uid || 'anon'}`;
+}
+
+function loadStoredThreads(uid) {
+  if (!uid || typeof window === 'undefined') return null;
+  try {
+    const raw = window.sessionStorage.getItem(getThreadStorageKey(uid));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.threads) || parsed.threads.length === 0) {
+      return null;
+    }
+    const sanitizedThreads = parsed.threads.map((t) => ({
+      ...t,
+      turns: Array.isArray(t.turns)
+        ? t.turns.map((trn) =>
+            trn.status === 'streaming'
+              ? {
+                  ...trn,
+                  status: trn.answer ? 'done' : 'error',
+                  error: trn.answer ? null : 'Response interrupted when the page reloaded.',
+                }
+              : trn
+          )
+        : [],
+    }));
+    return {
+      threads: sanitizedThreads,
+      activeThreadId: parsed.activeThreadId || sanitizedThreads[0].id,
+    };
+  } catch (e) {
+    console.warn('Could not restore session threads:', e);
+    return null;
+  }
+}
+
+function formatTurnTime(timestamp) {
+  if (!timestamp) return '';
+  try {
+    return new Date(timestamp).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return '';
+  }
+}
+
+function summarizeTurnRetrieval(events) {
+  let toolCallsCount = 0;
+  let chunksCount = 0;
+  let lastToolQuery = null;
+
+  if (Array.isArray(events)) {
+    for (const evt of events) {
+      const msgType = (evt?.type || '').toLowerCase();
+      if ((msgType === 'ai' || msgType === 'assistant') && Array.isArray(evt.tool_calls)) {
+        toolCallsCount += evt.tool_calls.length;
+        for (const call of evt.tool_calls) {
+          if (call?.args?.query) {
+            lastToolQuery = call.args.query;
+          }
+        }
+      } else if (msgType === 'tool' || msgType === 'function') {
+        chunksCount += parseRetrievedChunksXml(evt.content).length;
+      }
+    }
+  }
+
+  return { toolCallsCount, chunksCount, lastToolQuery };
+}
+
+function describeLiveAgentStep(events, endpointMode, turnNumber) {
+  if (endpointMode === 'standard') {
+    return {
+      stage: 'Searching your documents and writing an answer…',
+      detail: 'Please wait a moment',
+    };
+  }
+
+  if (!Array.isArray(events) || events.length === 0) {
+    return {
+      stage: 'Thinking…',
+      detail:
+        turnNumber > 1
+          ? 'Reviewing your earlier messages'
+          : 'Preparing to search your documents',
+    };
+  }
+
+  let latestToolQuery = null;
+  let totalChunks = 0;
+  let sawToolResult = false;
+
+  for (const evt of events) {
+    const t = (evt?.type || '').toLowerCase();
+    if (
+      (t === 'ai' || t === 'assistant') &&
+      Array.isArray(evt.tool_calls) &&
+      evt.tool_calls.length > 0
+    ) {
+      const lastCall = evt.tool_calls[evt.tool_calls.length - 1];
+      latestToolQuery = lastCall?.args?.query || null;
+      sawToolResult = false;
+    } else if (t === 'tool' || t === 'function') {
+      sawToolResult = true;
+      totalChunks += parseRetrievedChunksXml(evt.content).length;
+    }
+  }
+
+  if (sawToolResult) {
+    return {
+      stage:
+        totalChunks > 0
+          ? `Writing answer using ${totalChunks} matching ${
+              totalChunks === 1 ? 'passage' : 'passages'
+            }…`
+          : 'Writing your answer…',
+      detail: latestToolQuery ? `Searched for: "${latestToolQuery}"` : '',
+    };
+  }
+
+  if (latestToolQuery) {
+    return {
+      stage: 'Searching your documents…',
+      detail: `Looking for: "${latestToolQuery}"`,
+    };
+  }
+
+  return {
+    stage:
+      turnNumber > 1
+        ? 'Reviewing conversation context…'
+        : 'Understanding your question…',
+    detail: '',
+  };
+}
+
+function renderStreamEventItem(msg, key, contextEvents) {
+  const msgType = (msg.type || 'unknown').toLowerCase();
+
+  if (msgType === 'human' || msgType === 'user') {
+    return (
+      <div key={key}>
+        <div className="pretty-header human">Your Question</div>
+        <div className="pretty-msg-box">{msg.content}</div>
+      </div>
+    );
+  }
+
+  if (msgType === 'ai' || msgType === 'assistant') {
+    return (
+      <div key={key}>
+        <div className="pretty-header ai">Assistant</div>
+        {msg.content && (
+          <div className="pretty-msg-box pretty-ai-markdown">
+            <AgentMarkdownView
+              markdown={msg.content}
+              events={contextEvents}
+              compact
+            />
+          </div>
+        )}
+
+        {msg.tool_calls && msg.tool_calls.length > 0 && (
+          <div className="pretty-tool-calls-panel">
+            <div className="pretty-tool-calls-title">
+              <Search size={14} />
+              Document Search
+            </div>
+            {msg.tool_calls.map((call, cIdx) => (
+              <div
+                key={cIdx}
+                style={{ marginBottom: cIdx < msg.tool_calls.length - 1 ? '0.5rem' : 0 }}
+              >
+                {call.args && (
+                  <div>
+                    {Object.entries(call.args).map(([k, v]) => (
+                      <div key={k} className="pretty-tool-arg-row">
+                        <span className="pretty-tool-arg-key">
+                          • {k === 'query' ? 'Search phrase' : k}:
+                        </span>
+                        <span>{typeof v === 'object' ? JSON.stringify(v) : String(v)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (msgType === 'tool' || msgType === 'function') {
+    const xmlChunks = parseRetrievedChunksXml(msg.content);
+    return (
+      <div key={key}>
+        <div className="pretty-header tool">Matched Passages</div>
+        {xmlChunks.length > 0 && (
+          <div style={{ fontSize: '0.8rem', fontWeight: 600, color: '#e2e8f0', marginBottom: '6px' }}>
+            Found {xmlChunks.length} matching {xmlChunks.length === 1 ? 'passage' : 'passages'}:
+          </div>
+        )}
+        {xmlChunks.length > 0 ? (
+          <div className="pretty-tool-chunks-list">
+            {xmlChunks.map((chunk, cIdx) => (
+              <div key={cIdx} className="pretty-tool-chunk-card">
+                <div className="pretty-tool-chunk-header">
+                  <span className="pretty-tool-chunk-index">Passage #{cIdx + 1}</span>
+                  <span className="result-source-tag">
+                    <FileText size={12} className="result-source-icon" />
+                    <span className="result-source-name">{chunk.source}</span>
+                    <span className="result-page-badge">p. {chunk.page}</span>
+                  </span>
+                </div>
+                <FormattedChunkView
+                  rawText={chunk.content}
+                  queryTerms={[]}
+                  viewMode="reflowed"
+                  highlightEnabled={false}
+                />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="pretty-tool-result-box">{msg.content}</div>
+        )}
+      </div>
+    );
+  }
+
+  if (msgType === 'system') {
+    return (
+      <div key={key}>
+        <div className="pretty-header system">System Note</div>
+        <div className="pretty-msg-box">{msg.content}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div key={key}>
+      <div className="pretty-header" style={{ color: '#94a3b8' }}>
+        {msgType.toUpperCase()}
+      </div>
+      <div className="pretty-msg-box">{msg.content || JSON.stringify(msg)}</div>
+    </div>
+  );
+}
+
+function PrettyPrintEventStream({ events = [], priorTurns = [], turnNumber = 1 }) {
+  const [scopeMode, setScopeMode] = useState('turn'); // 'turn' | 'thread'
   const [viewMode, setViewMode] = useState('pretty'); // 'pretty' | 'json'
   const [copied, setCopied] = useState(false);
 
+  const hasPriorHistory = priorTurns.length > 0;
+  const effectiveScope = hasPriorHistory ? scopeMode : 'turn';
+
+  const turnGroups = [
+    ...priorTurns.map((t, idx) => ({
+      turnNumber: idx + 1,
+      query: t.query,
+      events: Array.isArray(t.events) ? t.events : [],
+    })),
+    {
+      turnNumber,
+      events: Array.isArray(events) ? events : [],
+    },
+  ];
+  const allThreadEvents = turnGroups.flatMap((g) => g.events);
+  const displayedEvents = effectiveScope === 'thread' ? allThreadEvents : events;
+
   const handleCopyJson = () => {
-    navigator.clipboard.writeText(JSON.stringify(events, null, 2));
+    navigator.clipboard.writeText(JSON.stringify(displayedEvents, null, 2));
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -992,10 +1297,37 @@ function PrettyPrintEventStream({ events }) {
     <div className="stream-inspector-container">
       <div className="stream-inspector-header">
         <div className="stream-inspector-title">
-          <Terminal size={16} color="var(--primary)" />
-          Stream Events Log ({events.length} message events)
+          <BookOpen size={15} color="var(--primary)" />
+          <span>
+            {effectiveScope === 'thread'
+              ? `Full Chat Activity (${allThreadEvents.length} steps)`
+              : `Search & Reasoning Steps (${events.length})`}
+          </span>
         </div>
-        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+
+        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+          {hasPriorHistory && (
+            <div className="chunk-view-segmented" role="group" aria-label="Activity scope">
+              <button
+                type="button"
+                className={`chunk-view-btn ${effectiveScope === 'turn' ? 'active' : ''}`}
+                onClick={() => setScopeMode('turn')}
+                title="Show steps for this answer only"
+              >
+                <span>This Answer</span>
+              </button>
+              <button
+                type="button"
+                className={`chunk-view-btn ${effectiveScope === 'thread' ? 'active' : ''}`}
+                onClick={() => setScopeMode('thread')}
+                title="Show steps across the entire conversation"
+              >
+                <History size={12} />
+                <span>Full Chat</span>
+              </button>
+            </div>
+          )}
+
           <button
             type="button"
             className={`tab-btn ${viewMode === 'pretty' ? 'active' : ''}`}
@@ -1003,7 +1335,7 @@ function PrettyPrintEventStream({ events }) {
             style={{ padding: '0.3rem 0.75rem', fontSize: '0.78rem' }}
           >
             <Sparkles size={13} />
-            pretty_print_event
+            Readable
           </button>
           <button
             type="button"
@@ -1012,7 +1344,7 @@ function PrettyPrintEventStream({ events }) {
             style={{ padding: '0.3rem 0.75rem', fontSize: '0.78rem' }}
           >
             <Code2 size={13} />
-            Raw JSON
+            JSON
           </button>
           {viewMode === 'json' && (
             <button
@@ -1031,143 +1363,238 @@ function PrettyPrintEventStream({ events }) {
       <div className="stream-inspector-body">
         {viewMode === 'json' ? (
           <pre style={{ margin: 0, color: '#a5b4fc', fontSize: '0.8rem' }}>
-            {JSON.stringify(events, null, 2)}
+            {JSON.stringify(displayedEvents, null, 2)}
           </pre>
+        ) : effectiveScope === 'thread' ? (
+          <div>
+            {turnGroups.map((group) => (
+              <div key={`grp-${group.turnNumber}`} className="pretty-turn-group">
+                <div className="pretty-turn-divider">
+                  <span>Question #{group.turnNumber}</span>
+                  <span>
+                    {group.events.length} {group.events.length === 1 ? 'step' : 'steps'}
+                  </span>
+                </div>
+                {group.events.map((msg, idx) =>
+                  renderStreamEventItem(
+                    msg,
+                    `t${group.turnNumber}-m${idx}`,
+                    allThreadEvents
+                  )
+                )}
+              </div>
+            ))}
+          </div>
         ) : (
           <div>
-            {events.map((msg, index) => {
-              const msgType = (msg.type || 'unknown').toLowerCase();
-
-              if (msgType === 'human' || msgType === 'user') {
-                return (
-                  <div key={index}>
-                    <div className="pretty-header human">
-                      Human Message
-                    </div>
-                    <div className="pretty-msg-box">
-                      {msg.content}
-                    </div>
-                  </div>
-                );
-              }
-
-              if (msgType === 'ai' || msgType === 'assistant') {
-                return (
-                  <div key={index}>
-                    <div className="pretty-header ai">
-                      AI Message
-                    </div>
-                    {msg.content && (
-                      <div className="pretty-msg-box pretty-ai-markdown">
-                        <AgentMarkdownView
-                          markdown={msg.content}
-                          events={events}
-                          compact
-                        />
-                      </div>
-                    )}
-
-                    {/* Tool Calls */}
-                    {msg.tool_calls && msg.tool_calls.length > 0 && (
-                      <div className="pretty-tool-calls-panel">
-                        <div className="pretty-tool-calls-title">
-                          <Bot size={15} />
-                          Tool Calls
-                        </div>
-                        {msg.tool_calls.map((call, cIdx) => (
-                          <div key={cIdx} style={{ marginBottom: cIdx < msg.tool_calls.length - 1 ? '0.5rem' : 0 }}>
-                            <div style={{ fontWeight: 700, color: '#f43f5e', marginBottom: '4px' }}>
-                              Tool: {call.name}
-                            </div>
-                            {call.args && (
-                              <div>
-                                <div style={{ fontWeight: 600, color: '#94a3b8', fontSize: '0.8rem' }}>
-                                  Arguments:
-                                </div>
-                                {Object.entries(call.args).map(([k, v]) => (
-                                  <div key={k} className="pretty-tool-arg-row">
-                                    <span className="pretty-tool-arg-key">  • {k}:</span>
-                                    <span>{typeof v === 'object' ? JSON.stringify(v) : String(v)}</span>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                );
-              }
-
-              if (msgType === 'tool' || msgType === 'function') {
-                const xmlChunks = parseRetrievedChunksXml(msg.content);
-                return (
-                  <div key={index}>
-                    <div className="pretty-header tool">
-                      Tool Message
-                    </div>
-                    <div style={{ fontSize: '0.82rem', marginBottom: '6px', fontWeight: 600, color: '#f87171' }}>
-                      Tool Name: {msg.name || 'Retriever'}
-                    </div>
-                    <div style={{ fontSize: '0.8rem', fontWeight: 600, color: '#e2e8f0', marginBottom: '6px' }}>
-                      Tool Result {xmlChunks.length > 0 ? `(${xmlChunks.length} retrieved chunks)` : ''}:
-                    </div>
-                    {xmlChunks.length > 0 ? (
-                      <div className="pretty-tool-chunks-list">
-                        {xmlChunks.map((chunk, cIdx) => (
-                          <div key={cIdx} className="pretty-tool-chunk-card">
-                            <div className="pretty-tool-chunk-header">
-                              <span className="pretty-tool-chunk-index">Chunk #{cIdx + 1}</span>
-                              <span className="result-source-tag">
-                                <FileText size={12} className="result-source-icon" />
-                                <span className="result-source-name">{chunk.source}</span>
-                                <span className="result-page-badge">p. {chunk.page}</span>
-                              </span>
-                            </div>
-                            <FormattedChunkView
-                              rawText={chunk.content}
-                              queryTerms={[]}
-                              viewMode="reflowed"
-                              highlightEnabled={false}
-                            />
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="pretty-tool-result-box">
-                        {msg.content}
-                      </div>
-                    )}
-                  </div>
-                );
-              }
-
-              if (msgType === 'system') {
-                return (
-                  <div key={index}>
-                    <div className="pretty-header system">
-                      System Message
-                    </div>
-                    <div className="pretty-msg-box">
-                      {msg.content}
-                    </div>
-                  </div>
-                );
-              }
-
-              return (
-                <div key={index}>
-                  <div className="pretty-header" style={{ color: '#94a3b8' }}>
-                    {msgType.toUpperCase()} Message
-                  </div>
-                  <div className="pretty-msg-box">
-                    {msg.content || JSON.stringify(msg)}
-                  </div>
-                </div>
-              );
-            })}
+            {events.map((msg, index) =>
+              renderStreamEventItem(msg, index, allThreadEvents)
+            )}
           </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ConversationTurnCard({
+  turn,
+  turnIndex,
+  priorTurns,
+  onRetryTurn,
+  onStopTurn,
+  agentLoading,
+}) {
+  const [viewMode, setViewMode] = useState('rendered'); // 'rendered' | 'raw'
+  const [copied, setCopied] = useState(false);
+  const [showStreamEvents, setShowStreamEvents] = useState(false);
+
+  const turnEvents = Array.isArray(turn.events) ? turn.events : [];
+  // Prioritize passages retrieved in the current turn, falling back to earlier turns in this conversation
+  const priorEventsReversed = [...priorTurns]
+    .reverse()
+    .flatMap((t) => (Array.isArray(t.events) ? t.events : []));
+  const groundingEvents = [...turnEvents, ...priorEventsReversed];
+
+  const retrievalStats = summarizeTurnRetrieval(turnEvents);
+  const liveStep =
+    turn.status === 'streaming' && !turn.answer
+      ? describeLiveAgentStep(turnEvents, turn.endpointMode, turnIndex + 1)
+      : null;
+
+  const handleCopy = () => {
+    if (!turn.answer) return;
+    navigator.clipboard.writeText(turn.answer);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1800);
+  };
+
+  return (
+    <div className="chat-turn-block">
+      {/* User Prompt Row */}
+      <div className="chat-user-row">
+        <div className="chat-user-meta">
+          <span className="chat-role-label">You</span>
+          {turn.createdAt && (
+            <span className="chat-turn-time">{formatTurnTime(turn.createdAt)}</span>
+          )}
+        </div>
+        <div className="chat-user-bubble">{turn.query}</div>
+      </div>
+
+      {/* Grounded Assistant Response Card */}
+      <div className="agent-response-card chat-agent-card">
+        <div className="agent-response-header">
+          <div className="agent-response-title-group">
+            <div className="agent-response-title">
+              <Sparkles size={18} color="var(--primary)" />
+              <span>Assistant</span>
+            </div>
+            {retrievalStats.chunksCount > 0 ? (
+              <span className="agent-grounding-badge">
+                {retrievalStats.chunksCount}{' '}
+                {retrievalStats.chunksCount === 1 ? 'passage' : 'passages'} used
+              </span>
+            ) : retrievalStats.toolCallsCount > 0 && turn.status === 'done' ? (
+              <span className="agent-grounding-badge muted">No matching passages</span>
+            ) : turnIndex > 0 && turn.status === 'done' ? (
+              <span
+                className="agent-grounding-badge memory"
+                title="Answered using context from earlier in this conversation"
+              >
+                <History size={11} />
+                <span>From earlier in chat</span>
+              </span>
+            ) : null}
+          </div>
+
+          <div className="agent-response-actions">
+            {turn.answer && (
+              <>
+                <div className="chunk-view-segmented" role="group" aria-label="Answer display mode">
+                  <button
+                    type="button"
+                    className={`chunk-view-btn ${viewMode === 'rendered' ? 'active' : ''}`}
+                    onClick={() => setViewMode('rendered')}
+                    title="Formatted answer with clickable page citations"
+                  >
+                    <AlignLeft size={13} />
+                    <span>Formatted</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`chunk-view-btn ${viewMode === 'raw' ? 'active' : ''}`}
+                    onClick={() => setViewMode('raw')}
+                    title="Plain text view"
+                  >
+                    <FileText size={13} />
+                    <span>Plain Text</span>
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  className={`chunk-copy-btn ${copied ? 'copied' : ''}`}
+                  onClick={handleCopy}
+                  title={copied ? 'Copied!' : 'Copy answer'}
+                >
+                  {copied ? <Check size={13} /> : <Copy size={13} />}
+                  <span>{copied ? 'Copied' : 'Copy'}</span>
+                </button>
+              </>
+            )}
+
+            {turnEvents.length > 0 && (
+              <button
+                type="button"
+                className="btn-event-stream"
+                onClick={() => setShowStreamEvents((prev) => !prev)}
+                title="See how the assistant searched your documents"
+              >
+                <Search size={13} />
+                <span>{showStreamEvents ? 'Hide Steps' : 'View Steps'}</span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {liveStep ? (
+          <div className="agent-live-step-card">
+            <div className="agent-live-step-main">
+              <RefreshCw className="spinner" size={20} style={{ color: 'var(--primary)', flexShrink: 0 }} />
+              <div className="agent-live-step-text">
+                <div className="agent-live-step-stage">{liveStep.stage}</div>
+                {liveStep.detail && (
+                  <div className="agent-live-step-detail">{liveStep.detail}</div>
+                )}
+              </div>
+            </div>
+            {onStopTurn && (
+              <button
+                type="button"
+                className="agent-stop-inline-btn"
+                onClick={onStopTurn}
+                title="Stop generating answer"
+              >
+                <Square size={11} />
+                <span>Stop</span>
+              </button>
+            )}
+          </div>
+        ) : turn.status === 'error' && !turn.answer ? (
+          <div className="agent-turn-error-box">
+            <div className="agent-turn-error-msg">
+              <AlertCircle size={17} style={{ flexShrink: 0 }} />
+              <span>{turn.error || 'Could not generate an answer. Please try again.'}</span>
+            </div>
+            {onRetryTurn && (
+              <button
+                type="button"
+                className="agent-retry-btn"
+                onClick={() => onRetryTurn(turn)}
+                disabled={agentLoading}
+              >
+                <RotateCcw size={13} />
+                <span>Try Again</span>
+              </button>
+            )}
+          </div>
+        ) : (
+          <>
+            <AgentMarkdownView
+              markdown={turn.answer}
+              events={groundingEvents}
+              viewMode={viewMode}
+              queryTerms={extractQueryTerms(turn.query)}
+            />
+            {turn.status === 'error' && turn.error && (
+              <div className="agent-turn-error-box" style={{ marginTop: '0.85rem' }}>
+                <div className="agent-turn-error-msg">
+                  <AlertCircle size={16} style={{ flexShrink: 0 }} />
+                  <span>{turn.error}</span>
+                </div>
+                {onRetryTurn && (
+                  <button
+                    type="button"
+                    className="agent-retry-btn"
+                    onClick={() => onRetryTurn(turn)}
+                    disabled={agentLoading}
+                  >
+                    <RotateCcw size={13} />
+                    <span>Try Again</span>
+                  </button>
+                )}
+              </div>
+            )}
+          </>
+        )}
+
+        {showStreamEvents && (
+          <PrettyPrintEventStream
+            events={turnEvents}
+            priorTurns={priorTurns}
+            turnNumber={turnIndex + 1}
+          />
         )}
       </div>
     </div>
@@ -1207,22 +1634,34 @@ export default function App() {
   const [highlightMatches, setHighlightMatches] = useState(true);
   const [copiedChunkIdx, setCopiedChunkIdx] = useState(null);
 
-  // Agent tab state
+  // Agent tab multi-turn state (backed by LangGraph InMemorySaver on backend)
+  const initialThreadRef = useRef(null);
+  if (!initialThreadRef.current) {
+    initialThreadRef.current = createConversationThread('');
+  }
+  const [agentThreads, setAgentThreads] = useState([initialThreadRef.current]);
+  const [activeThreadId, setActiveThreadId] = useState(initialThreadRef.current.id);
   const [agentCollection, setAgentCollection] = useState('');
   const [agentQuery, setAgentQuery] = useState('');
-  const [submittedAgentQuery, setSubmittedAgentQuery] = useState('');
   const [agentEndpointMode, setAgentEndpointMode] = useState('stream'); // 'stream' | 'standard'
-  const [agentViewMode, setAgentViewMode] = useState('rendered'); // 'rendered' | 'raw'
-  const [agentCopied, setAgentCopied] = useState(false);
   const [agentLoading, setAgentLoading] = useState(false);
-  const [agentAnswer, setAgentAnswer] = useState(null);
-  const [agentEvents, setAgentEvents] = useState([]);
-  const [showStreamEvents, setShowStreamEvents] = useState(false);
 
   const fileInputRef = useRef(null);
-  const threadIdRef = useRef(`session-${Date.now()}`);
+  const agentInputRef = useRef(null);
+  const conversationEndRef = useRef(null);
+  const abortControllerRef = useRef(null);
+  const restoredUidRef = useRef(null);
+
+  const activeThread =
+    agentThreads.find((t) => t.id === activeThreadId) || agentThreads[0] || null;
 
   const resetTenantState = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    restoredUidRef.current = null;
+    const freshThread = createConversationThread('');
     setCollections([]);
     setCollectionDetails([]);
     setDeletingCol(null);
@@ -1236,15 +1675,12 @@ export default function App() {
     setQueryResults(null);
     setExpandedMeta({});
     setCopiedChunkIdx(null);
+    setAgentThreads([freshThread]);
+    setActiveThreadId(freshThread.id);
     setAgentCollection('');
     setAgentQuery('');
-    setSubmittedAgentQuery('');
-    setAgentAnswer(null);
-    setAgentEvents([]);
-    setAgentCopied(false);
-    setShowStreamEvents(false);
+    setAgentLoading(false);
     setNotification(null);
-    threadIdRef.current = `session-${Date.now()}`;
   };
 
   useEffect(() => {
@@ -1257,11 +1693,15 @@ export default function App() {
   }, []);
 
   const handleSignOut = async () => {
+    const uidToClear = currentUser?.uid;
     try {
       if (!currentUser?.isLocalDev) {
         await logoutUser();
       }
     } finally {
+      if (uidToClear && typeof window !== 'undefined') {
+        window.sessionStorage.removeItem(getThreadStorageKey(uidToClear));
+      }
       resetTenantState();
       setCurrentUser(null);
     }
@@ -1296,7 +1736,7 @@ export default function App() {
   };
 
   // Fetch collections from backend
-  const fetchCollections = async () => {
+  const fetchCollections = async (preferredAgentCol = null) => {
     if (!currentUser) return;
     try {
       setApiStatus('checking');
@@ -1317,7 +1757,22 @@ export default function App() {
       if (colList.length > 0) {
         if (!selectedCollection || !colList.includes(selectedCollection)) setSelectedCollection(colList[0]);
         if (!queryCollection || !colList.includes(queryCollection)) setQueryCollection(colList[0]);
-        if (!agentCollection || !colList.includes(agentCollection)) setAgentCollection(colList[0]);
+        const candidateAgentCol =
+          typeof preferredAgentCol === 'string' && preferredAgentCol
+            ? preferredAgentCol
+            : agentCollection;
+        const resolvedAgentCol =
+          candidateAgentCol && colList.includes(candidateAgentCol)
+            ? candidateAgentCol
+            : colList[0];
+        setAgentCollection(resolvedAgentCol);
+        setAgentThreads((prev) =>
+          prev.map((t) =>
+            t.turns.length === 0 && (!t.collection || !colList.includes(t.collection))
+              ? { ...t, collection: resolvedAgentCol }
+              : t
+          )
+        );
       } else {
         setSelectedCollection('');
         setQueryCollection('');
@@ -1328,7 +1783,7 @@ export default function App() {
       setApiStatus('offline');
       setNotification({
         type: 'error',
-        message: `Could not connect to backend API (${API_BASE}). Please ensure backend is running and authenticated.`
+        message: 'Could not reach the document service. Please check your connection and try again.'
       });
     }
   };
@@ -1353,9 +1808,20 @@ export default function App() {
       }
       setNotification({
         type: 'success',
-        message: `Successfully deleted collection '${colName}'.`
+        message: `Deleted collection '${colName}'.`
       });
       setDeletingCol(null);
+      const remainingThreads = agentThreads.filter((t) => t.collection !== colName);
+      if (remainingThreads.length === 0) {
+        const fresh = createConversationThread('');
+        setAgentThreads([fresh]);
+        setActiveThreadId(fresh.id);
+      } else if (remainingThreads.length !== agentThreads.length) {
+        setAgentThreads(remainingThreads);
+        if (!remainingThreads.some((t) => t.id === activeThreadId)) {
+          setActiveThreadId(remainingThreads[0].id);
+        }
+      }
       await fetchCollections();
     } catch (err) {
       console.error('Delete collection error:', err);
@@ -1369,10 +1835,44 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (currentUser?.uid) {
-      fetchCollections();
+    if (!currentUser?.uid) return;
+    let restoredCol = null;
+    const stored = loadStoredThreads(currentUser.uid);
+    if (stored) {
+      setAgentThreads(stored.threads);
+      setActiveThreadId(stored.activeThreadId);
+      const active =
+        stored.threads.find((t) => t.id === stored.activeThreadId) ||
+        stored.threads[0];
+      if (active?.collection) {
+        restoredCol = active.collection;
+        setAgentCollection(active.collection);
+      }
     }
+    restoredUidRef.current = currentUser.uid;
+    fetchCollections(restoredCol);
   }, [currentUser?.uid]);
+
+  useEffect(() => {
+    if (
+      !currentUser?.uid ||
+      restoredUidRef.current !== currentUser.uid ||
+      typeof window === 'undefined'
+    ) {
+      return;
+    }
+    try {
+      window.sessionStorage.setItem(
+        getThreadStorageKey(currentUser.uid),
+        JSON.stringify({
+          threads: agentThreads,
+          activeThreadId,
+        })
+      );
+    } catch (e) {
+      console.warn('Could not persist session threads:', e);
+    }
+  }, [currentUser?.uid, agentThreads, activeThreadId]);
 
   const handleFileChange = (e) => {
     const selectedFiles = Array.from(e.target.files).filter(
@@ -1419,7 +1919,7 @@ export default function App() {
     if (!targetCollection) {
       setNotification({
         type: 'error',
-        message: 'Please select or enter a valid collection name.'
+        message: 'Please choose or enter a collection name.'
       });
       return;
     }
@@ -1435,7 +1935,7 @@ export default function App() {
     if (uploadMode === 'paths' && !pdfPaths.trim()) {
       setNotification({
         type: 'error',
-        message: 'Please enter at least one valid server PDF path.'
+        message: 'Please enter at least one PDF file path.'
       });
       return;
     }
@@ -1462,12 +1962,12 @@ export default function App() {
       const result = await response.json();
 
       if (!response.ok) {
-        throw new Error(result.detail || 'Failed to ingest documents');
+        throw new Error(result.detail || 'Failed to add documents');
       }
 
       setNotification({
         type: 'success',
-        message: result.message || `Successfully ingested documents into '${targetCollection}'!`,
+        message: result.message || `Added documents to '${targetCollection}'.`,
         details: result
       });
 
@@ -1502,7 +2002,7 @@ export default function App() {
     if (!queryCollection) {
       setNotification({
         type: 'error',
-        message: 'Please select a collection to query.'
+        message: 'Please choose a collection to search.'
       });
       return;
     }
@@ -1511,7 +2011,7 @@ export default function App() {
     if (!trimmedQuery) {
       setNotification({
         type: 'error',
-        message: 'Please enter a search query.'
+        message: 'Please enter something to search for.'
       });
       return;
     }
@@ -1534,7 +2034,7 @@ export default function App() {
       const result = await response.json();
 
       if (!response.ok) {
-        throw new Error(result.detail || 'Failed to query collection');
+        throw new Error(result.detail || 'Search failed');
       }
 
       setSubmittedQuery(trimmedQuery);
@@ -1544,41 +2044,219 @@ export default function App() {
       console.error('Query error:', err);
       setNotification({
         type: 'error',
-        message: err.message || 'An error occurred while querying vector store.'
+        message: err.message || 'An error occurred while searching your documents.'
       });
     } finally {
       setQueryLoading(false);
     }
   };
 
-  const handleAgentSubmit = async (e) => {
-    e.preventDefault();
-    setNotification(null);
-    setAgentAnswer(null);
-    setAgentEvents([]);
-    setAgentCopied(false);
-    setShowStreamEvents(false);
+  const selectAgentCollection = (nextCol) => {
+    setAgentCollection(nextCol);
+    if (!nextCol) return;
 
-    const targetCollection = agentCollection || selectedCollection;
+    const current =
+      agentThreads.find((t) => t.id === activeThreadId) || agentThreads[0];
+
+    if (current && current.collection === nextCol) {
+      if (activeThreadId !== current.id) {
+        setActiveThreadId(current.id);
+      }
+      return;
+    }
+
+    if (current && current.turns.length === 0) {
+      setAgentThreads((prev) =>
+        prev.map((t) =>
+          t.id === current.id
+            ? { ...t, collection: nextCol, updatedAt: Date.now() }
+            : t
+        )
+      );
+      if (activeThreadId !== current.id) {
+        setActiveThreadId(current.id);
+      }
+      return;
+    }
+
+    const existingForCol = [...agentThreads]
+      .filter((t) => t.collection === nextCol)
+      .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+
+    if (existingForCol) {
+      setActiveThreadId(existingForCol.id);
+      return;
+    }
+
+    const fresh = createConversationThread(nextCol);
+    setAgentThreads((prev) => [fresh, ...prev]);
+    setActiveThreadId(fresh.id);
+  };
+
+  const handleNewThread = () => {
+    if (agentLoading) return;
+    const targetCol =
+      activeThread?.collection || agentCollection || selectedCollection || '';
+
+    if (activeThread && activeThread.turns.length === 0) {
+      const rotatedId = createThreadId();
+      setAgentThreads((prev) =>
+        prev.map((t) =>
+          t.id === activeThread.id
+            ? {
+                ...t,
+                id: rotatedId,
+                collection: targetCol,
+                updatedAt: Date.now(),
+              }
+            : t
+        )
+      );
+      setActiveThreadId(rotatedId);
+    } else {
+      const fresh = createConversationThread(targetCol);
+      setAgentThreads((prev) => [fresh, ...prev]);
+      setActiveThreadId(fresh.id);
+    }
+
+    setAgentQuery('');
+    setNotification(null);
+    setTimeout(() => agentInputRef.current?.focus(), 30);
+  };
+
+  const handleSwitchThread = (thread) => {
+    if (agentLoading || !thread) return;
+    setActiveThreadId(thread.id);
+    if (thread.collection && collections.includes(thread.collection)) {
+      setAgentCollection(thread.collection);
+    }
+    setNotification(null);
+  };
+
+  const handleDeleteThread = (e, threadId) => {
+    e.stopPropagation();
+    if (agentLoading) return;
+    const remaining = agentThreads.filter((t) => t.id !== threadId);
+    if (remaining.length === 0) {
+      const fallbackCol = agentCollection || selectedCollection || '';
+      const fresh = createConversationThread(fallbackCol);
+      setAgentThreads([fresh]);
+      setActiveThreadId(fresh.id);
+    } else {
+      setAgentThreads(remaining);
+      if (activeThreadId === threadId) {
+        const nextActive = [...remaining].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+        setActiveThreadId(nextActive.id);
+        if (nextActive.collection && collections.includes(nextActive.collection)) {
+          setAgentCollection(nextActive.collection);
+        }
+      }
+    }
+  };
+
+  const handleStopAgent = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+  };
+
+  const updateTurnInThread = (tId, trnId, patchFn) => {
+    setAgentThreads((prev) =>
+      prev.map((t) => {
+        if (t.id !== tId) return t;
+        return {
+          ...t,
+          updatedAt: Date.now(),
+          turns: t.turns.map((trn) => (trn.id === trnId ? patchFn(trn) : trn)),
+        };
+      })
+    );
+  };
+
+  const submitAgentQuestion = async (rawQuestion, { retryTurnId = null } = {}) => {
+    if (agentLoading) return;
+    setNotification(null);
+
+    const targetCollection =
+      activeThread?.collection || agentCollection || selectedCollection;
     if (!targetCollection) {
       setNotification({
         type: 'error',
-        message: 'Please select a collection for the Agentic RAG assistant.'
+        message: 'Please choose a collection first.',
       });
       return;
     }
 
-    const trimmedQuestion = agentQuery.trim();
+    const trimmedQuestion = (rawQuestion || '').trim();
     if (!trimmedQuestion) {
       setNotification({
         type: 'error',
-        message: 'Please enter a question for the agent.'
+        message: 'Please enter a question.',
       });
       return;
     }
 
-    setSubmittedAgentQuery(trimmedQuestion);
+    let targetThreadId = activeThread?.id;
+    const turnId = `turn-${Date.now().toString(36)}-${Math.random()
+      .toString(36)
+      .slice(2, 6)}`;
+    const now = Date.now();
+    const newTurn = {
+      id: turnId,
+      query: trimmedQuestion,
+      answer: '',
+      events: [],
+      endpointMode: agentEndpointMode,
+      status: 'streaming',
+      error: null,
+      createdAt: now,
+    };
+
+    if (!targetThreadId) {
+      const fresh = {
+        ...createConversationThread(targetCollection),
+        title: summarizeThreadTitle(trimmedQuestion),
+        updatedAt: now,
+        turns: [newTurn],
+      };
+      targetThreadId = fresh.id;
+      setAgentThreads((prev) => [fresh, ...prev]);
+      setActiveThreadId(fresh.id);
+    } else {
+      setAgentThreads((prev) =>
+        prev.map((t) => {
+          if (t.id !== targetThreadId) return t;
+          const baseTurns = retryTurnId
+            ? t.turns.filter((item) => item.id !== retryTurnId)
+            : t.turns;
+          const nextTitle =
+            baseTurns.length === 0 ? summarizeThreadTitle(trimmedQuestion) : t.title;
+          return {
+            ...t,
+            collection: t.collection || targetCollection,
+            title: nextTitle,
+            updatedAt: now,
+            turns: [...baseTurns, newTurn],
+          };
+        })
+      );
+    }
+
+    if (!retryTurnId) {
+      setAgentQuery('');
+    }
     setAgentLoading(true);
+
+    setTimeout(() => {
+      conversationEndRef.current?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'end',
+      });
+    }, 50);
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
 
     try {
       const endpointUrl =
@@ -1590,19 +2268,20 @@ export default function App() {
           ? {
               query: trimmedQuestion,
               collection_name: targetCollection,
-              thread_id: threadIdRef.current,
+              thread_id: targetThreadId,
               stream: false,
             }
           : {
               query: trimmedQuestion,
               collection_name: targetCollection,
-              thread_id: threadIdRef.current,
+              thread_id: targetThreadId,
             };
 
       const response = await authFetch(endpointUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -1616,6 +2295,8 @@ export default function App() {
         const decoder = new TextDecoder();
         let buffer = '';
         let streamDone = false;
+        let latestAnswer = '';
+        let streamError = null;
         const accumulatedEvents = [];
 
         const processLine = (rawLine) => {
@@ -1627,14 +2308,23 @@ export default function App() {
 
           try {
             const parsed = JSON.parse(dataStr);
+            if (parsed.event === 'error' && parsed.error) {
+              streamError = parsed.error;
+            }
             if (parsed.message) {
               accumulatedEvents.push(parsed.message);
-              setAgentEvents([...accumulatedEvents]);
-
               const msgType = (parsed.message.type || '').toLowerCase();
-              if ((msgType === 'ai' || msgType === 'assistant') && parsed.message.content) {
-                setAgentAnswer(parsed.message.content);
+              if (
+                (msgType === 'ai' || msgType === 'assistant') &&
+                parsed.message.content
+              ) {
+                latestAnswer = parsed.message.content;
               }
+              updateTurnInThread(targetThreadId, turnId, (trn) => ({
+                ...trn,
+                events: [...accumulatedEvents],
+                answer: latestAnswer,
+              }));
             }
           } catch (e) {
             console.warn('Error parsing SSE json:', e);
@@ -1663,23 +2353,67 @@ export default function App() {
             }
           }
         }
+
+        updateTurnInThread(targetThreadId, turnId, (trn) => ({
+          ...trn,
+          events: [...accumulatedEvents],
+          answer: latestAnswer,
+          status: streamError && !latestAnswer ? 'error' : 'done',
+          error: streamError && !latestAnswer ? streamError : null,
+        }));
       } else {
         const data = await response.json();
-        if (data.messages) {
-          setAgentEvents(data.messages);
-        }
-        if (data.answer) {
-          setAgentAnswer(data.answer);
-        }
+        const msgs = Array.isArray(data.messages) ? data.messages : [];
+        const ans = data.answer || '';
+        updateTurnInThread(targetThreadId, turnId, (trn) => ({
+          ...trn,
+          events: msgs,
+          answer: ans,
+          status: 'done',
+          error: null,
+        }));
       }
     } catch (err) {
-      console.error('Agent execution error:', err);
-      setNotification({
-        type: 'error',
-        message: err.message || 'An error occurred while communicating with the AI agent.'
-      });
+      if (err?.name === 'AbortError') {
+        updateTurnInThread(targetThreadId, turnId, (trn) => ({
+          ...trn,
+          status: trn.answer ? 'done' : 'error',
+          error: trn.answer ? null : 'Stopped.',
+        }));
+      } else {
+        console.error('Agent execution error:', err);
+        const errMessage =
+          err.message || 'Could not get an answer right now. Please try again.';
+        updateTurnInThread(targetThreadId, turnId, (trn) => ({
+          ...trn,
+          status: 'error',
+          error: errMessage,
+        }));
+      }
     } finally {
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
       setAgentLoading(false);
+    }
+  };
+
+  const handleAgentSubmit = (e) => {
+    e.preventDefault();
+    submitAgentQuestion(agentQuery);
+  };
+
+  const handleRetryTurn = (failedTurn) => {
+    if (!failedTurn?.query || agentLoading) return;
+    submitAgentQuestion(failedTurn.query, { retryTurnId: failedTurn.id });
+  };
+
+  const handleAgentKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent?.isComposing) {
+      e.preventDefault();
+      if (!agentLoading && apiStatus !== 'offline' && agentQuery.trim()) {
+        submitAgentQuestion(agentQuery);
+      }
     }
   };
 
@@ -1700,19 +2434,12 @@ export default function App() {
     }, 1800);
   };
 
-  const handleCopyAgentAnswer = () => {
-    if (!agentAnswer) return;
-    navigator.clipboard.writeText(agentAnswer);
-    setAgentCopied(true);
-    setTimeout(() => setAgentCopied(false), 1800);
-  };
-
   if (authInitializing) {
     return (
       <div className="auth-screen">
         <div className="glass-card" style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
           <RefreshCw size={20} className="spinner" color="var(--primary)" />
-          <span>Checking authentication session...</span>
+          <span>Signing you in...</span>
         </div>
       </div>
     );
@@ -1738,16 +2465,16 @@ export default function App() {
             <Database size={28} />
           </div>
           <div>
-            <h1 className="brand-title">Interactive RAG Portal</h1>
-            <p className="brand-subtitle">Vector Store Ingestion & Semantic Retrieval Engine</p>
+            <h1 className="brand-title">Interactive RAG</h1>
+            <p className="brand-subtitle">Upload PDFs, search passages, and chat with your documents</p>
           </div>
         </div>
 
         <div className="header-actions">
           <div className="status-pill">
             <span className={`status-dot ${apiStatus === 'online' ? 'online' : 'offline'}`}></span>
-            <span>{apiStatus === 'online' ? 'Backend Connected' : 'Backend Offline'}</span>
-            <button onClick={fetchCollections} className="refresh-btn" title="Check connection">
+            <span>{apiStatus === 'online' ? 'Connected' : 'Offline'}</span>
+            <button onClick={fetchCollections} className="refresh-btn" title="Refresh connection">
               <RefreshCw size={14} className={apiStatus === 'checking' ? 'spinner' : ''} />
             </button>
           </div>
@@ -1779,28 +2506,28 @@ export default function App() {
           onClick={() => setActiveTab('ingest')}
         >
           <Upload size={18} />
-          Ingest Documents
+          Upload Documents
         </button>
         <button
           className={`nav-tab-btn ${activeTab === 'query' ? 'active' : ''}`}
           onClick={() => setActiveTab('query')}
         >
           <Search size={18} />
-          Query Collections
+          Search Passages
         </button>
         <button
           className={`nav-tab-btn ${activeTab === 'agent' ? 'active' : ''}`}
           onClick={() => setActiveTab('agent')}
         >
           <Bot size={18} />
-          Agentic RAG Assistant
+          AI Assistant
         </button>
         <button
           className={`nav-tab-btn ${activeTab === 'manage' ? 'active' : ''}`}
           onClick={() => setActiveTab('manage')}
         >
           <Database size={18} />
-          Manage Collections
+          My Collections
         </button>
       </div>
 
@@ -1816,7 +2543,9 @@ export default function App() {
             <p style={{ fontWeight: 600 }}>{notification.message}</p>
             {notification.details && (
               <p style={{ fontSize: '0.8rem', marginTop: '4px', opacity: 0.9 }}>
-                Added {notification.details.chunks_added} chunks across {notification.details.processed_files?.length || 0} file(s).
+                Indexed {notification.details.chunks_added}{' '}
+                {notification.details.chunks_added === 1 ? 'passage' : 'passages'} from{' '}
+                {notification.details.processed_files?.length || 0} file(s).
               </p>
             )}
           </div>
@@ -1836,13 +2565,13 @@ export default function App() {
           <div className="glass-card">
             <h2 className="card-title">
               <Upload size={22} color="var(--primary)" />
-              Ingest PDF Documents
+              Upload PDF Documents
             </h2>
 
             <form onSubmit={handleIngestSubmit}>
               {/* Step 1: Collection Selection */}
               <div className="form-group">
-                <label className="form-label">Vectorstore Collection Name</label>
+                <label className="form-label">Collection</label>
                 
                 <div className="tab-group">
                   <button
@@ -1879,7 +2608,7 @@ export default function App() {
                       </select>
                     ) : (
                       <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-                        No existing collections found. Select 'New Collection' to create one.
+                        No collections yet. Select 'New Collection' to create one.
                       </p>
                     )}
                   </div>
@@ -1887,16 +2616,16 @@ export default function App() {
                   <input
                     type="text"
                     className="form-input"
-                    placeholder="e.g. stock_market_vs, financial_reports_2025"
+                    placeholder="e.g. annual-reports-2025, product-guides"
                     value={newCollectionName}
                     onChange={(e) => setNewCollectionName(e.target.value)}
                   />
                 )}
               </div>
 
-              {/* Step 2: Document Input Mode */}
+              {/* Step 2: Document Source */}
               <div className="form-group">
-                <label className="form-label">Document Input Mode</label>
+                <label className="form-label">Files to Add</label>
                 
                 <div className="tab-group">
                   <button
@@ -1913,7 +2642,7 @@ export default function App() {
                     onClick={() => setUploadMode('paths')}
                   >
                     <FileText size={16} />
-                    Server File Paths
+                    Local File Paths
                   </button>
                 </div>
 
@@ -1926,8 +2655,8 @@ export default function App() {
                       onClick={() => fileInputRef.current?.click()}
                     >
                       <Upload className="dropzone-icon" />
-                      <p className="dropzone-text">Click or Drag & Drop PDF files here</p>
-                      <p className="dropzone-hint">Supports single or multiple PDF documents</p>
+                      <p className="dropzone-text">Click or drag &amp; drop PDF files here</p>
+                      <p className="dropzone-hint">Supports one or multiple PDF documents</p>
                       <input
                         ref={fileInputRef}
                         type="file"
@@ -1967,12 +2696,12 @@ export default function App() {
                     <textarea
                       rows={4}
                       className="form-textarea"
-                      placeholder="Enter file path(s), one per line, e.g.:&#10;./data/Stock_Market_Performance_2024.pdf&#10;./data/Stock_Market_Performance_2025.pdf"
+                      placeholder="Enter file path(s), one per line, e.g.:&#10;./data/annual_report_2024.pdf&#10;./data/annual_report_2025.pdf"
                       value={pdfPaths}
                       onChange={(e) => setPdfPaths(e.target.value)}
                     />
                     <p style={{ fontSize: '0.75rem', color: 'var(--text-dim)', marginTop: '4px' }}>
-                      Enter absolute or relative paths accessible by the FastAPI server.
+                      Enter local file paths available on the server, one per line.
                     </p>
                   </div>
                 )}
@@ -1983,12 +2712,12 @@ export default function App() {
                 {loading ? (
                   <>
                     <RefreshCw className="spinner" size={20} />
-                    Splitting & Embedding PDF Chunks...
+                    Processing &amp; Indexing PDFs...
                   </>
                 ) : (
                   <>
                     <PlusCircle size={20} />
-                    Ingest Documents into Collection
+                    Add Documents to Collection
                   </>
                 )}
               </button>
@@ -1996,18 +2725,18 @@ export default function App() {
           </div>
         )}
 
-        {/* Query Tab Content */}
+        {/* Search Passages Tab Content */}
         {activeTab === 'query' && (
           <div className="glass-card">
             <h2 className="card-title">
               <Search size={22} color="var(--accent-cyan)" />
-              Search & Query Collection
+              Search Document Passages
             </h2>
 
             <form onSubmit={handleQuerySubmit}>
               {/* Target Collection */}
               <div className="form-group">
-                <label className="form-label">Select Target Collection</label>
+                <label className="form-label">Collection</label>
                 {collections.length > 0 ? (
                   <select
                     className="form-select"
@@ -2022,28 +2751,30 @@ export default function App() {
                   </select>
                 ) : (
                   <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-                    No collections found. Ingest documents first to create a collection.
+                    No collections yet. Upload documents first to create one.
                   </p>
                 )}
               </div>
 
               {/* Query Text */}
               <div className="form-group">
-                <label className="form-label">Natural Language Query / Question</label>
+                <label className="form-label">What are you looking for?</label>
                 <input
                   type="text"
                   className="form-input"
-                  placeholder="e.g., What is Arm Holdings (ARM)? or Stock market trends in 2025"
+                  placeholder="e.g., key recommendations, budget overview, or project timeline"
                   value={queryText}
                   onChange={(e) => setQueryText(e.target.value)}
                 />
               </div>
 
-              {/* Top K selector */}
+              {/* Number of Results selector */}
               <div className="form-group">
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
-                  <label className="form-label" style={{ margin: 0 }}>Top Results Limit (k)</label>
-                  <span style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--accent-cyan)' }}>{topK} results</span>
+                  <label className="form-label" style={{ margin: 0 }}>Number of Results</label>
+                  <span style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--accent-cyan)' }}>
+                    {topK} {Number(topK) === 1 ? 'passage' : 'passages'}
+                  </span>
                 </div>
                 <input
                   type="range"
@@ -2059,12 +2790,12 @@ export default function App() {
                 {queryLoading ? (
                   <>
                     <RefreshCw className="spinner" size={20} />
-                    Retrieving Matching Documents...
+                    Searching Documents...
                   </>
                 ) : (
                   <>
-                    <Sparkles size={20} />
-                    Run Similarity Search
+                    <Search size={20} />
+                    Search Passages
                   </>
                 )}
               </button>
@@ -2078,7 +2809,7 @@ export default function App() {
                   <div className="results-toolbar">
                     <div className="results-toolbar-left">
                       <h3 className="results-heading">
-                        Search Results
+                        Matching Passages
                         <span className="results-count-pill">{queryResults.length}</span>
                       </h3>
                       <span className="results-collection-label">
@@ -2093,31 +2824,31 @@ export default function App() {
                             type="button"
                             className={`chunk-control-pill ${highlightMatches ? 'active' : ''}`}
                             onClick={() => setHighlightMatches((prev) => !prev)}
-                            title="Toggle query keyword highlighting"
+                            title="Highlight matching search words"
                           >
                             <Highlighter size={13} />
                             <span>Highlights</span>
                           </button>
                         )}
 
-                        <div className="chunk-view-segmented" role="group" aria-label="Chunk display mode">
+                        <div className="chunk-view-segmented" role="group" aria-label="Passage layout">
                           <button
                             type="button"
                             className={`chunk-view-btn ${chunkViewMode === 'reflowed' ? 'active' : ''}`}
                             onClick={() => setChunkViewMode('reflowed')}
-                            title="Reflow PDF line breaks into full-width paragraphs"
+                            title="Easy-to-read paragraphs"
                           >
                             <AlignLeft size={13} />
-                            <span>Reflowed</span>
+                            <span>Formatted</span>
                           </button>
                           <button
                             type="button"
                             className={`chunk-view-btn ${chunkViewMode === 'raw' ? 'active' : ''}`}
                             onClick={() => setChunkViewMode('raw')}
-                            title="Show exact raw chunk text with original newlines"
+                            title="Original text layout from the PDF"
                           >
-                            <Code2 size={13} />
-                            <span>Raw</span>
+                            <FileText size={13} />
+                            <span>Original</span>
                           </button>
                         </div>
                       </div>
@@ -2126,7 +2857,7 @@ export default function App() {
 
                   {queryResults.length === 0 ? (
                     <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', margin: '1.5rem 0' }}>
-                      No matching documents found for your query.
+                      No matching passages found. Try phrasing your search differently.
                     </p>
                   ) : (
                     <div className="results-container">
@@ -2135,7 +2866,6 @@ export default function App() {
                         const wordCount = rawContent.trim()
                           ? rawContent.trim().split(/\s+/).length
                           : 0;
-                        const charCount = rawContent.length;
                         const sourceName = res.metadata?.source
                           ? res.metadata.source.split(/[\\/]/).pop()
                           : null;
@@ -2152,10 +2882,10 @@ export default function App() {
                             <div className="result-header">
                               <div className="result-header-left">
                                 <span className="result-rank-badge">
-                                  Result #{idx + 1}
+                                  Passage #{idx + 1}
                                 </span>
                                 <span className="result-stats-pill">
-                                  {wordCount} words · {charCount} chars
+                                  {wordCount} words
                                 </span>
                               </div>
 
@@ -2177,7 +2907,7 @@ export default function App() {
                                   title={
                                     isCopied
                                       ? 'Copied!'
-                                      : `Copy ${chunkViewMode === 'raw' ? 'raw' : 'formatted'} chunk`
+                                      : `Copy ${chunkViewMode === 'raw' ? 'original' : 'formatted'} passage`
                                   }
                                 >
                                   {isCopied ? <Check size={13} /> : <Copy size={13} />}
@@ -2202,11 +2932,11 @@ export default function App() {
                                 >
                                   {expandedMeta[idx] ? (
                                     <>
-                                      <ChevronUp size={14} /> Hide Full Metadata
+                                      <ChevronUp size={14} /> Hide File Details
                                     </>
                                   ) : (
                                     <>
-                                      <ChevronDown size={14} /> View Metadata
+                                      <ChevronDown size={14} /> File Details
                                     </>
                                   )}
                                 </button>
@@ -2229,208 +2959,349 @@ export default function App() {
           </div>
         )}
 
-        {/* Agentic RAG Assistant Tab Content */}
-        {activeTab === 'agent' && (
-          <div className="glass-card">
-            <h2 className="card-title">
-              <Bot size={22} color="var(--primary)" />
-              Agentic RAG Assistant
-            </h2>
-            <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '1.5rem' }}>
-              Ask natural language questions to any collection. The agent dynamically decides when to invoke document retriever tools and returns a synthesized response.
-            </p>
+        {/* AI Assistant Tab Content */}
+        {activeTab === 'agent' &&
+          (() => {
+            const effectiveCollection =
+              activeThread?.collection || agentCollection || selectedCollection || '';
+            const activeTurns = activeThread?.turns || [];
+            const showThreadStrip =
+              agentThreads.length > 1 || activeTurns.length > 0;
+            const distinctThreadCollections = new Set(
+              agentThreads.map((t) => t.collection).filter(Boolean)
+            );
 
-            <form onSubmit={handleAgentSubmit}>
-              {/* Target Collection */}
-              <div className="form-group">
-                <label className="form-label">Select Target Collection</label>
-                {collections.length > 0 ? (
-                  <select
-                    className="form-select"
-                    value={agentCollection || selectedCollection}
-                    onChange={(e) => setAgentCollection(e.target.value)}
+            return (
+              <div className="glass-card agent-workspace-card">
+                {/* Workspace Header */}
+                <div className="agent-workspace-header">
+                  <div className="agent-workspace-title-group">
+                    <h2 className="card-title" style={{ margin: 0 }}>
+                      <Bot size={22} color="var(--primary)" />
+                      <span>AI Assistant</span>
+                    </h2>
+                  </div>
+
+                  <button
+                    type="button"
+                    className="btn-new-thread"
+                    onClick={handleNewThread}
+                    disabled={agentLoading || (activeTurns.length === 0 && agentThreads.length <= 1)}
+                    title="Start a new chat"
                   >
-                    {collections.map((col) => (
-                      <option key={col} value={col}>
-                        {col}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-                    No collections found. Ingest documents first to create a collection.
-                  </p>
-                )}
-              </div>
-
-              {/* Natural Language Question & Endpoint Mode */}
-              <div className="form-group">
-                <div className="agent-question-label-row">
-                  <label className="form-label" style={{ margin: 0 }}>
-                    Question for AI Agent
-                  </label>
-                  <div className="chunk-view-segmented" role="group" aria-label="Agent endpoint mode">
-                    <button
-                      type="button"
-                      className={`chunk-view-btn ${agentEndpointMode === 'stream' ? 'active' : ''}`}
-                      onClick={() => setAgentEndpointMode('stream')}
-                      title="Stream real-time SSE events via POST /agent/stream"
-                    >
-                      <Zap size={12} />
-                      <span>/agent/stream</span>
-                    </button>
-                    <button
-                      type="button"
-                      className={`chunk-view-btn ${agentEndpointMode === 'standard' ? 'active' : ''}`}
-                      onClick={() => setAgentEndpointMode('standard')}
-                      title="Fetch complete JSON response via POST /agent"
-                    >
-                      <Server size={12} />
-                      <span>/agent</span>
-                    </button>
-                  </div>
+                    <MessageSquarePlus size={15} />
+                    <span>New Chat</span>
+                  </button>
                 </div>
-                <textarea
-                  rows={3}
-                  className="form-textarea"
-                  placeholder="e.g. What is ARM Holdings? or Summarize the major drivers for ARM in 2024."
-                  value={agentQuery}
-                  onChange={(e) => setAgentQuery(e.target.value)}
-                />
-              </div>
 
-              <button type="submit" className="btn-primary" disabled={agentLoading || apiStatus === 'offline'}>
-                {agentLoading ? (
-                  <>
-                    <RefreshCw className="spinner" size={20} />
-                    Agent Thinking & Querying Retriever...
-                  </>
-                ) : (
-                  <>
-                    <Sparkles size={20} />
-                    Ask Agent
-                  </>
-                )}
-              </button>
-            </form>
+                <p className="agent-workspace-subtitle">
+                  Ask questions about your documents and follow up naturally — the assistant
+                  remembers your conversation and cites the exact pages it used.
+                </p>
 
-            {/* AI Response Card & Event Stream Inspector */}
-            {(agentAnswer || agentLoading || agentEvents.length > 0) && (
-              <div className="agent-response-card">
-                <div className="agent-response-header">
-                  <div className="agent-response-title-group">
-                    <div className="agent-response-title">
-                      <Sparkles size={20} color="var(--primary)" />
-                      AI Response
-                    </div>
-                    <span className="agent-endpoint-badge">
-                      {agentEndpointMode === 'standard' ? 'POST /agent' : 'POST /agent/stream'}
+                {/* Session Config Bar: Collection + Response Mode */}
+                <div className="agent-session-bar">
+                  <div className="agent-collection-picker">
+                    <span className="agent-picker-label">
+                      <Database size={14} color="var(--accent-cyan)" />
+                      <span>Collection</span>
                     </span>
+                    {collections.length > 0 ? (
+                      <select
+                        className="form-select agent-compact-select"
+                        value={effectiveCollection}
+                        onChange={(e) => selectAgentCollection(e.target.value)}
+                        disabled={agentLoading}
+                        aria-label="Choose collection"
+                      >
+                        {collections.map((col) => (
+                          <option key={col} value={col}>
+                            {col}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <span className="agent-no-collection-hint">
+                        No collections yet — upload PDFs first
+                      </span>
+                    )}
                   </div>
 
-                  <div className="agent-response-actions">
-                    {agentAnswer && (
-                      <>
-                        <div className="chunk-view-segmented" role="group" aria-label="Response display mode">
-                          <button
-                            type="button"
-                            className={`chunk-view-btn ${agentViewMode === 'rendered' ? 'active' : ''}`}
-                            onClick={() => setAgentViewMode('rendered')}
-                            title="Formatted view with rich typography and interactive citations"
-                          >
-                            <AlignLeft size={13} />
-                            <span>Formatted</span>
-                          </button>
-                          <button
-                            type="button"
-                            className={`chunk-view-btn ${agentViewMode === 'raw' ? 'active' : ''}`}
-                            onClick={() => setAgentViewMode('raw')}
-                            title="Raw Markdown output"
-                          >
-                            <Code2 size={13} />
-                            <span>Markdown</span>
-                          </button>
-                        </div>
-
-                        <button
-                          type="button"
-                          className={`chunk-copy-btn ${agentCopied ? 'copied' : ''}`}
-                          onClick={handleCopyAgentAnswer}
-                          title={agentCopied ? 'Copied!' : 'Copy AI response'}
-                        >
-                          {agentCopied ? <Check size={13} /> : <Copy size={13} />}
-                          <span>{agentCopied ? 'Copied' : 'Copy'}</span>
-                        </button>
-                      </>
-                    )}
-
-                    {agentEvents.length > 0 && (
+                  <div className="agent-session-bar-right">
+                    <div
+                      className="chunk-view-segmented"
+                      role="group"
+                      aria-label="Response delivery mode"
+                    >
                       <button
                         type="button"
-                        className="btn-event-stream"
-                        onClick={() => setShowStreamEvents(!showStreamEvents)}
+                        className={`chunk-view-btn ${
+                          agentEndpointMode === 'stream' ? 'active' : ''
+                        }`}
+                        onClick={() => setAgentEndpointMode('stream')}
+                        title="Show progress and answers live as they are generated"
                       >
-                        <Terminal size={15} />
-                        {showStreamEvents ? 'Hide Stream Events' : 'Stream Events'}
+                        <Zap size={12} />
+                        <span>Live</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={`chunk-view-btn ${
+                          agentEndpointMode === 'standard' ? 'active' : ''
+                        }`}
+                        onClick={() => setAgentEndpointMode('standard')}
+                        title="Show the complete answer once ready"
+                      >
+                        <FileCheck size={12} />
+                        <span>Standard</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Recent Chats Switcher Strip */}
+                {showThreadStrip && (
+                  <div className="agent-threads-strip">
+                    <div className="agent-threads-strip-label">
+                      <History size={13} />
+                      <span>Chats</span>
+                    </div>
+                    <div className="agent-threads-list" role="tablist" aria-label="Recent chats">
+                      {agentThreads.map((thread) => {
+                        const isActive = thread.id === activeThread?.id;
+                        const turnCount = thread.turns.length;
+                        const canDelete = agentThreads.length > 1 || turnCount > 0;
+                        return (
+                          <div
+                            key={thread.id}
+                            role="tab"
+                            aria-selected={isActive}
+                            tabIndex={0}
+                            className={`agent-thread-chip ${isActive ? 'active' : ''} ${
+                              agentLoading && !isActive ? 'disabled' : ''
+                            }`}
+                            onClick={() => handleSwitchThread(thread)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' || e.key === ' ') {
+                                e.preventDefault();
+                                handleSwitchThread(thread);
+                              }
+                            }}
+                            title={`${thread.title}${
+                              thread.collection ? ` (${thread.collection})` : ''
+                            }`}
+                          >
+                            <MessageSquare size={12} className="agent-thread-chip-icon" />
+                            <span className="agent-thread-chip-title">
+                              {thread.title}
+                            </span>
+                            {(distinctThreadCollections.size > 1 ||
+                              (thread.collection &&
+                                thread.collection !== effectiveCollection)) &&
+                              thread.collection && (
+                                <span className="agent-thread-chip-col">
+                                  {thread.collection}
+                                </span>
+                              )}
+                            {turnCount > 0 && (
+                              <span className="agent-thread-chip-count">{turnCount}</span>
+                            )}
+                            {canDelete && (
+                              <button
+                                type="button"
+                                className="agent-thread-chip-close"
+                                onClick={(e) => handleDeleteThread(e, thread.id)}
+                                disabled={agentLoading}
+                                title={
+                                  agentThreads.length === 1
+                                    ? 'Clear chat'
+                                    : 'Remove chat'
+                                }
+                                aria-label="Remove chat"
+                              >
+                                <X size={11} />
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Conversation Timeline */}
+                <div className="agent-chat-feed">
+                  {activeTurns.length === 0 ? (
+                    <div className="agent-empty-thread">
+                      <div className="agent-empty-icon-wrap">
+                        <MessageSquare size={22} />
+                      </div>
+                      <h3 className="agent-empty-title">
+                        Ask Anything About Your Documents
+                      </h3>
+                      <p className="agent-empty-desc">
+                        Ask a question
+                        {effectiveCollection ? (
+                          <>
+                            {' '}
+                            about <strong>{effectiveCollection}</strong>
+                          </>
+                        ) : null}{' '}
+                        below, or choose an example to get started. Follow-up questions
+                        automatically keep context from earlier answers.
+                      </p>
+                      {effectiveCollection && (
+                        <div className="agent-starter-chips">
+                          {STARTER_PROMPTS.map((promptText, pIdx) => (
+                            <button
+                              key={pIdx}
+                              type="button"
+                              className="agent-starter-chip"
+                              onClick={() => {
+                                setAgentQuery(promptText);
+                                agentInputRef.current?.focus();
+                              }}
+                            >
+                              <Sparkles size={12} className="agent-starter-chip-icon" />
+                              <span>{promptText}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="agent-turns-timeline">
+                      {activeTurns.map((turn, idx) => (
+                        <ConversationTurnCard
+                          key={turn.id}
+                          turn={turn}
+                          turnIndex={idx}
+                          priorTurns={activeTurns.slice(0, idx)}
+                          onRetryTurn={handleRetryTurn}
+                          onStopTurn={
+                            turn.status === 'streaming' ? handleStopAgent : null
+                          }
+                          agentLoading={agentLoading}
+                        />
+                      ))}
+                      <div ref={conversationEndRef} />
+                    </div>
+                  )}
+                </div>
+
+                {/* Question Composer */}
+                <form className="agent-composer-form" onSubmit={handleAgentSubmit}>
+                  <div className="agent-composer-header">
+                    {activeTurns.length > 0 ? (
+                      <span className="composer-memory-cue follow-up">
+                        <CornerDownLeft size={13} />
+                        <span>
+                          Follow-up question
+                          {effectiveCollection ? (
+                            <>
+                              {' '}
+                              in <code>{effectiveCollection}</code>
+                            </>
+                          ) : null}
+                        </span>
+                      </span>
+                    ) : (
+                      <span className="composer-memory-cue">
+                        <span>Your question</span>
+                      </span>
+                    )}
+
+                    {activeTurns.length > 0 && !agentLoading && (
+                      <button
+                        type="button"
+                        className="composer-reset-link"
+                        onClick={handleNewThread}
+                      >
+                        <PlusCircle size={12} />
+                        <span>New chat</span>
                       </button>
                     )}
                   </div>
-                </div>
 
-                {agentLoading && !agentAnswer ? (
-                  <div style={{ padding: '1.5rem', textAlign: 'center', color: 'var(--text-muted)' }}>
-                    <RefreshCw className="spinner" size={24} style={{ marginBottom: '0.5rem', color: 'var(--primary)' }} />
-                    <p style={{ fontSize: '0.9rem' }}>
-                      {agentEndpointMode === 'standard'
-                        ? 'Awaiting grounded JSON response from /agent...'
-                        : 'Streaming message events from agent state graph...'}
-                    </p>
-                  </div>
-                ) : (
-                  <AgentMarkdownView
-                    markdown={agentAnswer}
-                    events={agentEvents}
-                    viewMode={agentViewMode}
-                    queryTerms={extractQueryTerms(submittedAgentQuery)}
+                  <textarea
+                    ref={agentInputRef}
+                    rows={activeTurns.length > 0 ? 2 : 3}
+                    className="form-textarea agent-composer-textarea"
+                    placeholder={
+                      activeTurns.length > 0
+                        ? 'Ask a follow-up question (e.g., Explain the second point in more detail, or compare those numbers in a table)…'
+                        : 'Ask a question about your documents (e.g., Summarize the main takeaways and cite the pages)…'
+                    }
+                    value={agentQuery}
+                    onChange={(e) => setAgentQuery(e.target.value)}
+                    onKeyDown={handleAgentKeyDown}
+                    disabled={apiStatus === 'offline'}
                   />
-                )}
 
-                {/* Pretty Print Event Stream Drawer / View */}
-                {showStreamEvents && (
-                  <PrettyPrintEventStream events={agentEvents} />
-                )}
+                  <div className="agent-composer-footer">
+                    <span className="composer-shortcut-hint">
+                      Press <kbd>Enter</kbd> to send · <kbd>Shift</kbd> +{' '}
+                      <kbd>Enter</kbd> for new line
+                    </span>
+
+                    {agentLoading ? (
+                      <button
+                        type="button"
+                        className="btn-stop-agent"
+                        onClick={handleStopAgent}
+                      >
+                        <Square size={14} />
+                        <span>Stop</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="submit"
+                        className="btn-send-agent"
+                        disabled={
+                          apiStatus === 'offline' ||
+                          !effectiveCollection ||
+                          !agentQuery.trim()
+                        }
+                      >
+                        <Send size={15} />
+                        <span>
+                          {activeTurns.length > 0 ? 'Send' : 'Ask'}
+                        </span>
+                      </button>
+                    )}
+                  </div>
+                </form>
               </div>
-            )}
-          </div>
-        )}
+            );
+          })()}
 
-        {/* Manage Collections Tab View */}
+        {/* My Collections Tab View */}
         {activeTab === 'manage' && (
           <div className="glass-card">
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
               <h2 className="card-title" style={{ margin: 0 }}>
                 <Database size={22} color="var(--primary)" />
-                Manage Collections
+                My Collections
               </h2>
               <button onClick={fetchCollections} className="refresh-btn" title="Refresh collections">
                 <RefreshCw size={16} className={apiStatus === 'checking' ? 'spinner' : ''} />
               </button>
             </div>
             <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '1.5rem' }}>
-              View stored vector store collections, check document chunk counts, or delete existing collections.
+              Browse your document collections, search passages, start a chat, or remove collections you no longer need.
             </p>
 
             {collectionDetails.length === 0 ? (
               <div style={{ padding: '3rem 1.5rem', textAlign: 'center', background: 'rgba(255,255,255,0.02)', borderRadius: 'var(--radius-md)', border: '1px dashed var(--border-color)' }}>
                 <Database size={40} color="var(--text-muted)" style={{ marginBottom: '1rem', opacity: 0.5 }} />
-                <p style={{ color: 'var(--text-muted)', fontSize: '0.95rem' }}>No vector store collections exist yet.</p>
+                <p style={{ color: 'var(--text-muted)', fontSize: '0.95rem' }}>You do not have any document collections yet.</p>
                 <button 
                   className="btn-primary" 
                   style={{ marginTop: '1rem', display: 'inline-flex', width: 'auto', padding: '0.6rem 1.2rem' }}
                   onClick={() => setActiveTab('ingest')}
                 >
                   <Upload size={16} />
-                  Ingest Documents to Create Collection
+                  Upload Documents
                 </button>
               </div>
             ) : (
@@ -2454,14 +3325,16 @@ export default function App() {
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
                           <div style={{ padding: '0.6rem', borderRadius: '8px', background: 'rgba(99, 102, 241, 0.15)', color: 'var(--primary)' }}>
-                            <Server size={20} />
+                            <Layers size={20} />
                           </div>
                           <div>
                             <h3 style={{ fontSize: '1rem', fontWeight: 600, color: '#fff', margin: 0 }}>
                               {col.name}
                             </h3>
                             <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', margin: '2px 0 0 0' }}>
-                              {col.count !== undefined ? `${col.count} document chunk(s) stored` : 'Chroma Collection'}
+                              {col.count !== undefined
+                                ? `${col.count} ${col.count === 1 ? 'passage' : 'passages'} indexed`
+                                : 'Document collection'}
                             </p>
                           </div>
                         </div>
@@ -2478,19 +3351,19 @@ export default function App() {
                               }}
                             >
                               <Search size={14} />
-                              Query
+                              Search
                             </button>
                             <button
                               type="button"
                               className="tab-btn"
                               style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem' }}
                               onClick={() => {
-                                setAgentCollection(col.name);
+                                selectAgentCollection(col.name);
                                 setActiveTab('agent');
                               }}
                             >
                               <Bot size={14} />
-                              Ask Agent
+                              Ask AI
                             </button>
                             <button
                               type="button"
@@ -2525,7 +3398,7 @@ export default function App() {
                         }}>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#fca5a5', fontSize: '0.85rem' }}>
                             <AlertTriangle size={18} style={{ flexShrink: 0 }} />
-                            <span>Are you sure you want to delete collection <strong>"{col.name}"</strong>?</span>
+                            <span>Are you sure you want to delete <strong>"{col.name}"</strong>?</span>
                           </div>
                           <div style={{ display: 'flex', gap: '0.5rem', flexShrink: 0 }}>
                             <button
@@ -2560,7 +3433,7 @@ export default function App() {
                               ) : (
                                 <Trash2 size={14} />
                               )}
-                              Confirm Delete
+                              Delete Collection
                             </button>
                           </div>
                         </div>
@@ -2573,54 +3446,70 @@ export default function App() {
           </div>
         )}
 
-        {/* Right Section - Existing Collections Sidebar */}
+        {/* Right Section - Collections Sidebar */}
         <div className="glass-card">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem' }}>
             <h3 style={{ fontSize: '1.1rem', fontWeight: 600, color: '#fff', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
               <Layers size={18} color="var(--accent-cyan)" />
-              Vector Collections
+              Collections
             </h3>
-            <button onClick={fetchCollections} className="refresh-btn" title="Refresh list">
+            <button onClick={fetchCollections} className="refresh-btn" title="Refresh collections">
               <RefreshCw size={14} className={apiStatus === 'checking' ? 'spinner' : ''} />
             </button>
           </div>
 
           {collections.length === 0 ? (
             <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', textAlign: 'center', padding: '2rem 0' }}>
-              No collections found in ChromaDB yet. Ingest your first PDF document to create one!
+              No collections yet. Upload your first PDF document to get started.
             </p>
           ) : (
             <div>
-              {collections.map((col) => (
-                <div 
-                  key={col} 
-                  className="collection-card-item"
-                  style={{
-                    borderColor: (queryCollection === col || selectedCollection === col || agentCollection === col) ? 'var(--primary)' : 'var(--border-color)',
-                    cursor: 'pointer'
-                  }}
-                  onClick={() => {
-                    setSelectedCollection(col);
-                    setQueryCollection(col);
-                    setAgentCollection(col);
-                  }}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-                    <Server size={16} color="var(--primary)" />
-                    <span style={{ fontWeight: 500, fontSize: '0.9rem' }}>{col}</span>
+              {collections.map((col) => {
+                const detail = collectionDetails.find((d) => d.name === col);
+                const isSelected =
+                  (activeTab === 'ingest' && selectedCollection === col) ||
+                  (activeTab === 'query' && queryCollection === col) ||
+                  (activeTab === 'agent' && (activeThread?.collection || agentCollection) === col);
+
+                return (
+                  <div 
+                    key={col} 
+                    className="collection-card-item"
+                    style={{
+                      borderColor: isSelected ? 'var(--primary)' : 'var(--border-color)',
+                      cursor: 'pointer'
+                    }}
+                    onClick={() => {
+                      setSelectedCollection(col);
+                      setQueryCollection(col);
+                      if (!agentLoading) {
+                        selectAgentCollection(col);
+                      }
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                      <FileText size={16} color={isSelected ? 'var(--primary)' : 'var(--text-muted)'} />
+                      <span style={{ fontWeight: 500, fontSize: '0.9rem' }}>{col}</span>
+                    </div>
+                    <span className="collection-badge">
+                      {detail?.count !== undefined
+                        ? `${detail.count} ${detail.count === 1 ? 'passage' : 'passages'}`
+                        : isSelected
+                        ? 'Selected'
+                        : 'Ready'}
+                    </span>
                   </div>
-                  <span className="collection-badge">Active</span>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
 
           <div style={{ marginTop: '2rem', padding: '1rem', background: 'rgba(255,255,255,0.03)', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)' }}>
             <h4 style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
-              💡 Quick Info
+              💡 Tip
             </h4>
             <p style={{ fontSize: '0.8rem', color: 'var(--text-dim)', lineHeight: 1.4 }}>
-              Use the <strong>Agentic RAG Assistant</strong> tab to ask questions to any collection and view real-time streamed graph events with <code>pretty_print_event</code> formatting!
+              Select any collection to search specific passages or open <strong>AI Assistant</strong> to ask questions, follow up naturally, and click any page reference to preview the source text.
             </p>
           </div>
         </div>

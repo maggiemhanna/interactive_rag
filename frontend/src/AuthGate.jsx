@@ -118,16 +118,16 @@ export default function AuthGate({ onLocalDevLogin }) {
             <Database size={28} />
           </div>
           <div>
-            <h1 className="brand-title">Interactive RAG Portal</h1>
+            <h1 className="brand-title">Interactive RAG</h1>
             <p className="brand-subtitle">
-              Sign in to manage &amp; query your private Chroma vector stores
+              Sign in to upload, search, and chat with your PDF documents
             </p>
           </div>
         </div>
 
         <div className="auth-isolation-badge">
           <ShieldCheck size={16} color="var(--accent-emerald)" />
-          <span>Per-user isolated vector persistence on Google Cloud Storage</span>
+          <span>Private workspace — your documents are visible only to you</span>
         </div>
 
         {error && (
