@@ -65,15 +65,14 @@ def test_standard_endpoint(url: str):
                 print_event(msg_obj)
 
 
-def test_streaming_endpoint(url: str):
-    logger.info("--- Testing Streaming Endpoint (SSE) ---")
+def test_streaming_endpoint(stream_url: str):
+    logger.info("--- Testing Streaming Endpoint (/agent/stream SSE) ---")
     payload = {
         "query": "What is ARM Holdings?",
         "collection_name": "stock_market_vs",
-        "stream": True,
     }
-    logger.info(f"Sending streaming request to '{url}': {payload}")
-    response = requests.post(url, json=payload, stream=True)
+    logger.info(f"Sending streaming request to '{stream_url}': {payload}")
+    response = requests.post(stream_url, json=payload, stream=True)
     response.raise_for_status()
 
     logger.info("Receiving and pretty printing stream events:")
@@ -96,12 +95,12 @@ def test_streaming_endpoint(url: str):
 
 if __name__ == "__main__":
     port = os.getenv("PORT", "8001")
-    url = f"http://localhost:{port}/agent"
+    base_url = f"http://localhost:{port}"
 
     try:
-        test_standard_endpoint(url)
+        test_standard_endpoint(f"{base_url}/agent")
         print("\n" + "=" * 80 + "\n")
-        test_streaming_endpoint(url)
+        test_streaming_endpoint(f"{base_url}/agent/stream")
     except Exception as e:
         logger.error(f"Error testing agent endpoint: {e}")
         if hasattr(e, "response") and e.response is not None:

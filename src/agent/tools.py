@@ -8,7 +8,11 @@ from pydantic import BaseModel, Field
 
 from src.core.chroma import get_vectorstore, require_collection
 from src.core.config import DEFAULT_COLLECTION, DEFAULT_EMBEDDING_MODEL
-from src.core.security import validate_collection_name, validate_embedding_model
+from src.core.security import (
+    sanitize_retrieved_documents,
+    validate_collection_name,
+    validate_embedding_model,
+)
 
 EMPTY_RETRIEVAL_MARKER = (
     '<retrieved_context status="empty">'
@@ -121,7 +125,8 @@ def get_retriever_tool(
 
     def _retrieve(query: str) -> str:
         docs = retriever.invoke(query)
-        return format_retrieved_chunks(docs)
+        safe_docs = sanitize_retrieved_documents(docs)
+        return format_retrieved_chunks(safe_docs)
 
     return StructuredTool.from_function(
         func=_retrieve,

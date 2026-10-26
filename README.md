@@ -50,6 +50,7 @@ flowchart TB
     SubIngest -->|"Private Google Access"| Vertex
     SubAgent -->|"Private Google Access"| GCS
     SubAgent -->|"Private Google Access"| Vertex
+    SubIngest --> SubPSC
     SubAgent --> SubPSC
     SubPSC -->|"Regional PSC"| Armor
     Armor <-->|"Inspect & Mask"| DLP
@@ -106,11 +107,11 @@ Every query and retrieved document passage flows through a hardened LangGraph pi
    - Pydantic request schemas and multipart upload parsers across `/ingest`, `/query`, and `/agent` apply safe defaults when omitted and reject unapproved models immediately with HTTP `422`.
 3. **AI & Ingestion Guardrails (Grounding, Citations, Upload & Loop Ceilings)**
    - **Strict Grounding & Mandatory `[source, p.X]` Citations:** The retriever converts PyPDF's 0-indexed page metadata into 1-indexed `page` attributes, and the system prompt requires every factual statement to rely exclusively on retrieved chunks with inline `[filename.pdf, p.X]` citations—or explicitly abstain when evidence is missing.
-   - **Input, Upload & Loop Ceilings:** Enforces `MAX_QUERY_CHARS` (`4000`), `%PDF-` magic-byte signature checks (rejecting disguised non-PDF files with `400`), `MAX_UPLOAD_MB` (`20` MB per PDF, returning `413`), `MAX_FILES_PER_REQUEST` (`10`), `MAX_CHUNKS_PER_INGEST` (`1000`), and a LangGraph `recursion_limit` (`AGENT_RECURSION_LIMIT=6` in `src/agent/stream.py`) that cleanly halts runaway tool-calling loops.
-4. **Output Filtering & Sanitized Errors (Cloud DLP + Model Armor Across JSON & SSE)**
-   - **Managed PII & Secret Masking (`output_guard`):** Provisioned in `infra/ai_security.tf`, a **Cloud DLP Inspect + De-identify Template** integrated into Model Armor (`sanitizeModelResponse`) automatically masks `EMAIL_ADDRESS`, `PHONE_NUMBER`, `CREDIT_CARD_NUMBER`, `US_SOCIAL_SECURITY_NUMBER`, `IBAN_CODE`, `GCP_API_KEY`, and `AUTH_TOKEN` matches with `[INFO_TYPE]` placeholders.
-   - **Unified REST & Live SSE Redaction:** `model_call` holds candidate final answers in `pending_response` so `output_guard` sanitizes the message *before* committing it to `messages` or yielding SSE frames in `stream_sse`—ensuring unredacted PII never leaks in either `stream=false` JSON or `stream=true` SSE mode.
-   - **Sanitized `500` Responses:** Unexpected exceptions across FastAPI endpoints and SSE generators log full tracebacks privately on the server while returning a safe `"An internal server error occurred. Please try again later."` message to clients.
+   - **Input, Upload & Loop Ceilings:** Enforces `MAX_QUERY_CHARS` (`4000`), bounded `k` (`1`–`50` on `/query`), `%PDF-` magic-byte signature checks (rejecting disguised non-PDF files with `400`), `MAX_UPLOAD_MB` (`20` MB per PDF, returning `413`), `MAX_FILES_PER_REQUEST` (`10`), `MAX_CHUNKS_PER_INGEST` (`1000`), and a LangGraph `recursion_limit` (`AGENT_RECURSION_LIMIT=6` in `src/agent/stream.py`) that cleanly halts runaway tool-calling loops.
+4. **Output Filtering & Sanitized Errors (Cloud DLP + Model Armor Across `/query`, Tool Traces & SSE)**
+   - **Managed PII & Secret Masking (`sanitize_retrieved_documents` + `output_guard`):** Provisioned in `infra/ai_security.tf`, a **Cloud DLP Inspect + De-identify Template** integrated into Model Armor (`sanitizeModelResponse`) automatically masks `EMAIL_ADDRESS`, `PHONE_NUMBER`, `CREDIT_CARD_NUMBER`, `US_SOCIAL_SECURITY_NUMBER`, `IBAN_CODE`, `GCP_API_KEY`, and `AUTH_TOKEN` matches with `[INFO_TYPE]` placeholders across both `ingestion-api` and `agent-api`.
+   - **End-to-End Chunk, REST & Live SSE Redaction:** Retrieved document chunks are concurrently sanitized via `sanitize_retrieved_documents()` before `/query` returns passages or `get_retriever_tool()` emits `<retrieved_chunk>` blocks into SSE tool traces, logs, and checkpoints, while `model_call` + `output_guard` sanitize final AI answers via `pending_response` before committing to `messages` or yielding SSE frames.
+   - **Sanitized `500` Responses:** Unexpected exceptions (including fail-closed Model Armor errors) across FastAPI endpoints and SSE generators log full tracebacks privately on the server while returning a safe `"An internal server error occurred. Please try again later."` message to clients.
 5. **Content Safety (Pinned Harm Thresholds & Polite Refusal Fallbacks)**
    - Configures `ChatGoogleGenerativeAI` explicitly across `HATE_SPEECH`, `HARASSMENT`, `SEXUALLY_EXPLICIT`, and `DANGEROUS_CONTENT` using `GEMINI_SAFETY_THRESHOLD` (default `BLOCK_LOW_AND_ABOVE`), alongside Model Armor's RAI filters.
    - Checks `is_safety_blocked(response)` on model outputs (`finish_reason` in `SAFETY`, `PROHIBITED_CONTENT`, `SPII`, `BLOCKLIST`) and substitutes a clear, polite refusal fallback instead of returning a blank answer.
@@ -311,14 +312,13 @@ curl -X POST "http://localhost:8000/query" \
     "k": 3
   }'
 
-# 3. Grounded Agentic RAG query (returns inline [source, p.X] citations; set "stream": true for SSE)
-curl -X POST "http://localhost:8001/agent" \
+# 3. Grounded Agentic RAG SSE stream (default UI path; use POST /agent for non-streaming JSON)
+curl -N -X POST "http://localhost:8001/agent/stream" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "What was ARM Holdings financial performance in 2024?",
     "collection_name": "stock_market_vs",
-    "model_name": "gemini-3.8-flash",
-    "stream": false
+    "model_name": "gemini-3.8-flash"
   }'
 ```
 

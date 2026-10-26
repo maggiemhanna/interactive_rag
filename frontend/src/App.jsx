@@ -591,29 +591,15 @@ export default function App() {
     setAgentLoading(true);
 
     try {
-      let agentUrl = `${AGENT_API_BASE}/agent`;
-      let response;
-      const requestBody = JSON.stringify({
-        query: agentQuery.trim(),
-        collection_name: targetCollection,
-        thread_id: threadIdRef.current,
-        stream: true,
+      const response = await authFetch(`${AGENT_API_BASE}/agent/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: agentQuery.trim(),
+          collection_name: targetCollection,
+          thread_id: threadIdRef.current,
+        }),
       });
-
-      try {
-        response = await authFetch(agentUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: requestBody,
-        });
-      } catch (err) {
-        agentUrl = `${API_BASE}/agent`;
-        response = await authFetch(agentUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: requestBody,
-        });
-      }
 
       if (!response.ok) {
         const errJson = await response.json().catch(() => ({}));
@@ -625,36 +611,51 @@ export default function App() {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
+        let streamDone = false;
         const accumulatedEvents = [];
 
-        while (true) {
+        const processLine = (rawLine) => {
+          const trimmed = rawLine.trim();
+          if (!trimmed.startsWith('data: ')) return false;
+
+          const dataStr = trimmed.slice(6).trim();
+          if (dataStr === '[DONE]') return true;
+
+          try {
+            const parsed = JSON.parse(dataStr);
+            if (parsed.message) {
+              accumulatedEvents.push(parsed.message);
+              setAgentEvents([...accumulatedEvents]);
+
+              const msgType = (parsed.message.type || '').toLowerCase();
+              if ((msgType === 'ai' || msgType === 'assistant') && parsed.message.content) {
+                setAgentAnswer(parsed.message.content);
+              }
+            }
+          } catch (e) {
+            console.warn('Error parsing SSE json:', e);
+          }
+          return false;
+        };
+
+        while (!streamDone) {
           const { done, value } = await reader.read();
-          if (done) break;
+          if (done) {
+            buffer += decoder.decode();
+            if (buffer.trim()) {
+              processLine(buffer);
+            }
+            break;
+          }
 
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
 
           for (const line of lines) {
-            const trimmed = line.trim();
-            if (trimmed.startsWith('data: ')) {
-              const dataStr = trimmed.slice(6).trim();
-              if (dataStr === '[DONE]') break;
-
-              try {
-                const parsed = JSON.parse(dataStr);
-                if (parsed.message) {
-                  accumulatedEvents.push(parsed.message);
-                  setAgentEvents([...accumulatedEvents]);
-
-                  const msgType = (parsed.message.type || '').toLowerCase();
-                  if ((msgType === 'ai' || msgType === 'assistant') && parsed.message.content) {
-                    setAgentAnswer(parsed.message.content);
-                  }
-                }
-              } catch (e) {
-                console.warn('Error parsing SSE json:', e);
-              }
+            if (processLine(line)) {
+              streamDone = true;
+              break;
             }
           }
         }

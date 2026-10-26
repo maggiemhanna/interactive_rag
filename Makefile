@@ -56,7 +56,7 @@ help: ## Show available reproducible build & deployment commands
 	@echo "InteractiveRAG — GCP Cloud Run & Terraform Automation"
 	@echo ""
 	@echo "Resolved configuration:"
-	@echo "  PROJECT_ID      = $(PROJECT_ID) (number: $(PROJECT_NUMBER))"
+	@echo "  PROJECT_ID      = $(PROJECT_ID) (number: $(if $(PROJECT_NUMBER),$(PROJECT_NUMBER),UNRESOLVED - run 'gcloud auth login'))"
 	@echo "  REGION          = $(REGION)"
 	@echo "  APP_NAME        = $(APP_NAME)"
 	@echo "  ENV             = $(ENV)"
@@ -70,6 +70,13 @@ help: ## Show available reproducible build & deployment commands
 check-project:
 	@if [ -z "$(PROJECT_ID)" ] || [ "$(PROJECT_ID)" = "your-gcp-project-id" ]; then \
 		echo "Error: PROJECT_ID is not set. Populate infra/terraform.tfvars or pass PROJECT_ID=<gcp-project-id>."; \
+		exit 1; \
+	fi
+	@if [ -z "$(PROJECT_NUMBER)" ]; then \
+		echo "Error: Could not resolve PROJECT_NUMBER for '$(PROJECT_ID)' via gcloud CLI."; \
+		echo "       Your gcloud CLI session may have expired (note: 'gcloud' CLI uses 'gcloud auth login', not ADC)."; \
+		echo "       Run 'gcloud auth login' (or complete any reauth prompt below) and re-run make."; \
+		gcloud projects describe "$(PROJECT_ID)" --format="value(projectNumber)" >/dev/null || true; \
 		exit 1; \
 	fi
 

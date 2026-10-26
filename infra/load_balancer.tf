@@ -126,6 +126,7 @@ resource "google_compute_backend_service" "ingestion_backend" {
   project               = var.project_id
   load_balancing_scheme = "EXTERNAL_MANAGED"
   enable_cdn            = false
+  timeout_sec           = 300
   description           = "Backend service routing /api/ingest/* traffic to ingestion-api Cloud Run."
 
   backend {
@@ -138,7 +139,8 @@ resource "google_compute_backend_service" "agent_backend" {
   project               = var.project_id
   load_balancing_scheme = "EXTERNAL_MANAGED"
   enable_cdn            = false
-  description           = "Backend service routing /api/agent/* SSE & REST traffic to agent-api Cloud Run."
+  timeout_sec           = 300
+  description           = "Backend service routing /api/agent/* SSE (/agent/stream) & REST traffic to agent-api Cloud Run."
 
   backend {
     group = google_compute_region_network_endpoint_group.agent_neg.id
@@ -153,7 +155,7 @@ resource "google_compute_backend_service" "agent_backend" {
 # - `/api/ingest/*` -> strips `/api/ingest` (`path_prefix_rewrite = "/"`) and forwards
 #   to `ingestion-api` (e.g., `/api/ingest/collections` arrives at FastAPI as `/collections`).
 # - `/api/agent/*`  -> strips `/api/agent` (`path_prefix_rewrite = "/"`) and forwards
-#   to `agent-api` (e.g., `/api/agent/agent` arrives at FastAPI as `/agent`).
+#   to `agent-api` (e.g., `/api/agent/agent/stream` arrives at FastAPI as `/agent/stream`).
 # - `/*` (default)  -> forwards directly to `frontend` (React SPA).
 resource "google_compute_url_map" "https_router" {
   name            = "${var.app_name}-https-urlmap-${var.environment}"

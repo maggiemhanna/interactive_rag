@@ -7,6 +7,7 @@ from langchain_core.documents import Document
 from src.core.chroma import get_vectorstore, require_collection
 from src.core.config import DEFAULT_COLLECTION, DEFAULT_EMBEDDING_MODEL
 from src.core.logger import setup_logging
+from src.core.security import sanitize_retrieved_documents
 from src.core.storage import user_read_lock, user_write_lock
 
 logger = setup_logging(name="ingestion.service")
@@ -82,7 +83,7 @@ def search_collection(
     k: int = 5,
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
 ) -> List[Dict[str, Any]]:
-    """Performs similarity search against a user's Chroma vectorstore collection."""
+    """Performs similarity search against a user's Chroma vectorstore collection and masks PII/secrets."""
     with user_read_lock(uid) as persist_directory:
         require_collection(persist_directory, collection_name)
         vectorstore = get_vectorstore(
@@ -95,16 +96,17 @@ def search_collection(
         )
         docs = retriever.invoke(query)
 
-        results = [
-            {
-                "page_content": doc.page_content,
-                "metadata": doc.metadata,
-            }
-            for doc in docs
-        ]
+    safe_docs = sanitize_retrieved_documents(docs)
+    results = [
+        {
+            "page_content": doc.page_content,
+            "metadata": doc.metadata,
+        }
+        for doc in safe_docs
+    ]
 
-        logger.info(
-            f"Query '{query}' by uid='{uid}' against collection '{collection_name}' "
-            f"returned {len(results)} results."
-        )
-        return results
+    logger.info(
+        f"Query '{query}' by uid='{uid}' against collection '{collection_name}' "
+        f"returned {len(results)} results."
+    )
+    return results

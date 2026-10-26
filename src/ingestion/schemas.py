@@ -40,7 +40,12 @@ class QueryRequest(BaseModel):
         default=DEFAULT_COLLECTION,
         description="Name of the Chroma vectorstore collection",
     )
-    k: int = Field(default=5, description="Number of results to retrieve")
+    k: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description="Number of results to retrieve (1-50)",
+    )
     embedding_model: str = Field(
         default=DEFAULT_EMBEDDING_MODEL,
         description="Name of the approved Vertex AI embedding model",

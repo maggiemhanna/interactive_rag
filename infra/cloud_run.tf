@@ -88,6 +88,14 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
         value = "FALSE"
       }
       env {
+        name  = "MODEL_ARMOR_TEMPLATE_ID"
+        value = google_model_armor_template.rag_guard.id
+      }
+      env {
+        name  = "MODEL_ARMOR_LOCATION"
+        value = var.region
+      }
+      env {
         name  = "ALLOWED_EMBEDDING_MODELS"
         value = var.allowed_embedding_models
       }
@@ -113,10 +121,15 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
   depends_on = [
     google_project_service.required_apis["run.googleapis.com"],
     google_project_iam_member.backend_vertex_ai_user,
+    google_project_iam_member.backend_model_armor_user,
+    google_project_iam_member.backend_dlp_user,
     google_storage_bucket_iam_member.backend_chroma_bucket_object_user,
+    google_model_armor_template.rag_guard,
     google_compute_route.private_googleapis,
     google_dns_record_set.private_googleapis_a,
     google_dns_record_set.googleapis_wildcard_cname,
+    google_network_connectivity_regional_endpoint.modelarmor_psc,
+    google_dns_record_set.modelarmor_rep_a,
   ]
 }
 

@@ -94,9 +94,8 @@ def agent_stream(
     request: AgentRequest,
     uid: str = Depends(get_current_user),
 ):
-    """Dedicated streaming endpoint using Server-Sent Events (SSE)."""
-    request.stream = True
-    return agent(request=request, uid=uid)
+    """Dedicated streaming endpoint using Server-Sent Events (SSE) by default."""
+    return agent(request=request.model_copy(update={"stream": True}), uid=uid)
 
 
 def main() -> None:

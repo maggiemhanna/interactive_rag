@@ -1,10 +1,12 @@
+from concurrent.futures import ThreadPoolExecutor
 import os
 import re
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from google.cloud import modelarmor_v1
+from langchain_core.documents import Document
 from langchain_google_genai import HarmBlockThreshold, HarmCategory
 
 from src.core.auth import is_cloud_run
@@ -30,6 +32,7 @@ PROMPT_BLOCKED_MESSAGE = (
 SAFETY_REFUSAL_MESSAGE = (
     "I cannot fulfill this request due to content safety policies."
 )
+CHUNK_REDACTED_MESSAGE = "[Chunk content withheld by AI security policy.]"
 RECURSION_LIMIT_MESSAGE = (
     "I reached the maximum number of document search steps without finding a complete answer. "
     "Please narrow or rephrase your question."
@@ -388,3 +391,51 @@ def sanitize_model_output(
             text=INTERNAL_ERROR_MESSAGE,
             blocked_reason="model_armor_error",
         )
+
+
+def sanitize_chunk_text(chunk_text: str) -> str:
+    """Masks PII/secrets in a retrieved document chunk via Model Armor + Cloud DLP, failing closed on service errors."""
+    if not chunk_text or not chunk_text.strip():
+        return chunk_text
+
+    decision = sanitize_model_output(chunk_text)
+    if not decision.allowed:
+        if decision.blocked_reason in {"model_armor_error", "missing_model_armor_config"}:
+            raise RuntimeError(
+                f"Model Armor chunk sanitization failed ({decision.blocked_reason})."
+            )
+        logger.warning(
+            f"Withholding retrieved document chunk flagged by Model Armor (reason={decision.blocked_reason})."
+        )
+        return CHUNK_REDACTED_MESSAGE
+
+    return decision.text
+
+
+def sanitize_retrieved_documents(docs: Sequence[Document]) -> List[Document]:
+    """Sanitizes a sequence of retrieved Document chunks concurrently while preserving chunk order and metadata."""
+    if not docs:
+        return []
+
+    target = _resolve_model_armor_target()
+    if target is None and not _is_model_armor_fail_closed():
+        if is_cloud_run():
+            logger.warning(
+                "MODEL_ARMOR_TEMPLATE_ID is unset in Cloud Run; skipping Model Armor chunk sanitization."
+            )
+        return list(docs)
+
+    if len(docs) == 1 or target is None:
+        sanitized_texts = [sanitize_chunk_text(doc.page_content or "") for doc in docs]
+    else:
+        max_workers = min(len(docs), 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            sanitized_texts = list(
+                executor.map(sanitize_chunk_text, [doc.page_content or "" for doc in docs])
+            )
+
+    return [
+        Document(page_content=text, metadata=dict(doc.metadata or {}))
+        for doc, text in zip(docs, sanitized_texts)
+    ]
+
