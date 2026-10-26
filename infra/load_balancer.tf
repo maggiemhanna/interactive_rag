@@ -109,6 +109,8 @@ resource "google_compute_region_network_endpoint_group" "agent_neg" {
 # (also the attachment point if Cloud Armor WAF policies are added later).
 # `enable_cdn = false` ensures authenticated API responses, `/env-config.js`, and live
 # Server-Sent Events (SSE) streams are never cached at Google's edge.
+# Note: `timeout_sec` must NOT be set on Serverless NEG backend services (GCP rejects it
+# with HTTP 400); request/SSE timeouts are governed by Cloud Run's `timeout = "300s"`.
 resource "google_compute_backend_service" "frontend_backend" {
   name                  = "${var.app_name}-fe-backend-${var.environment}"
   project               = var.project_id
@@ -126,7 +128,6 @@ resource "google_compute_backend_service" "ingestion_backend" {
   project               = var.project_id
   load_balancing_scheme = "EXTERNAL_MANAGED"
   enable_cdn            = false
-  timeout_sec           = 300
   description           = "Backend service routing /api/ingest/* traffic to ingestion-api Cloud Run."
 
   backend {
@@ -139,7 +140,6 @@ resource "google_compute_backend_service" "agent_backend" {
   project               = var.project_id
   load_balancing_scheme = "EXTERNAL_MANAGED"
   enable_cdn            = false
-  timeout_sec           = 300
   description           = "Backend service routing /api/agent/* SSE (/agent/stream) & REST traffic to agent-api Cloud Run."
 
   backend {

@@ -136,6 +136,8 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
             "GCS_BUCKET_NAME": self.fake_bucket.name,
             "LOCAL_CHROMA_ROOT": chroma_root,
             "UPLOAD_TMP_ROOT": self.uploads_tmp,
+            "MODEL_ARMOR_TEMPLATE_ID": "",
+            "MODEL_ARMOR_FAIL_CLOSED": "false",
         }
         env.update(extra)
         return env
