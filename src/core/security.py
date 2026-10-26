@@ -32,7 +32,6 @@ PROMPT_BLOCKED_MESSAGE = (
 SAFETY_REFUSAL_MESSAGE = (
     "I cannot fulfill this request due to content safety policies."
 )
-CHUNK_REDACTED_MESSAGE = "[Chunk content withheld by AI security policy.]"
 RECURSION_LIMIT_MESSAGE = (
     "I reached the maximum number of document search steps without finding a complete answer. "
     "Please narrow or rephrase your question."
@@ -196,6 +195,8 @@ def _get_model_armor_client(location: str) -> modelarmor_v1.ModelArmorClient:
 
 def _has_proto_field(msg: Any, field_name: str) -> bool:
     """Safely checks whether a proto-plus message or mock object populates `field_name`."""
+    if "_pb" in getattr(msg, "__dict__", {}):
+        return field_name in msg
     try:
         if field_name in msg:
             return True
@@ -393,23 +394,78 @@ def sanitize_model_output(
         )
 
 
+def _extract_sdp_deidentified_text(
+    sanitization_result: Any,
+    original_text: str,
+) -> str:
+    """Extracts Cloud DLP `[INFO_TYPE]`-masked text from `sdp_filter_result` while preserving surrounding chunk text."""
+    match_found = modelarmor_v1.FilterMatchState.MATCH_FOUND
+    exec_skipped = modelarmor_v1.FilterExecutionState.EXECUTION_SKIPPED
+    filter_results = getattr(sanitization_result, "filter_results", None) or {}
+
+    for filter_result in filter_results.values():
+        if not _has_proto_field(filter_result, "sdp_filter_result"):
+            continue
+
+        sdp_res = filter_result.sdp_filter_result
+        if _has_proto_field(sdp_res, "deidentify_result"):
+            deid = sdp_res.deidentify_result
+            if getattr(deid, "execution_state", None) == exec_skipped:
+                raise RuntimeError("Model Armor SDP de-identification execution was skipped.")
+            if getattr(deid, "match_state", None) == match_found:
+                candidate = getattr(getattr(deid, "data", None), "text", None)
+                if candidate is None:
+                    raise RuntimeError(
+                        "Model Armor SDP matched sensitive data without returning de-identified text."
+                    )
+                return candidate
+            return original_text
+
+        if _has_proto_field(sdp_res, "inspect_result"):
+            insp = sdp_res.inspect_result
+            if getattr(insp, "execution_state", None) == exec_skipped:
+                raise RuntimeError("Model Armor SDP inspection execution was skipped.")
+            if getattr(insp, "match_state", None) == match_found:
+                raise RuntimeError(
+                    "Model Armor SDP matched sensitive data without a de-identify template configured."
+                )
+            return original_text
+
+    return original_text
+
+
 def sanitize_chunk_text(chunk_text: str) -> str:
-    """Masks PII/secrets in a retrieved document chunk via Model Armor + Cloud DLP, failing closed on service errors."""
+    """Masks sensitive spans in a retrieved chunk with `[INFO_TYPE]` placeholders via Model Armor SDP + Cloud DLP."""
     if not chunk_text or not chunk_text.strip():
         return chunk_text
 
-    decision = sanitize_model_output(chunk_text)
-    if not decision.allowed:
-        if decision.blocked_reason in {"model_armor_error", "missing_model_armor_config"}:
-            raise RuntimeError(
-                f"Model Armor chunk sanitization failed ({decision.blocked_reason})."
-            )
-        logger.warning(
-            f"Withholding retrieved document chunk flagged by Model Armor (reason={decision.blocked_reason})."
-        )
-        return CHUNK_REDACTED_MESSAGE
+    target = _resolve_model_armor_target()
+    if target is None:
+        if _is_model_armor_fail_closed():
+            logger.error("MODEL_ARMOR_TEMPLATE_ID is unset with MODEL_ARMOR_FAIL_CLOSED=true; failing closed.")
+            raise RuntimeError("Model Armor chunk sanitization failed (missing_model_armor_config).")
+        if is_cloud_run():
+            logger.warning("MODEL_ARMOR_TEMPLATE_ID is unset in Cloud Run; skipping Model Armor chunk sanitization.")
+        return chunk_text
 
-    return decision.text
+    template_name, location = target
+    try:
+        client = _get_model_armor_client(location)
+        request = modelarmor_v1.SanitizeModelResponseRequest(
+            name=template_name,
+            model_response_data=modelarmor_v1.DataItem(text=chunk_text),
+        )
+        response = client.sanitize_model_response(request=request)
+        redacted_text = _extract_sdp_deidentified_text(
+            sanitization_result=response.sanitization_result,
+            original_text=chunk_text,
+        )
+        if redacted_text != chunk_text:
+            logger.info("Model Armor + Cloud DLP masked sensitive infoTypes in retrieved document chunk.")
+        return redacted_text
+    except Exception as e:
+        logger.error(f"Model Armor chunk sanitization failed: {e}")
+        raise RuntimeError("Model Armor chunk sanitization failed (model_armor_error).") from e
 
 
 def sanitize_retrieved_documents(docs: Sequence[Document]) -> List[Document]:
