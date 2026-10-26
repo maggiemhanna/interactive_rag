@@ -14,7 +14,6 @@ import {
   Server,
   Search,
   Sparkles,
-  FileCode2,
   ChevronDown,
   ChevronUp,
   Bot,
@@ -25,7 +24,11 @@ import {
   Trash2,
   AlertTriangle,
   LogOut,
-  User
+  User,
+  AlignLeft,
+  Highlighter,
+  BookOpen,
+  Zap
 } from 'lucide-react';
 import {
   API_BASE,
@@ -34,6 +37,946 @@ import {
   logoutUser,
 } from './firebase';
 import AuthGate from './AuthGate';
+
+const QUERY_STOPWORDS = new Set([
+  'the', 'and', 'for', 'that', 'with', 'this', 'from', 'what', 'how', 'why',
+  'who', 'when', 'where', 'which', 'are', 'was', 'were', 'been', 'being',
+  'have', 'has', 'had', 'does', 'did', 'can', 'could', 'will', 'would',
+  'should', 'may', 'might', 'into', 'about', 'their', 'there', 'these',
+  'those', 'than', 'then', 'them', 'they', 'your', 'our', 'its', 'his',
+  'her', 'not', 'but', 'all', 'any', 'some', 'such', 'more', 'most', 'other',
+  'over', 'under', 'between', 'through', 'during', 'before', 'after',
+  'les', 'des', 'dans', 'pour', 'avec', 'une', 'sur', 'par', 'plus', 'est', 'sont'
+]);
+
+const CHUNK_BULLET_RE = /^([•●▪◦‣⁃]|\u2022|[-–—*])\s+(.*)$/;
+const CHUNK_NUMBERED_RE = /^(\d+(?:\.\d+)*[.)]|\([a-zA-Z0-9]+\))\s+([A-Z0-9"“‘(\[].*)$/;
+const CHUNK_ABBREV_RE = /\b(?:e\.g|i\.e|et\s+al|vs|cf|viz|Dr|Mr|Mrs|Ms|Prof|Fig|No|Vol|pp?|Inc|Ltd|Co|Jr|Sr|St)\.\s*$/i;
+const CHUNK_SENTENCE_END_RE = /[.!?]["'”’)\]]*\s*$/;
+const CHUNK_HEADING_PREFIX_RE = /^(?:Standard|Annex|Chapter|Section|Table|Figure|Box|Part|Module|Appendix)\s+[A-Z0-9]+/i;
+const CHUNK_DANGLING_WORD_RE = /\b(?:and|or|of|to|in|for|with|on|by|at|from|as|the|a|an|that|which|who|whose|their|its|our|your|his|her|this|these|those|are|is|was|were|be|been|have|has|had|can|may|will|would|should|could|into|over|under|between|through|during|before|after)$/i;
+
+function parseChunkBlocks(rawText) {
+  if (!rawText) return [];
+  const normalized = rawText.replace(/\r\n/g, '\n').trim();
+  if (!normalized) return [];
+
+  const rawLines = normalized.split('\n');
+  const nonEmptyLengths = rawLines
+    .map((l) => l.trim().length)
+    .filter((len) => len > 20)
+    .sort((a, b) => a - b);
+  const typicalWidth =
+    nonEmptyLengths.length > 0
+      ? nonEmptyLengths[Math.floor(nonEmptyLengths.length * 0.8)]
+      : 80;
+
+  const blocks = [];
+  let current = null;
+
+  const flush = () => {
+    if (current && current.text.trim()) {
+      blocks.push({
+        type: current.type,
+        marker: current.marker || null,
+        text: current.text.replace(/\s{2,}/g, ' ').trim(),
+      });
+    }
+    current = null;
+  };
+
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i].trim();
+    if (!line) {
+      flush();
+      continue;
+    }
+
+    const bulletMatch = line.match(CHUNK_BULLET_RE);
+    if (bulletMatch) {
+      flush();
+      current = { type: 'bullet', marker: bulletMatch[1], text: bulletMatch[2] };
+    } else {
+      const numMatch = line.match(CHUNK_NUMBERED_RE);
+      if (numMatch) {
+        flush();
+        current = { type: 'bullet', marker: numMatch[1], text: numMatch[2] };
+      } else if (!current) {
+        const nextLine = (rawLines[i + 1] || '').trim();
+        const isExplicitHeading =
+          CHUNK_HEADING_PREFIX_RE.test(line) &&
+          line.length < typicalWidth * 0.85 &&
+          !CHUNK_SENTENCE_END_RE.test(line);
+        const isShortHeading =
+          (i > 0 || CHUNK_BULLET_RE.test(nextLine)) &&
+          Boolean(nextLine) &&
+          !CHUNK_SENTENCE_END_RE.test(line) &&
+          !/[,;:\-–—]$/.test(line) &&
+          !CHUNK_DANGLING_WORD_RE.test(line) &&
+          /^[A-Z0-9]/.test(line) &&
+          /^[A-Z0-9•●▪◦\-]/.test(nextLine) &&
+          line.length < typicalWidth * 0.68;
+
+        if (isExplicitHeading || isShortHeading) {
+          blocks.push({ type: 'heading', marker: null, text: line });
+          continue;
+        }
+
+        current = { type: 'paragraph', marker: null, text: line };
+      } else if (/[a-zA-Z0-9]-$/.test(current.text) && /^[a-z0-9]/.test(line)) {
+        current.text = current.text + line;
+      } else {
+        current.text = `${current.text} ${line}`;
+      }
+    }
+
+    const nextNonEmpty = (rawLines[i + 1] || '').trim();
+    if (!current || !nextNonEmpty) continue;
+
+    if (
+      current.type === 'paragraph' &&
+      CHUNK_SENTENCE_END_RE.test(line) &&
+      !CHUNK_ABBREV_RE.test(line) &&
+      /^[A-Z"“‘(\[0-9]/.test(nextNonEmpty)
+    ) {
+      flush();
+    } else if (
+      current.type === 'bullet' &&
+      !CHUNK_BULLET_RE.test(nextNonEmpty) &&
+      !CHUNK_NUMBERED_RE.test(nextNonEmpty) &&
+      CHUNK_SENTENCE_END_RE.test(line) &&
+      !CHUNK_ABBREV_RE.test(line) &&
+      /^[A-Z"“‘(\[]/.test(nextNonEmpty) &&
+      line.length < typicalWidth * 0.85
+    ) {
+      flush();
+    }
+  }
+
+  flush();
+  return blocks;
+}
+
+function formatChunkPlainText(rawText) {
+  const blocks = parseChunkBlocks(rawText);
+  if (blocks.length === 0) return rawText || '';
+  return blocks
+    .map((b) => (b.type === 'bullet' ? `${b.marker} ${b.text}` : b.text))
+    .join('\n\n');
+}
+
+function extractQueryTerms(query) {
+  if (!query) return [];
+  const rawTokens = query.split(/[^a-zA-Z0-9À-ÿ]+/).filter(Boolean);
+  const seen = new Set();
+  const terms = [];
+
+  for (const token of rawTokens) {
+    const lower = token.toLowerCase();
+    const isAcronym = /^[A-Z0-9]{2,}$/.test(token);
+    if ((token.length >= 3 || isAcronym) && !QUERY_STOPWORDS.has(lower) && !seen.has(lower)) {
+      seen.add(lower);
+      terms.push(token);
+    }
+  }
+
+  return terms.sort((a, b) => b.length - a.length);
+}
+
+function renderHighlightedText(text, terms) {
+  if (!text || !terms || terms.length === 0) return text;
+  const escaped = terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  let regex;
+  try {
+    regex = new RegExp(
+      `((?<![a-zA-Z0-9À-ÿ])(?:${escaped.join('|')})(?:s|es|ed|ing)?(?![a-zA-Z0-9À-ÿ]))`,
+      'gi'
+    );
+  } catch {
+    regex = new RegExp(`(\\b(?:${escaped.join('|')})(?:s|es|ed|ing)?\\b)`, 'gi');
+  }
+
+  const parts = text.split(regex);
+  if (parts.length <= 1) return text;
+
+  return parts.map((part, idx) =>
+    idx % 2 === 1 ? (
+      <mark key={idx} className="chunk-highlight">
+        {part}
+      </mark>
+    ) : (
+      part
+    )
+  );
+}
+
+function FormattedChunkView({ rawText, queryTerms, viewMode, highlightEnabled }) {
+  const activeTerms = highlightEnabled ? queryTerms : [];
+
+  if (viewMode === 'raw') {
+    return (
+      <div className="result-content result-content-raw">
+        {renderHighlightedText(rawText, activeTerms)}
+      </div>
+    );
+  }
+
+  const blocks = parseChunkBlocks(rawText);
+  const trimmed = (rawText || '').trim();
+  const startsMidSentence = /^[a-z,;:\])]/.test(trimmed);
+  const lastBlock = blocks[blocks.length - 1];
+  const endsMidSentence = Boolean(
+    lastBlock &&
+      lastBlock.type !== 'heading' &&
+      /[a-zA-Z0-9,;:\-–—(]$/.test(trimmed)
+  );
+
+  return (
+    <div className="result-content result-content-reflowed">
+      {blocks.map((block, bIdx) => {
+        const isFirst = bIdx === 0;
+        const isLast = bIdx === blocks.length - 1;
+        const showLeadEllipsis = isFirst && startsMidSentence && block.type === 'paragraph';
+        const showTrailEllipsis = isLast && endsMidSentence;
+
+        if (block.type === 'heading') {
+          return (
+            <div key={bIdx} className="chunk-heading">
+              {renderHighlightedText(block.text, activeTerms)}
+            </div>
+          );
+        }
+
+        if (block.type === 'bullet') {
+          return (
+            <div key={bIdx} className="chunk-bullet-item">
+              <span className="chunk-bullet-marker">{block.marker}</span>
+              <span className="chunk-bullet-body">
+                {renderHighlightedText(block.text, activeTerms)}
+                {showTrailEllipsis && (
+                  <span className="chunk-ellipsis" title="Chunk continues in next segment">
+                    …
+                  </span>
+                )}
+              </span>
+            </div>
+          );
+        }
+
+        return (
+          <p key={bIdx} className="chunk-paragraph">
+            {showLeadEllipsis && (
+              <span className="chunk-ellipsis" title="Chunk begins mid-sentence">
+                …
+              </span>
+            )}
+            {renderHighlightedText(block.text, activeTerms)}
+            {showTrailEllipsis && (
+              <span className="chunk-ellipsis" title="Chunk continues in next segment">
+                …
+              </span>
+            )}
+          </p>
+        );
+      })}
+    </div>
+  );
+}
+
+function unescapeXml(str) {
+  return (str || '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&');
+}
+
+function parseRetrievedChunksXml(xmlText) {
+  if (typeof xmlText !== 'string' || !xmlText.includes('<retrieved_chunk')) {
+    return [];
+  }
+  const chunks = [];
+  const chunkRe = /<retrieved_chunk\s+source="([^"]*)"\s+page="([^"]*)">\s*([\s\S]*?)\s*<\/retrieved_chunk>/g;
+  let m;
+  while ((m = chunkRe.exec(xmlText)) !== null) {
+    chunks.push({
+      source: unescapeXml(m[1]).split(/[\\/]/).pop().trim(),
+      page: unescapeXml(m[2]).trim(),
+      content: unescapeXml(m[3]),
+    });
+  }
+  return chunks;
+}
+
+function extractRetrievedChunksFromEvents(events) {
+  if (!Array.isArray(events)) return [];
+  const all = [];
+  const seen = new Set();
+
+  for (const evt of events) {
+    const msgType = (evt?.type || '').toLowerCase();
+    if ((msgType === 'tool' || msgType === 'function') && typeof evt.content === 'string') {
+      for (const chunk of parseRetrievedChunksXml(evt.content)) {
+        const dedupKey = `${chunk.source}::${chunk.page}::${chunk.content.slice(0, 120)}`;
+        if (!seen.has(dedupKey)) {
+          seen.add(dedupKey);
+          all.push(chunk);
+        }
+      }
+    }
+  }
+  return all;
+}
+
+function isCitationInner(inner) {
+  if (!inner || inner.length > 180) return false;
+  if (/^source\s*[:=]/i.test(inner.trim())) return true;
+  if (/\b[\w.\-]+\.(?:pdf|docx?|txt|md|csv|html?)\b/i.test(inner)) return true;
+  if (/^[^\[\]]+?,\s*(?:pp?\.?|pages?)\s*\d+/i.test(inner)) return true;
+  return false;
+}
+
+function parseCitationSegment(rawSegment) {
+  const cleaned = rawSegment.trim().replace(/^source\s*[:=]\s*/i, '');
+  if (!cleaned) return null;
+
+  const commaIdx = cleaned.indexOf(',');
+  if (commaIdx === -1) {
+    const srcOnly = cleaned.replace(/^["']|["']$/g, '').split(/[\\/]/).pop().trim();
+    return { source: srcOnly, pages: [], pageLabel: null };
+  }
+
+  const rawSource = cleaned.slice(0, commaIdx).replace(/^["']|["']$/g, '').trim();
+  const source = rawSource.split(/[\\/]/).pop().trim();
+  const rest = cleaned.slice(commaIdx + 1).trim();
+
+  const pageGroupRe = /^(?:pp?\.?|pages?\s*[:=]?)\s*["']?(\d+(?:\s*[-–—]\s*\d+)?(?:\s*,\s*(?:pp?\.?\s*)?\d+(?:\s*[-–—]\s*\d+)?)*)["']?(.*)$/i;
+  const groupMatch = rest.match(pageGroupRe);
+  if (groupMatch) {
+    const rawPageList = groupMatch[1];
+    const trailingDetail = (groupMatch[2] || '').replace(/^[,\s]+/, '').trim();
+    const nums = (rawPageList.match(/\d+(?:\s*[-–—]\s*\d+)?/g) || []).map((n) =>
+      n.replace(/\s+/g, '')
+    );
+    const uniquePages = [...new Set(nums)];
+    const prefix =
+      uniquePages.length > 1 || uniquePages.some((p) => /[-–—]/.test(p))
+        ? 'pp.'
+        : 'p.';
+    const baseLabel = `${prefix} ${uniquePages.join(', ')}`;
+    return {
+      source,
+      pages: uniquePages,
+      pageLabel: trailingDetail ? `${baseLabel}, ${trailingDetail}` : baseLabel,
+    };
+  }
+
+  return { source, pages: [], pageLabel: rest || null };
+}
+
+function parseCitationBracket(inner) {
+  return inner
+    .split(/\s*(?:;\s*|,\s*(?=[a-zA-Z0-9._-]+\.(?:pdf|docx?|txt|md|csv|html?)\b))/)
+    .map(parseCitationSegment)
+    .filter((c) => c && c.source);
+}
+
+function collectAllCitations(markdown) {
+  if (!markdown) return [];
+  const map = new Map();
+  const bracketRe =
+    /\[([^\[\]\n]+)\](?!\()|\(([\w.\-]+\.(?:pdf|docx?|txt|md|csv|html?)\s*,\s*(?:pp?\.?|pages?)\s*[^()\n]+)\)/g;
+  let m;
+  while ((m = bracketRe.exec(markdown)) !== null) {
+    const inner = m[1] || m[2];
+    if (!isCitationInner(inner)) continue;
+    for (const cit of parseCitationBracket(inner)) {
+      if (!map.has(cit.source)) {
+        map.set(cit.source, new Set());
+      }
+      const pageSet = map.get(cit.source);
+      for (const p of cit.pages) pageSet.add(p);
+    }
+  }
+  return Array.from(map.entries()).map(([source, pageSet]) => ({
+    source,
+    pages: Array.from(pageSet),
+  }));
+}
+
+function pageMatchesCitedRange(chunkPage, citedToken) {
+  if (!chunkPage || !citedToken) return false;
+  if (String(chunkPage).trim() === String(citedToken).trim()) return true;
+  const rangeMatch = String(citedToken).match(/^(\d+)\s*[-–—]\s*(\d+)$/);
+  if (rangeMatch) {
+    const num = Number(chunkPage);
+    const start = Number(rangeMatch[1]);
+    const end = Number(rangeMatch[2]);
+    if (!Number.isNaN(num) && num >= start && num <= end) return true;
+  }
+  return false;
+}
+
+function findMatchingChunksForCitation(citation, retrievedChunks) {
+  if (!citation?.source || !retrievedChunks?.length) return null;
+  const sameSource = retrievedChunks.filter(
+    (c) => c.source.toLowerCase() === citation.source.toLowerCase()
+  );
+  if (sameSource.length === 0) return null;
+
+  if (citation.pages && citation.pages.length > 0) {
+    const exact = sameSource.filter((c) =>
+      citation.pages.some((p) => pageMatchesCitedRange(c.page, p))
+    );
+    if (exact.length > 0) {
+      return { exact: true, chunks: exact };
+    }
+  }
+  return { exact: false, chunks: sameSource };
+}
+
+const INLINE_MARKDOWN_MASTER_RE =
+  /`([^`\n]+)`|\[([^\[\]\n]+)\]\((https?:\/\/[^\s)]+)\)|\[([^\[\]\n]+)\](?!\()|\(([\w.\-]+\.(?:pdf|docx?|txt|md|csv|html?)\s*,\s*(?:pp?\.?|pages?)\s*[^()\n]+)\)|\*\*\*([^\n]+?)\*\*\*|\*\*([^\n]+?)\*\*|__([^\n]+?)__|(?<!\*)\*([^\s*](?:[^\n*]*?[^\s*])?)\*(?!\*)|(?<![a-zA-Z0-9_])_([^\s_](?:[^\n_]*?[^\s_])?)_(?![a-zA-Z0-9_])/g;
+
+function renderInlineMarkdown(text, options = {}, keyPrefix = 'in') {
+  if (!text) return null;
+  const { retrievedChunks = [], activeCitationKey = null, onSelectCitation = null } = options;
+
+  const nodes = [];
+  let lastIdx = 0;
+  const re = new RegExp(INLINE_MARKDOWN_MASTER_RE.source, 'g');
+  let m;
+  let tokenIdx = 0;
+
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > lastIdx) {
+      nodes.push(text.slice(lastIdx, m.index));
+    }
+
+    const key = `${keyPrefix}-${tokenIdx++}`;
+
+    if (m[1] !== undefined) {
+      nodes.push(
+        <code key={key} className="md-inline-code">
+          {m[1]}
+        </code>
+      );
+    } else if (m[2] !== undefined) {
+      nodes.push(
+        <a
+          key={key}
+          href={m[3]}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="md-link"
+        >
+          {renderInlineMarkdown(m[2], options, `${key}-lnk`)}
+        </a>
+      );
+    } else if (m[4] !== undefined || m[5] !== undefined) {
+      const inner = m[4] !== undefined ? m[4] : m[5];
+      if (isCitationInner(inner)) {
+        const parsedCitations = parseCitationBracket(inner);
+        nodes.push(
+          <span key={key} className="md-citation-group">
+            {parsedCitations.map((cit, cIdx) => {
+              const citKey = `${cit.source}::${(cit.pages || []).join(',')}`;
+              const matchInfo = findMatchingChunksForCitation(cit, retrievedChunks);
+              const isInteractive = Boolean(onSelectCitation && matchInfo);
+              const isActive = activeCitationKey === citKey;
+
+              const badgeInner = (
+                <>
+                  <FileText size={11} className="md-citation-icon" />
+                  <span className="md-citation-source">{cit.source}</span>
+                  {cit.pageLabel && (
+                    <span className="md-citation-page">{cit.pageLabel}</span>
+                  )}
+                </>
+              );
+
+              if (isInteractive) {
+                return (
+                  <button
+                    key={`${key}-c-${cIdx}`}
+                    type="button"
+                    className={`md-citation-badge interactive ${isActive ? 'active' : ''}`}
+                    onClick={() => onSelectCitation(cit, citKey)}
+                    title={`Click to ${isActive ? 'hide' : 'preview'} retrieved passage from ${cit.source}${cit.pageLabel ? ` (${cit.pageLabel})` : ''}`}
+                  >
+                    {badgeInner}
+                  </button>
+                );
+              }
+
+              return (
+                <span key={`${key}-c-${cIdx}`} className="md-citation-badge">
+                  {badgeInner}
+                </span>
+              );
+            })}
+          </span>
+        );
+      } else {
+        const open = m[4] !== undefined ? '[' : '(';
+        const close = m[4] !== undefined ? ']' : ')';
+        nodes.push(
+          <React.Fragment key={key}>
+            {open}
+            {renderInlineMarkdown(inner, options, `${key}-brk`)}
+            {close}
+          </React.Fragment>
+        );
+      }
+    } else if (m[6] !== undefined) {
+      nodes.push(
+        <strong key={key} className="md-strong">
+          <em className="md-em">{renderInlineMarkdown(m[6], options, `${key}-bi`)}</em>
+        </strong>
+      );
+    } else if (m[7] !== undefined || m[8] !== undefined) {
+      nodes.push(
+        <strong key={key} className="md-strong">
+          {renderInlineMarkdown(m[7] ?? m[8], options, `${key}-b`)}
+        </strong>
+      );
+    } else if (m[9] !== undefined || m[10] !== undefined) {
+      nodes.push(
+        <em key={key} className="md-em">
+          {renderInlineMarkdown(m[9] ?? m[10], options, `${key}-i`)}
+        </em>
+      );
+    }
+
+    lastIdx = re.lastIndex;
+  }
+
+  if (lastIdx < text.length) {
+    nodes.push(text.slice(lastIdx));
+  }
+
+  return nodes;
+}
+
+function parseAgentMarkdownBlocks(markdown) {
+  if (!markdown) return [];
+  const lines = markdown.replace(/\r\n/g, '\n').split('\n');
+  const blocks = [];
+  let i = 0;
+
+  const HEADING_RE = /^\s*(#{1,4})\s+(.+?)\s*$/;
+  const HR_RE = /^\s*(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$/;
+  const UL_RE = /^(\s*)([*+\-•●▪◦])\s+(.+)$/;
+  const OL_RE = /^(\s*)(\d+[.)])\s+(.+)$/;
+  const TABLE_SEP_RE = /^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?\s*$/;
+
+  const splitTableRow = (row) => {
+    let trimmed = row.trim();
+    if (trimmed.startsWith('|')) trimmed = trimmed.slice(1);
+    if (trimmed.endsWith('|')) trimmed = trimmed.slice(0, -1);
+    return trimmed.split('|').map((c) => c.trim());
+  };
+
+  while (i < lines.length) {
+    const rawLine = lines[i];
+    const trimmed = rawLine.trim();
+
+    if (!trimmed) {
+      i++;
+      continue;
+    }
+
+    if (trimmed.startsWith('```')) {
+      const lang = trimmed.slice(3).trim();
+      i++;
+      const codeLines = [];
+      while (i < lines.length && !lines[i].trim().startsWith('```')) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      if (i < lines.length) i++;
+      blocks.push({ type: 'code', lang, content: codeLines.join('\n') });
+      continue;
+    }
+
+    if (trimmed.includes('|') && i + 1 < lines.length && TABLE_SEP_RE.test(lines[i + 1])) {
+      const headers = splitTableRow(rawLine);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].trim().includes('|') && lines[i].trim() !== '') {
+        rows.push(splitTableRow(lines[i]));
+        i++;
+      }
+      blocks.push({ type: 'table', headers, rows });
+      continue;
+    }
+
+    const headingMatch = rawLine.match(HEADING_RE);
+    if (headingMatch) {
+      blocks.push({
+        type: 'heading',
+        level: headingMatch[1].length,
+        text: headingMatch[2],
+      });
+      i++;
+      continue;
+    }
+
+    if (HR_RE.test(trimmed)) {
+      blocks.push({ type: 'hr' });
+      i++;
+      continue;
+    }
+
+    if (/^\s*>\s?/.test(rawLine)) {
+      const quoteLines = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+        quoteLines.push(lines[i].replace(/^\s*>\s?/, '').trim());
+        i++;
+      }
+      blocks.push({ type: 'blockquote', text: quoteLines.join(' ') });
+      continue;
+    }
+
+    if (UL_RE.test(rawLine) || OL_RE.test(rawLine)) {
+      const items = [];
+      while (i < lines.length) {
+        const l = lines[i];
+        if (!l.trim()) {
+          if (i + 1 < lines.length && (UL_RE.test(lines[i + 1]) || OL_RE.test(lines[i + 1]))) {
+            i++;
+            continue;
+          }
+          break;
+        }
+        if (HR_RE.test(l.trim())) break;
+
+        const ul = l.match(UL_RE);
+        const ol = !ul ? l.match(OL_RE) : null;
+        if (ul || ol) {
+          const indentSpaces = (ul ? ul[1] : ol[1]).replace(/\t/g, '  ').length;
+          const level = Math.min(2, Math.floor(indentSpaces / 2));
+          items.push({
+            ordered: Boolean(ol),
+            marker: ol ? ol[2] : '•',
+            level,
+            text: (ul ? ul[3] : ol[3]).trim(),
+          });
+          i++;
+        } else if (
+          items.length > 0 &&
+          !HEADING_RE.test(l) &&
+          !l.trim().startsWith('```') &&
+          !/^\s*>\s?/.test(l)
+        ) {
+          items[items.length - 1].text += ` ${l.trim()}`;
+          i++;
+        } else {
+          break;
+        }
+      }
+      blocks.push({ type: 'list', items });
+      continue;
+    }
+
+    const paraLines = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() !== '' &&
+      !lines[i].trim().startsWith('```') &&
+      !HEADING_RE.test(lines[i]) &&
+      !HR_RE.test(lines[i].trim()) &&
+      !/^\s*>\s?/.test(lines[i]) &&
+      !UL_RE.test(lines[i]) &&
+      !OL_RE.test(lines[i]) &&
+      !(lines[i].trim().includes('|') && i + 1 < lines.length && TABLE_SEP_RE.test(lines[i + 1]))
+    ) {
+      paraLines.push(lines[i].trim());
+      i++;
+    }
+    blocks.push({ type: 'paragraph', text: paraLines.join(' ') });
+  }
+
+  return blocks;
+}
+
+function AgentMarkdownView({
+  markdown,
+  events = [],
+  viewMode = 'rendered',
+  queryTerms = [],
+  compact = false,
+}) {
+  const [selectedCitation, setSelectedCitation] = useState(null);
+
+  useEffect(() => {
+    setSelectedCitation(null);
+  }, [markdown]);
+
+  if (!markdown) {
+    return (
+      <div className="agent-response-content">
+        <span style={{ color: 'var(--text-muted)' }}>Processing query response...</span>
+      </div>
+    );
+  }
+
+  if (viewMode === 'raw') {
+    return <pre className="agent-response-raw">{markdown}</pre>;
+  }
+
+  const retrievedChunks = extractRetrievedChunksFromEvents(events);
+  const blocks = parseAgentMarkdownBlocks(markdown);
+  const citationsSummary = compact ? [] : collectAllCitations(markdown);
+
+  const handleSelectCitation = (cit, citKey) => {
+    setSelectedCitation((prev) =>
+      prev && prev.key === citKey ? null : { citation: cit, key: citKey }
+    );
+  };
+
+  const inlineOptions = {
+    retrievedChunks,
+    activeCitationKey: selectedCitation?.key || null,
+    onSelectCitation: compact ? null : handleSelectCitation,
+  };
+
+  const previewMatch =
+    !compact && selectedCitation
+      ? findMatchingChunksForCitation(selectedCitation.citation, retrievedChunks)
+      : null;
+
+  return (
+    <div className={compact ? 'agent-md-compact' : 'agent-response-content'}>
+      <div className="agent-md-body">
+        {blocks.map((block, idx) => {
+          if (block.type === 'heading') {
+            const Tag = block.level <= 2 ? 'h3' : 'h4';
+            return (
+              <Tag key={idx} className={`md-heading md-h${block.level}`}>
+                {renderInlineMarkdown(block.text, inlineOptions, `b${idx}`)}
+              </Tag>
+            );
+          }
+
+          if (block.type === 'hr') {
+            return <hr key={idx} className="md-hr" />;
+          }
+
+          if (block.type === 'code') {
+            return (
+              <div key={idx} className="md-code-block-wrap">
+                {block.lang && <div className="md-code-lang">{block.lang}</div>}
+                <pre className="md-code-block">
+                  <code>{block.content}</code>
+                </pre>
+              </div>
+            );
+          }
+
+          if (block.type === 'blockquote') {
+            return (
+              <blockquote key={idx} className="md-blockquote">
+                {renderInlineMarkdown(block.text, inlineOptions, `b${idx}`)}
+              </blockquote>
+            );
+          }
+
+          if (block.type === 'table') {
+            return (
+              <div key={idx} className="md-table-wrapper">
+                <table className="md-table">
+                  <thead>
+                    <tr>
+                      {block.headers.map((h, hIdx) => (
+                        <th key={hIdx}>
+                          {renderInlineMarkdown(h, inlineOptions, `b${idx}-th${hIdx}`)}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {block.rows.map((row, rIdx) => (
+                      <tr key={rIdx}>
+                        {row.map((cell, cIdx) => (
+                          <td key={cIdx}>
+                            {renderInlineMarkdown(
+                              cell,
+                              inlineOptions,
+                              `b${idx}-r${rIdx}-c${cIdx}`
+                            )}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            );
+          }
+
+          if (block.type === 'list') {
+            return (
+              <ul key={idx} className="md-list">
+                {block.items.map((item, iIdx) => (
+                  <li
+                    key={iIdx}
+                    className={`md-list-item md-indent-${item.level} ${item.ordered ? 'ordered' : 'unordered'}`}
+                  >
+                    <span className="md-list-marker">
+                      {item.ordered ? item.marker : item.level > 0 ? '◦' : '•'}
+                    </span>
+                    <div className="md-list-text">
+                      {renderInlineMarkdown(
+                        item.text,
+                        inlineOptions,
+                        `b${idx}-li${iIdx}`
+                      )}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            );
+          }
+
+          return (
+            <p key={idx} className="md-paragraph">
+              {renderInlineMarkdown(block.text, inlineOptions, `b${idx}`)}
+            </p>
+          );
+        })}
+      </div>
+
+      {citationsSummary.length > 0 && (
+        <div className="agent-sources-footer">
+          <div className="agent-sources-header">
+            <span className="agent-sources-label">
+              <BookOpen size={13} />
+              Sources Cited ({citationsSummary.length})
+            </span>
+            {retrievedChunks.length > 0 && (
+              <span className="agent-sources-hint">
+                Click a citation or page to inspect retrieved passage
+              </span>
+            )}
+          </div>
+
+          <div className="agent-sources-list">
+            {citationsSummary.map((srcItem, sIdx) => {
+              const sourceMatch = findMatchingChunksForCitation(
+                { source: srcItem.source, pages: [] },
+                retrievedChunks
+              );
+
+              return (
+                <div key={sIdx} className="agent-source-group">
+                  <FileText size={13} className="agent-source-group-icon" />
+                  <span className="agent-source-group-name">{srcItem.source}</span>
+
+                  {srcItem.pages.length > 0 ? (
+                    <div className="agent-source-pages">
+                      {srcItem.pages.map((p) => {
+                        const pageCit = {
+                          source: srcItem.source,
+                          pages: [p],
+                          pageLabel: `p. ${p}`,
+                        };
+                        const pageKey = `${srcItem.source}::${p}`;
+                        const canPreview = Boolean(sourceMatch);
+                        const isPageActive = selectedCitation?.key === pageKey;
+
+                        return canPreview ? (
+                          <button
+                            key={p}
+                            type="button"
+                            className={`agent-source-page-btn ${isPageActive ? 'active' : ''}`}
+                            onClick={() => handleSelectCitation(pageCit, pageKey)}
+                            title={`Preview retrieved passage for ${srcItem.source} (p. ${p})`}
+                          >
+                            p. {p}
+                          </button>
+                        ) : (
+                          <span key={p} className="agent-source-page-static">
+                            p. {p}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    sourceMatch && (
+                      <button
+                        type="button"
+                        className={`agent-source-page-btn ${
+                          selectedCitation?.key === `${srcItem.source}::` ? 'active' : ''
+                        }`}
+                        onClick={() =>
+                          handleSelectCitation(
+                            { source: srcItem.source, pages: [], pageLabel: null },
+                            `${srcItem.source}::`
+                          )
+                        }
+                      >
+                        View passage
+                      </button>
+                    )
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {previewMatch && selectedCitation && (
+            <div className="agent-citation-preview">
+              <div className="agent-citation-preview-header">
+                <div className="agent-citation-preview-title">
+                  <BookOpen size={14} color="var(--accent-cyan)" />
+                  <span>Grounded Evidence — {selectedCitation.citation.source}</span>
+                  {selectedCitation.citation.pageLabel && (
+                    <span className="result-page-badge">
+                      {selectedCitation.citation.pageLabel}
+                    </span>
+                  )}
+                  {!previewMatch.exact && (
+                    <span className="agent-citation-fallback-note">
+                      (showing retrieved chunk(s) from this document)
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  className="remove-file-btn"
+                  onClick={() => setSelectedCitation(null)}
+                  title="Close preview"
+                >
+                  <X size={15} />
+                </button>
+              </div>
+
+              <div className="agent-citation-preview-list">
+                {previewMatch.chunks.map((chunk, cIdx) => (
+                  <div key={cIdx} className="agent-citation-chunk-item">
+                    {previewMatch.chunks.length > 1 || !previewMatch.exact ? (
+                      <div className="agent-citation-chunk-meta">
+                        <span>Retrieved Chunk #{cIdx + 1}</span>
+                        <span className="result-page-badge">p. {chunk.page}</span>
+                      </div>
+                    ) : null}
+                    <FormattedChunkView
+                      rawText={chunk.content}
+                      queryTerms={queryTerms}
+                      viewMode="reflowed"
+                      highlightEnabled={queryTerms.length > 0}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function PrettyPrintEventStream({ events }) {
   const [viewMode, setViewMode] = useState('pretty'); // 'pretty' | 'json'
@@ -115,8 +1058,12 @@ function PrettyPrintEventStream({ events }) {
                       AI Message
                     </div>
                     {msg.content && (
-                      <div className="pretty-msg-box">
-                        {msg.content}
+                      <div className="pretty-msg-box pretty-ai-markdown">
+                        <AgentMarkdownView
+                          markdown={msg.content}
+                          events={events}
+                          compact
+                        />
                       </div>
                     )}
 
@@ -154,20 +1101,44 @@ function PrettyPrintEventStream({ events }) {
               }
 
               if (msgType === 'tool' || msgType === 'function') {
+                const xmlChunks = parseRetrievedChunksXml(msg.content);
                 return (
                   <div key={index}>
                     <div className="pretty-header tool">
                       Tool Message
                     </div>
-                    <div style={{ fontSize: '0.82rem', marginBottom: '4px', fontWeight: 600, color: '#f87171' }}>
+                    <div style={{ fontSize: '0.82rem', marginBottom: '6px', fontWeight: 600, color: '#f87171' }}>
                       Tool Name: {msg.name || 'Retriever'}
                     </div>
-                    <div style={{ fontSize: '0.8rem', fontWeight: 600, color: '#e2e8f0', marginBottom: '4px' }}>
-                      Tool Result:
+                    <div style={{ fontSize: '0.8rem', fontWeight: 600, color: '#e2e8f0', marginBottom: '6px' }}>
+                      Tool Result {xmlChunks.length > 0 ? `(${xmlChunks.length} retrieved chunks)` : ''}:
                     </div>
-                    <div className="pretty-tool-result-box">
-                      {msg.content}
-                    </div>
+                    {xmlChunks.length > 0 ? (
+                      <div className="pretty-tool-chunks-list">
+                        {xmlChunks.map((chunk, cIdx) => (
+                          <div key={cIdx} className="pretty-tool-chunk-card">
+                            <div className="pretty-tool-chunk-header">
+                              <span className="pretty-tool-chunk-index">Chunk #{cIdx + 1}</span>
+                              <span className="result-source-tag">
+                                <FileText size={12} className="result-source-icon" />
+                                <span className="result-source-name">{chunk.source}</span>
+                                <span className="result-page-badge">p. {chunk.page}</span>
+                              </span>
+                            </div>
+                            <FormattedChunkView
+                              rawText={chunk.content}
+                              queryTerms={[]}
+                              viewMode="reflowed"
+                              highlightEnabled={false}
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="pretty-tool-result-box">
+                        {msg.content}
+                      </div>
+                    )}
                   </div>
                 );
               }
@@ -227,14 +1198,22 @@ export default function App() {
   // Query tab state
   const [queryCollection, setQueryCollection] = useState('');
   const [queryText, setQueryText] = useState('');
+  const [submittedQuery, setSubmittedQuery] = useState('');
   const [topK, setTopK] = useState(5);
   const [queryLoading, setQueryLoading] = useState(false);
   const [queryResults, setQueryResults] = useState(null);
   const [expandedMeta, setExpandedMeta] = useState({});
+  const [chunkViewMode, setChunkViewMode] = useState('reflowed'); // 'reflowed' | 'raw'
+  const [highlightMatches, setHighlightMatches] = useState(true);
+  const [copiedChunkIdx, setCopiedChunkIdx] = useState(null);
 
   // Agent tab state
   const [agentCollection, setAgentCollection] = useState('');
   const [agentQuery, setAgentQuery] = useState('');
+  const [submittedAgentQuery, setSubmittedAgentQuery] = useState('');
+  const [agentEndpointMode, setAgentEndpointMode] = useState('stream'); // 'stream' | 'standard'
+  const [agentViewMode, setAgentViewMode] = useState('rendered'); // 'rendered' | 'raw'
+  const [agentCopied, setAgentCopied] = useState(false);
   const [agentLoading, setAgentLoading] = useState(false);
   const [agentAnswer, setAgentAnswer] = useState(null);
   const [agentEvents, setAgentEvents] = useState([]);
@@ -253,12 +1232,16 @@ export default function App() {
     setPdfPaths('');
     setQueryCollection('');
     setQueryText('');
+    setSubmittedQuery('');
     setQueryResults(null);
     setExpandedMeta({});
+    setCopiedChunkIdx(null);
     setAgentCollection('');
     setAgentQuery('');
+    setSubmittedAgentQuery('');
     setAgentAnswer(null);
     setAgentEvents([]);
+    setAgentCopied(false);
     setShowStreamEvents(false);
     setNotification(null);
     threadIdRef.current = `session-${Date.now()}`;
@@ -513,6 +1496,8 @@ export default function App() {
     e.preventDefault();
     setNotification(null);
     setQueryResults(null);
+    setExpandedMeta({});
+    setCopiedChunkIdx(null);
 
     if (!queryCollection) {
       setNotification({
@@ -522,7 +1507,8 @@ export default function App() {
       return;
     }
 
-    if (!queryText.trim()) {
+    const trimmedQuery = queryText.trim();
+    if (!trimmedQuery) {
       setNotification({
         type: 'error',
         message: 'Please enter a search query.'
@@ -539,7 +1525,7 @@ export default function App() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          query: queryText.trim(),
+          query: trimmedQuery,
           collection_name: queryCollection,
           k: Number(topK)
         }),
@@ -551,6 +1537,7 @@ export default function App() {
         throw new Error(result.detail || 'Failed to query collection');
       }
 
+      setSubmittedQuery(trimmedQuery);
       setQueryResults(result.results || []);
 
     } catch (err) {
@@ -569,6 +1556,7 @@ export default function App() {
     setNotification(null);
     setAgentAnswer(null);
     setAgentEvents([]);
+    setAgentCopied(false);
     setShowStreamEvents(false);
 
     const targetCollection = agentCollection || selectedCollection;
@@ -580,7 +1568,8 @@ export default function App() {
       return;
     }
 
-    if (!agentQuery.trim()) {
+    const trimmedQuestion = agentQuery.trim();
+    if (!trimmedQuestion) {
       setNotification({
         type: 'error',
         message: 'Please enter a question for the agent.'
@@ -588,17 +1577,32 @@ export default function App() {
       return;
     }
 
+    setSubmittedAgentQuery(trimmedQuestion);
     setAgentLoading(true);
 
     try {
-      const response = await authFetch(`${AGENT_API_BASE}/agent/stream`, {
+      const endpointUrl =
+        agentEndpointMode === 'standard'
+          ? `${AGENT_API_BASE}/agent`
+          : `${AGENT_API_BASE}/agent/stream`;
+      const payload =
+        agentEndpointMode === 'standard'
+          ? {
+              query: trimmedQuestion,
+              collection_name: targetCollection,
+              thread_id: threadIdRef.current,
+              stream: false,
+            }
+          : {
+              query: trimmedQuestion,
+              collection_name: targetCollection,
+              thread_id: threadIdRef.current,
+            };
+
+      const response = await authFetch(endpointUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          query: agentQuery.trim(),
-          collection_name: targetCollection,
-          thread_id: threadIdRef.current,
-        }),
+        body: JSON.stringify(payload),
       });
 
       if (!response.ok) {
@@ -684,6 +1688,23 @@ export default function App() {
       ...prev,
       [index]: !prev[index]
     }));
+  };
+
+  const handleCopyChunk = (index, rawText) => {
+    const textToCopy =
+      chunkViewMode === 'raw' ? rawText || '' : formatChunkPlainText(rawText);
+    navigator.clipboard.writeText(textToCopy);
+    setCopiedChunkIdx(index);
+    setTimeout(() => {
+      setCopiedChunkIdx((prev) => (prev === index ? null : prev));
+    }, 1800);
+  };
+
+  const handleCopyAgentAnswer = () => {
+    if (!agentAnswer) return;
+    navigator.clipboard.writeText(agentAnswer);
+    setAgentCopied(true);
+    setTimeout(() => setAgentCopied(false), 1800);
   };
 
   if (authInitializing) {
@@ -1050,74 +2071,161 @@ export default function App() {
             </form>
 
             {/* Results Section */}
-            {queryResults && (
-              <div style={{ marginTop: '2rem' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingBottom: '0.5rem', borderBottom: '1px solid var(--border-color)' }}>
-                  <h3 style={{ fontSize: '1rem', fontWeight: 600, color: '#fff' }}>
-                    Search Results ({queryResults.length})
-                  </h3>
-                  <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>
-                    Collection: <strong>{queryCollection}</strong>
-                  </span>
-                </div>
+            {queryResults && (() => {
+              const queryTerms = extractQueryTerms(submittedQuery);
+              return (
+                <div className="results-section">
+                  <div className="results-toolbar">
+                    <div className="results-toolbar-left">
+                      <h3 className="results-heading">
+                        Search Results
+                        <span className="results-count-pill">{queryResults.length}</span>
+                      </h3>
+                      <span className="results-collection-label">
+                        in <strong>{queryCollection}</strong>
+                      </span>
+                    </div>
 
-                {queryResults.length === 0 ? (
-                  <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', margin: '1.5rem 0' }}>
-                    No matching documents found for your query.
-                  </p>
-                ) : (
-                  <div className="results-container">
-                    {queryResults.map((res, idx) => (
-                      <div key={idx} className="result-card">
-                        <div className="result-header">
-                          <span className="result-rank-badge">
-                            Result #{idx + 1}
-                          </span>
+                    {queryResults.length > 0 && (
+                      <div className="results-toolbar-controls">
+                        {queryTerms.length > 0 && (
+                          <button
+                            type="button"
+                            className={`chunk-control-pill ${highlightMatches ? 'active' : ''}`}
+                            onClick={() => setHighlightMatches((prev) => !prev)}
+                            title="Toggle query keyword highlighting"
+                          >
+                            <Highlighter size={13} />
+                            <span>Highlights</span>
+                          </button>
+                        )}
 
-                          {res.metadata?.source && (
-                            <span className="result-source-tag">
-                              <FileCode2 size={13} />
-                              {res.metadata.source.split('/').pop()}
-                              {res.metadata.page_label !== undefined && ` (p. ${res.metadata.page_label})`}
-                            </span>
-                          )}
+                        <div className="chunk-view-segmented" role="group" aria-label="Chunk display mode">
+                          <button
+                            type="button"
+                            className={`chunk-view-btn ${chunkViewMode === 'reflowed' ? 'active' : ''}`}
+                            onClick={() => setChunkViewMode('reflowed')}
+                            title="Reflow PDF line breaks into full-width paragraphs"
+                          >
+                            <AlignLeft size={13} />
+                            <span>Reflowed</span>
+                          </button>
+                          <button
+                            type="button"
+                            className={`chunk-view-btn ${chunkViewMode === 'raw' ? 'active' : ''}`}
+                            onClick={() => setChunkViewMode('raw')}
+                            title="Show exact raw chunk text with original newlines"
+                          >
+                            <Code2 size={13} />
+                            <span>Raw</span>
+                          </button>
                         </div>
+                      </div>
+                    )}
+                  </div>
 
-                        <div className="result-content">
-                          {res.page_content}
-                        </div>
+                  {queryResults.length === 0 ? (
+                    <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', margin: '1.5rem 0' }}>
+                      No matching documents found for your query.
+                    </p>
+                  ) : (
+                    <div className="results-container">
+                      {queryResults.map((res, idx) => {
+                        const rawContent = res.page_content || '';
+                        const wordCount = rawContent.trim()
+                          ? rawContent.trim().split(/\s+/).length
+                          : 0;
+                        const charCount = rawContent.length;
+                        const sourceName = res.metadata?.source
+                          ? res.metadata.source.split(/[\\/]/).pop()
+                          : null;
+                        const pageDisplay =
+                          res.metadata?.page_label !== undefined
+                            ? res.metadata.page_label
+                            : res.metadata?.page !== undefined
+                            ? Number(res.metadata.page) + 1
+                            : null;
+                        const isCopied = copiedChunkIdx === idx;
 
-                        {res.metadata && (
-                          <div>
-                            <button
-                              type="button"
-                              className="result-metadata-toggle"
-                              onClick={() => toggleMetadata(idx)}
-                            >
-                              {expandedMeta[idx] ? (
-                                <>
-                                  <ChevronUp size={14} /> Hide Full Metadata
-                                </>
-                              ) : (
-                                <>
-                                  <ChevronDown size={14} /> View Metadata
-                                </>
-                              )}
-                            </button>
+                        return (
+                          <div key={idx} className="result-card">
+                            <div className="result-header">
+                              <div className="result-header-left">
+                                <span className="result-rank-badge">
+                                  Result #{idx + 1}
+                                </span>
+                                <span className="result-stats-pill">
+                                  {wordCount} words · {charCount} chars
+                                </span>
+                              </div>
 
-                            {expandedMeta[idx] && (
-                              <pre className="result-metadata-box">
-                                {JSON.stringify(res.metadata, null, 2)}
-                              </pre>
+                              <div className="result-header-right">
+                                {sourceName && (
+                                  <span className="result-source-tag" title={res.metadata.source}>
+                                    <FileText size={13} className="result-source-icon" />
+                                    <span className="result-source-name">{sourceName}</span>
+                                    {pageDisplay !== null && (
+                                      <span className="result-page-badge">p. {pageDisplay}</span>
+                                    )}
+                                  </span>
+                                )}
+
+                                <button
+                                  type="button"
+                                  className={`chunk-copy-btn ${isCopied ? 'copied' : ''}`}
+                                  onClick={() => handleCopyChunk(idx, rawContent)}
+                                  title={
+                                    isCopied
+                                      ? 'Copied!'
+                                      : `Copy ${chunkViewMode === 'raw' ? 'raw' : 'formatted'} chunk`
+                                  }
+                                >
+                                  {isCopied ? <Check size={13} /> : <Copy size={13} />}
+                                  <span>{isCopied ? 'Copied' : 'Copy'}</span>
+                                </button>
+                              </div>
+                            </div>
+
+                            <FormattedChunkView
+                              rawText={rawContent}
+                              queryTerms={queryTerms}
+                              viewMode={chunkViewMode}
+                              highlightEnabled={highlightMatches}
+                            />
+
+                            {res.metadata && (
+                              <div className="result-footer">
+                                <button
+                                  type="button"
+                                  className="result-metadata-toggle"
+                                  onClick={() => toggleMetadata(idx)}
+                                >
+                                  {expandedMeta[idx] ? (
+                                    <>
+                                      <ChevronUp size={14} /> Hide Full Metadata
+                                    </>
+                                  ) : (
+                                    <>
+                                      <ChevronDown size={14} /> View Metadata
+                                    </>
+                                  )}
+                                </button>
+
+                                {expandedMeta[idx] && (
+                                  <pre className="result-metadata-box">
+                                    {JSON.stringify(res.metadata, null, 2)}
+                                  </pre>
+                                )}
+                              </div>
                             )}
                           </div>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         )}
 
@@ -1155,9 +2263,33 @@ export default function App() {
                 )}
               </div>
 
-              {/* Natural Language Question */}
+              {/* Natural Language Question & Endpoint Mode */}
               <div className="form-group">
-                <label className="form-label">Question for AI Agent</label>
+                <div className="agent-question-label-row">
+                  <label className="form-label" style={{ margin: 0 }}>
+                    Question for AI Agent
+                  </label>
+                  <div className="chunk-view-segmented" role="group" aria-label="Agent endpoint mode">
+                    <button
+                      type="button"
+                      className={`chunk-view-btn ${agentEndpointMode === 'stream' ? 'active' : ''}`}
+                      onClick={() => setAgentEndpointMode('stream')}
+                      title="Stream real-time SSE events via POST /agent/stream"
+                    >
+                      <Zap size={12} />
+                      <span>/agent/stream</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`chunk-view-btn ${agentEndpointMode === 'standard' ? 'active' : ''}`}
+                      onClick={() => setAgentEndpointMode('standard')}
+                      title="Fetch complete JSON response via POST /agent"
+                    >
+                      <Server size={12} />
+                      <span>/agent</span>
+                    </button>
+                  </div>
+                </div>
                 <textarea
                   rows={3}
                   className="form-textarea"
@@ -1186,32 +2318,81 @@ export default function App() {
             {(agentAnswer || agentLoading || agentEvents.length > 0) && (
               <div className="agent-response-card">
                 <div className="agent-response-header">
-                  <div className="agent-response-title">
-                    <Sparkles size={20} color="var(--primary)" />
-                    AI Response
+                  <div className="agent-response-title-group">
+                    <div className="agent-response-title">
+                      <Sparkles size={20} color="var(--primary)" />
+                      AI Response
+                    </div>
+                    <span className="agent-endpoint-badge">
+                      {agentEndpointMode === 'standard' ? 'POST /agent' : 'POST /agent/stream'}
+                    </span>
                   </div>
 
-                  {agentEvents.length > 0 && (
-                    <button
-                      type="button"
-                      className="btn-event-stream"
-                      onClick={() => setShowStreamEvents(!showStreamEvents)}
-                    >
-                      <Terminal size={16} />
-                      {showStreamEvents ? 'Hide Stream Events' : 'Inspect Stream Events (pretty_print_event)'}
-                    </button>
-                  )}
+                  <div className="agent-response-actions">
+                    {agentAnswer && (
+                      <>
+                        <div className="chunk-view-segmented" role="group" aria-label="Response display mode">
+                          <button
+                            type="button"
+                            className={`chunk-view-btn ${agentViewMode === 'rendered' ? 'active' : ''}`}
+                            onClick={() => setAgentViewMode('rendered')}
+                            title="Formatted view with rich typography and interactive citations"
+                          >
+                            <AlignLeft size={13} />
+                            <span>Formatted</span>
+                          </button>
+                          <button
+                            type="button"
+                            className={`chunk-view-btn ${agentViewMode === 'raw' ? 'active' : ''}`}
+                            onClick={() => setAgentViewMode('raw')}
+                            title="Raw Markdown output"
+                          >
+                            <Code2 size={13} />
+                            <span>Markdown</span>
+                          </button>
+                        </div>
+
+                        <button
+                          type="button"
+                          className={`chunk-copy-btn ${agentCopied ? 'copied' : ''}`}
+                          onClick={handleCopyAgentAnswer}
+                          title={agentCopied ? 'Copied!' : 'Copy AI response'}
+                        >
+                          {agentCopied ? <Check size={13} /> : <Copy size={13} />}
+                          <span>{agentCopied ? 'Copied' : 'Copy'}</span>
+                        </button>
+                      </>
+                    )}
+
+                    {agentEvents.length > 0 && (
+                      <button
+                        type="button"
+                        className="btn-event-stream"
+                        onClick={() => setShowStreamEvents(!showStreamEvents)}
+                      >
+                        <Terminal size={15} />
+                        {showStreamEvents ? 'Hide Stream Events' : 'Stream Events'}
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 {agentLoading && !agentAnswer ? (
                   <div style={{ padding: '1.5rem', textAlign: 'center', color: 'var(--text-muted)' }}>
                     <RefreshCw className="spinner" size={24} style={{ marginBottom: '0.5rem', color: 'var(--primary)' }} />
-                    <p style={{ fontSize: '0.9rem' }}>Streaming message events from agent state graph...</p>
+                    <p style={{ fontSize: '0.9rem' }}>
+                      {agentEndpointMode === 'standard'
+                        ? 'Awaiting grounded JSON response from /agent...'
+                        : 'Streaming message events from agent state graph...'}
+                    </p>
                   </div>
                 ) : (
-                  <div className="agent-response-content">
-                    {agentAnswer || "Processing query response..."}
-                  </div>
+                  <AgentMarkdownView
+                    markdown={agentAnswer}
+                    events={agentEvents}
+                    viewMode={agentViewMode}
+                    queryTerms={extractQueryTerms(submittedAgentQuery)}
+                  />
                 )}
 
                 {/* Pretty Print Event Stream Drawer / View */}
