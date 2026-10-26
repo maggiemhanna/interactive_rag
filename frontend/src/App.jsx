@@ -33,7 +33,8 @@ import {
   Send,
   CornerDownLeft,
   Square,
-  History
+  History,
+  ArrowLeft
 } from 'lucide-react';
 import {
   API_BASE,
@@ -1151,248 +1152,517 @@ function describeLiveAgentStep(events, endpointMode, turnNumber) {
   };
 }
 
-function renderStreamEventItem(msg, key, contextEvents) {
-  const msgType = (msg.type || 'unknown').toLowerCase();
+function parseTurnSteps(turn, turnNumber) {
+  const events = Array.isArray(turn?.events) ? turn.events : [];
+  const searchRounds = [];
+  let pendingQueries = [];
 
-  if (msgType === 'human' || msgType === 'user') {
-    return (
-      <div key={key}>
-        <div className="pretty-header human">Your Question</div>
-        <div className="pretty-msg-box">{msg.content}</div>
-      </div>
-    );
+  for (const evt of events) {
+    const t = (evt?.type || '').toLowerCase();
+    if ((t === 'ai' || t === 'assistant') && Array.isArray(evt.tool_calls) && evt.tool_calls.length > 0) {
+      const queries = evt.tool_calls
+        .map((c) => c?.args?.query)
+        .filter(Boolean);
+      pendingQueries = queries.length > 0 ? queries : ['Document lookup'];
+    } else if (t === 'tool' || t === 'function') {
+      const passages = parseRetrievedChunksXml(evt.content);
+      searchRounds.push({
+        queries: pendingQueries.length > 0 ? [...pendingQueries] : [],
+        passages,
+        rawContent: evt.content || '',
+      });
+      pendingQueries = [];
+    }
   }
 
-  if (msgType === 'ai' || msgType === 'assistant') {
-    return (
-      <div key={key}>
-        <div className="pretty-header ai">Assistant</div>
-        {msg.content && (
-          <div className="pretty-msg-box pretty-ai-markdown">
-            <AgentMarkdownView
-              markdown={msg.content}
-              events={contextEvents}
-              compact
-            />
-          </div>
-        )}
-
-        {msg.tool_calls && msg.tool_calls.length > 0 && (
-          <div className="pretty-tool-calls-panel">
-            <div className="pretty-tool-calls-title">
-              <Search size={14} />
-              Document Search
-            </div>
-            {msg.tool_calls.map((call, cIdx) => (
-              <div
-                key={cIdx}
-                style={{ marginBottom: cIdx < msg.tool_calls.length - 1 ? '0.5rem' : 0 }}
-              >
-                {call.args && (
-                  <div>
-                    {Object.entries(call.args).map(([k, v]) => (
-                      <div key={k} className="pretty-tool-arg-row">
-                        <span className="pretty-tool-arg-key">
-                          • {k === 'query' ? 'Search phrase' : k}:
-                        </span>
-                        <span>{typeof v === 'object' ? JSON.stringify(v) : String(v)}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    );
+  // If a search was dispatched and we are still awaiting the tool response
+  if (pendingQueries.length > 0) {
+    searchRounds.push({
+      queries: [...pendingQueries],
+      passages: null, // pending
+      rawContent: '',
+    });
   }
 
-  if (msgType === 'tool' || msgType === 'function') {
-    const xmlChunks = parseRetrievedChunksXml(msg.content);
-    return (
-      <div key={key}>
-        <div className="pretty-header tool">Matched Passages</div>
-        {xmlChunks.length > 0 && (
-          <div style={{ fontSize: '0.8rem', fontWeight: 600, color: '#e2e8f0', marginBottom: '6px' }}>
-            Found {xmlChunks.length} matching {xmlChunks.length === 1 ? 'passage' : 'passages'}:
-          </div>
-        )}
-        {xmlChunks.length > 0 ? (
-          <div className="pretty-tool-chunks-list">
-            {xmlChunks.map((chunk, cIdx) => (
-              <div key={cIdx} className="pretty-tool-chunk-card">
-                <div className="pretty-tool-chunk-header">
-                  <span className="pretty-tool-chunk-index">Passage #{cIdx + 1}</span>
-                  <span className="result-source-tag">
-                    <FileText size={12} className="result-source-icon" />
-                    <span className="result-source-name">{chunk.source}</span>
-                    <span className="result-page-badge">p. {chunk.page}</span>
-                  </span>
-                </div>
-                <FormattedChunkView
-                  rawText={chunk.content}
-                  queryTerms={[]}
-                  viewMode="reflowed"
-                  highlightEnabled={false}
-                />
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="pretty-tool-result-box">{msg.content}</div>
-        )}
-      </div>
-    );
-  }
+  return {
+    turnNumber,
+    searchRounds,
+    usedEarlierContextOnly:
+      searchRounds.length === 0 &&
+      turnNumber > 1 &&
+      (turn?.status === 'done' || Boolean(turn?.answer)),
+  };
+}
 
-  if (msgType === 'system') {
-    return (
-      <div key={key}>
-        <div className="pretty-header system">System Note</div>
-        <div className="pretty-msg-box">{msg.content}</div>
-      </div>
-    );
-  }
+function TurnStepsTimelineCard({
+  turn,
+  turnIndex,
+  allPriorEvents,
+  defaultExpandPassages = true,
+  onBackToChat,
+}) {
+  const [expandedRounds, setExpandedRounds] = useState({});
+  const [showAnswerPreview, setShowAnswerPreview] = useState(false);
+
+  const turnNumber = turnIndex + 1;
+  const turnEvents = Array.isArray(turn.events) ? turn.events : [];
+  const groundingEvents = [...turnEvents, ...(allPriorEvents || [])];
+  const { searchRounds, usedEarlierContextOnly } = parseTurnSteps(turn, turnNumber);
+  const citations = turn.answer ? collectAllCitations(turn.answer) : [];
+  const liveStep =
+    turn.status === 'streaming' && !turn.answer
+      ? describeLiveAgentStep(turnEvents, turn.endpointMode, turnNumber)
+      : null;
+
+  const isRoundExpanded = (rIdx) =>
+    expandedRounds[rIdx] !== undefined ? expandedRounds[rIdx] : defaultExpandPassages;
+
+  const toggleRound = (rIdx) => {
+    setExpandedRounds((prev) => ({
+      ...prev,
+      [rIdx]: !isRoundExpanded(rIdx),
+    }));
+  };
 
   return (
-    <div key={key}>
-      <div className="pretty-header" style={{ color: '#94a3b8' }}>
-        {msgType.toUpperCase()}
+    <div className="steps-turn-card">
+      <div className="steps-turn-card-header">
+        <div className="steps-turn-card-title">
+          <span className="steps-turn-badge">Question #{turnNumber}</span>
+          {turnNumber > 1 && (
+            <span className="steps-turn-subbadge">Follow-up</span>
+          )}
+          {turn.createdAt && (
+            <span className="chat-turn-time">{formatTurnTime(turn.createdAt)}</span>
+          )}
+        </div>
+        {onBackToChat && (
+          <button
+            type="button"
+            className="steps-jump-chat-link"
+            onClick={onBackToChat}
+          >
+            <span>View in Chat</span>
+          </button>
+        )}
       </div>
-      <div className="pretty-msg-box">{msg.content || JSON.stringify(msg)}</div>
+
+      <div className="steps-timeline">
+        {/* Step 1: Question */}
+        <div className="step-node">
+          <div className="step-node-indicator question">
+            <MessageSquare size={14} />
+          </div>
+          <div className="step-node-body">
+            <div className="step-node-label">Your Question</div>
+            <div className="step-question-box">{turn.query}</div>
+          </div>
+        </div>
+
+        {/* Step 2..N: Search Rounds & Matched Passages */}
+        {searchRounds.map((round, rIdx) => {
+          const primaryQuery = round.queries[0] || turn.query || '';
+          const highlightTerms = extractQueryTerms(primaryQuery);
+          const expanded = isRoundExpanded(rIdx);
+          const passageCount = Array.isArray(round.passages) ? round.passages.length : 0;
+
+          return (
+            <React.Fragment key={`round-${rIdx}`}>
+              {round.queries.length > 0 && (
+                <div className="step-node">
+                  <div className="step-node-indicator search">
+                    <Search size={14} />
+                  </div>
+                  <div className="step-node-body">
+                    <div className="step-node-label">
+                      {searchRounds.length > 1
+                        ? `Document Search #${rIdx + 1}`
+                        : 'Searched Documents'}
+                    </div>
+                    <div className="step-queries-list">
+                      {round.queries.map((q, qIdx) => (
+                        <div key={qIdx} className="step-query-pill">
+                          <Search size={12} className="step-query-pill-icon" />
+                          <span>"{q}"</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {round.passages !== null && (
+                <div className="step-node">
+                  <div className="step-node-indicator passages">
+                    <BookOpen size={14} />
+                  </div>
+                  <div className="step-node-body">
+                    <div className="step-passages-header-row">
+                      <div className="step-node-label" style={{ margin: 0 }}>
+                        {passageCount > 0
+                          ? `Matched ${passageCount} ${
+                              passageCount === 1 ? 'Passage' : 'Passages'
+                            }`
+                          : 'No Matching Passages Found'}
+                      </div>
+                      {passageCount > 0 && (
+                        <button
+                          type="button"
+                          className="step-collapse-btn"
+                          onClick={() => toggleRound(rIdx)}
+                        >
+                          {expanded ? (
+                            <>
+                              <ChevronUp size={13} />
+                              <span>Hide passages</span>
+                            </>
+                          ) : (
+                            <>
+                              <ChevronDown size={13} />
+                              <span>Show {passageCount} passages</span>
+                            </>
+                          )}
+                        </button>
+                      )}
+                    </div>
+
+                    {passageCount > 0 && expanded && (
+                      <div className="step-passages-grid">
+                        {round.passages.map((chunk, cIdx) => {
+                          const wordCount = (chunk.content || '').trim()
+                            ? chunk.content.trim().split(/\s+/).length
+                            : 0;
+                          return (
+                            <div key={cIdx} className="step-passage-card">
+                              <div className="step-passage-card-header">
+                                <div className="step-passage-card-left">
+                                  <span className="step-passage-index">
+                                    Passage #{cIdx + 1}
+                                  </span>
+                                  <span className="result-stats-pill">
+                                    {wordCount} words
+                                  </span>
+                                </div>
+                                <span className="result-source-tag">
+                                  <FileText size={12} className="result-source-icon" />
+                                  <span className="result-source-name">{chunk.source}</span>
+                                  <span className="result-page-badge">p. {chunk.page}</span>
+                                </span>
+                              </div>
+                              <FormattedChunkView
+                                rawText={chunk.content}
+                                queryTerms={highlightTerms}
+                                viewMode="reflowed"
+                                highlightEnabled={highlightTerms.length > 0}
+                              />
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </React.Fragment>
+          );
+        })}
+
+        {usedEarlierContextOnly && (
+          <div className="step-node">
+            <div className="step-node-indicator context">
+              <History size={14} />
+            </div>
+            <div className="step-node-body">
+              <div className="step-node-label">Used Conversation Context</div>
+              <div className="step-context-note">
+                No new document search was needed — answered using context from earlier in this chat.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Final Step: Live Status / Error / Answer Summary */}
+        <div className="step-node last">
+          <div
+            className={`step-node-indicator ${
+              turn.status === 'error' && !turn.answer ? 'error' : 'answer'
+            }`}
+          >
+            {liveStep ? (
+              <RefreshCw size={14} className="spinner" />
+            ) : turn.status === 'error' && !turn.answer ? (
+              <AlertCircle size={14} />
+            ) : (
+              <Sparkles size={14} />
+            )}
+          </div>
+          <div className="step-node-body">
+            {liveStep ? (
+              <>
+                <div className="step-node-label">In Progress</div>
+                <div className="step-live-box">
+                  <div className="agent-live-step-stage">{liveStep.stage}</div>
+                  {liveStep.detail && (
+                    <div className="agent-live-step-detail">{liveStep.detail}</div>
+                  )}
+                </div>
+              </>
+            ) : turn.status === 'error' && !turn.answer ? (
+              <>
+                <div className="step-node-label">Stopped / Error</div>
+                <div className="agent-turn-error-box">
+                  <span>{turn.error || 'Could not generate an answer.'}</span>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="step-passages-header-row">
+                  <div className="step-node-label" style={{ margin: 0 }}>
+                    Answer Ready
+                  </div>
+                  {turn.answer && (
+                    <button
+                      type="button"
+                      className="step-collapse-btn"
+                      onClick={() => setShowAnswerPreview((prev) => !prev)}
+                    >
+                      {showAnswerPreview ? (
+                        <>
+                          <ChevronUp size={13} />
+                          <span>Hide answer preview</span>
+                        </>
+                      ) : (
+                        <>
+                          <ChevronDown size={13} />
+                          <span>Preview answer</span>
+                        </>
+                      )}
+                    </button>
+                  )}
+                </div>
+
+                <div className="step-answer-summary-card">
+                  {citations.length > 0 ? (
+                    <div className="step-answer-citations-row">
+                      <span className="step-answer-cited-label">Pages cited:</span>
+                      {citations.map((srcItem, sIdx) => (
+                        <span key={sIdx} className="result-source-tag">
+                          <FileText size={12} className="result-source-icon" />
+                          <span className="result-source-name">{srcItem.source}</span>
+                          {srcItem.pages.length > 0 && (
+                            <span className="result-page-badge">
+                              p. {srcItem.pages.join(', ')}
+                            </span>
+                          )}
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <span className="step-answer-plain-note">
+                      Answer completed — switch to Chat to read or ask a follow-up.
+                    </span>
+                  )}
+
+                  {showAnswerPreview && turn.answer && (
+                    <div className="step-answer-preview-body">
+                      <AgentMarkdownView
+                        markdown={turn.answer}
+                        events={groundingEvents}
+                        compact
+                      />
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
 
-function PrettyPrintEventStream({ events = [], priorTurns = [], turnNumber = 1 }) {
-  const [scopeMode, setScopeMode] = useState('turn'); // 'turn' | 'thread'
-  const [viewMode, setViewMode] = useState('pretty'); // 'pretty' | 'json'
+function AgentSearchStepsView({
+  turns = [],
+  focusedTurnId = 'latest',
+  onSelectTurnFilter,
+  onBackToChat,
+}) {
+  const [formatMode, setFormatMode] = useState('visual'); // 'visual' | 'json'
   const [copied, setCopied] = useState(false);
 
-  const hasPriorHistory = priorTurns.length > 0;
-  const effectiveScope = hasPriorHistory ? scopeMode : 'turn';
+  if (!Array.isArray(turns) || turns.length === 0) {
+    return (
+      <div className="agent-empty-thread">
+        <div className="agent-empty-icon-wrap">
+          <Search size={22} />
+        </div>
+        <h3 className="agent-empty-title">No Search Steps Yet</h3>
+        <p className="agent-empty-desc">
+          Ask a question in <strong>Chat</strong> first — then toggle here anytime to see
+          the exact search phrases and document passages used to write each answer.
+        </p>
+        <button
+          type="button"
+          className="btn-new-thread"
+          style={{ marginTop: '0.4rem' }}
+          onClick={onBackToChat}
+        >
+          <ArrowLeft size={14} />
+          <span>Back to Chat</span>
+        </button>
+      </div>
+    );
+  }
 
-  const turnGroups = [
-    ...priorTurns.map((t, idx) => ({
-      turnNumber: idx + 1,
-      query: t.query,
-      events: Array.isArray(t.events) ? t.events : [],
-    })),
-    {
-      turnNumber,
-      events: Array.isArray(events) ? events : [],
-    },
-  ];
-  const allThreadEvents = turnGroups.flatMap((g) => g.events);
-  const displayedEvents = effectiveScope === 'thread' ? allThreadEvents : events;
+  const latestTurn = turns[turns.length - 1];
+  const resolvedFilter =
+    focusedTurnId === 'all' && turns.length > 1
+      ? 'all'
+      : turns.some((t) => t.id === focusedTurnId)
+      ? focusedTurnId
+      : latestTurn.id;
+
+  const displayedItems =
+    resolvedFilter === 'all'
+      ? turns.map((turn, idx) => ({ turn, idx }))
+      : turns
+          .map((turn, idx) => ({ turn, idx }))
+          .filter((item) => item.turn.id === resolvedFilter);
+
+  const jsonPayload =
+    resolvedFilter === 'all'
+      ? turns.map((t, i) => ({
+          question_number: i + 1,
+          question: t.query,
+          steps: t.events || [],
+        }))
+      : displayedItems[0]?.turn?.events || [];
 
   const handleCopyJson = () => {
-    navigator.clipboard.writeText(JSON.stringify(displayedEvents, null, 2));
+    navigator.clipboard.writeText(JSON.stringify(jsonPayload, null, 2));
     setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    setTimeout(() => setCopied(false), 1800);
   };
 
   return (
-    <div className="stream-inspector-container">
-      <div className="stream-inspector-header">
-        <div className="stream-inspector-title">
-          <BookOpen size={15} color="var(--primary)" />
-          <span>
-            {effectiveScope === 'thread'
-              ? `Full Chat Activity (${allThreadEvents.length} steps)`
-              : `Search & Reasoning Steps (${events.length})`}
-          </span>
-        </div>
-
-        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
-          {hasPriorHistory && (
-            <div className="chunk-view-segmented" role="group" aria-label="Activity scope">
+    <div className="agent-steps-view">
+      {/* Top Toolbar: Question Switcher + Visual/JSON + Back to Chat */}
+      <div className="agent-steps-toolbar">
+        <div className="agent-steps-filter-group">
+          {turns.length > 1 ? (
+            <div className="agent-steps-turn-pills" role="tablist" aria-label="Select question">
+              {turns.map((t, idx) => {
+                const isSelected = resolvedFilter === t.id;
+                const shortQ =
+                  t.query.length > 30 ? `${t.query.slice(0, 29).trimEnd()}…` : t.query;
+                return (
+                  <button
+                    key={t.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={isSelected}
+                    className={`steps-filter-pill ${isSelected ? 'active' : ''}`}
+                    onClick={() => onSelectTurnFilter(t.id)}
+                    title={t.query}
+                  >
+                    <span className="steps-filter-pill-num">Q{idx + 1}</span>
+                    <span className="steps-filter-pill-text">{shortQ}</span>
+                  </button>
+                );
+              })}
               <button
                 type="button"
-                className={`chunk-view-btn ${effectiveScope === 'turn' ? 'active' : ''}`}
-                onClick={() => setScopeMode('turn')}
-                title="Show steps for this answer only"
+                role="tab"
+                aria-selected={resolvedFilter === 'all'}
+                className={`steps-filter-pill ${resolvedFilter === 'all' ? 'active' : ''}`}
+                onClick={() => onSelectTurnFilter('all')}
               >
-                <span>This Answer</span>
-              </button>
-              <button
-                type="button"
-                className={`chunk-view-btn ${effectiveScope === 'thread' ? 'active' : ''}`}
-                onClick={() => setScopeMode('thread')}
-                title="Show steps across the entire conversation"
-              >
-                <History size={12} />
-                <span>Full Chat</span>
+                <Layers size={12} />
+                <span>All ({turns.length})</span>
               </button>
             </div>
+          ) : (
+            <div className="steps-single-heading">
+              <Search size={15} color="var(--accent-cyan)" />
+              <span>How the assistant searched your documents</span>
+            </div>
+          )}
+        </div>
+
+        <div className="agent-steps-toolbar-right">
+          <div className="chunk-view-segmented" role="group" aria-label="Steps format">
+            <button
+              type="button"
+              className={`chunk-view-btn ${formatMode === 'visual' ? 'active' : ''}`}
+              onClick={() => setFormatMode('visual')}
+              title="Clean step-by-step visual timeline"
+            >
+              <Sparkles size={12} />
+              <span>Visual</span>
+            </button>
+            <button
+              type="button"
+              className={`chunk-view-btn ${formatMode === 'json' ? 'active' : ''}`}
+              onClick={() => setFormatMode('json')}
+              title="Inspect raw JSON data"
+            >
+              <Code2 size={12} />
+              <span>JSON</span>
+            </button>
+          </div>
+
+          {formatMode === 'json' && (
+            <button
+              type="button"
+              className={`chunk-copy-btn ${copied ? 'copied' : ''}`}
+              onClick={handleCopyJson}
+              title="Copy JSON"
+            >
+              {copied ? <Check size={13} /> : <Copy size={13} />}
+              <span>{copied ? 'Copied' : 'Copy'}</span>
+            </button>
           )}
 
           <button
             type="button"
-            className={`tab-btn ${viewMode === 'pretty' ? 'active' : ''}`}
-            onClick={() => setViewMode('pretty')}
-            style={{ padding: '0.3rem 0.75rem', fontSize: '0.78rem' }}
+            className="steps-back-btn"
+            onClick={onBackToChat}
+            title="Return to conversation"
           >
-            <Sparkles size={13} />
-            Readable
+            <ArrowLeft size={13} />
+            <span>Back to Chat</span>
           </button>
-          <button
-            type="button"
-            className={`tab-btn ${viewMode === 'json' ? 'active' : ''}`}
-            onClick={() => setViewMode('json')}
-            style={{ padding: '0.3rem 0.75rem', fontSize: '0.78rem' }}
-          >
-            <Code2 size={13} />
-            JSON
-          </button>
-          {viewMode === 'json' && (
-            <button
-              type="button"
-              className="refresh-btn"
-              onClick={handleCopyJson}
-              title="Copy JSON"
-              style={{ color: copied ? 'var(--accent-emerald)' : 'var(--text-muted)' }}
-            >
-              {copied ? <Check size={14} /> : <Copy size={14} />}
-            </button>
-          )}
         </div>
       </div>
 
-      <div className="stream-inspector-body">
-        {viewMode === 'json' ? (
-          <pre style={{ margin: 0, color: '#a5b4fc', fontSize: '0.8rem' }}>
-            {JSON.stringify(displayedEvents, null, 2)}
-          </pre>
-        ) : effectiveScope === 'thread' ? (
-          <div>
-            {turnGroups.map((group) => (
-              <div key={`grp-${group.turnNumber}`} className="pretty-turn-group">
-                <div className="pretty-turn-divider">
-                  <span>Question #{group.turnNumber}</span>
-                  <span>
-                    {group.events.length} {group.events.length === 1 ? 'step' : 'steps'}
-                  </span>
-                </div>
-                {group.events.map((msg, idx) =>
-                  renderStreamEventItem(
-                    msg,
-                    `t${group.turnNumber}-m${idx}`,
-                    allThreadEvents
-                  )
-                )}
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div>
-            {events.map((msg, index) =>
-              renderStreamEventItem(msg, index, allThreadEvents)
-            )}
-          </div>
-        )}
-      </div>
+      {/* Body: Visual Step Timeline or Raw JSON */}
+      {formatMode === 'json' ? (
+        <div className="steps-json-panel">
+          <pre>{JSON.stringify(jsonPayload, null, 2)}</pre>
+        </div>
+      ) : (
+        <div className="steps-cards-list">
+          {displayedItems.map(({ turn, idx }) => {
+            const priorEventsReversed = turns
+              .slice(0, idx)
+              .reverse()
+              .flatMap((t) => (Array.isArray(t.events) ? t.events : []));
+            return (
+              <TurnStepsTimelineCard
+                key={turn.id}
+                turn={turn}
+                turnIndex={idx}
+                allPriorEvents={priorEventsReversed}
+                defaultExpandPassages={
+                  resolvedFilter !== 'all' || idx === turns.length - 1
+                }
+                onBackToChat={onBackToChat}
+              />
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -1403,11 +1673,11 @@ function ConversationTurnCard({
   priorTurns,
   onRetryTurn,
   onStopTurn,
+  onOpenSteps,
   agentLoading,
 }) {
   const [viewMode, setViewMode] = useState('rendered'); // 'rendered' | 'raw'
   const [copied, setCopied] = useState(false);
-  const [showStreamEvents, setShowStreamEvents] = useState(false);
 
   const turnEvents = Array.isArray(turn.events) ? turn.events : [];
   // Prioritize passages retrieved in the current turn, falling back to earlier turns in this conversation
@@ -1451,10 +1721,17 @@ function ConversationTurnCard({
               <span>Assistant</span>
             </div>
             {retrievalStats.chunksCount > 0 ? (
-              <span className="agent-grounding-badge">
-                {retrievalStats.chunksCount}{' '}
-                {retrievalStats.chunksCount === 1 ? 'passage' : 'passages'} used
-              </span>
+              <button
+                type="button"
+                className="agent-grounding-badge clickable"
+                onClick={() => onOpenSteps && onOpenSteps(turn.id)}
+                title="Click to inspect the search steps and matched passages"
+              >
+                <span>
+                  {retrievalStats.chunksCount}{' '}
+                  {retrievalStats.chunksCount === 1 ? 'passage' : 'passages'} used
+                </span>
+              </button>
             ) : retrievalStats.toolCallsCount > 0 && turn.status === 'done' ? (
               <span className="agent-grounding-badge muted">No matching passages</span>
             ) : turnIndex > 0 && turn.status === 'done' ? (
@@ -1504,15 +1781,15 @@ function ConversationTurnCard({
               </>
             )}
 
-            {turnEvents.length > 0 && (
+            {turnEvents.length > 0 && onOpenSteps && (
               <button
                 type="button"
                 className="btn-event-stream"
-                onClick={() => setShowStreamEvents((prev) => !prev)}
-                title="See how the assistant searched your documents"
+                onClick={() => onOpenSteps(turn.id)}
+                title="Open Search Steps view for this answer"
               >
                 <Search size={13} />
-                <span>{showStreamEvents ? 'Hide Steps' : 'View Steps'}</span>
+                <span>Search Steps</span>
               </button>
             )}
           </div>
@@ -1588,14 +1865,6 @@ function ConversationTurnCard({
             )}
           </>
         )}
-
-        {showStreamEvents && (
-          <PrettyPrintEventStream
-            events={turnEvents}
-            priorTurns={priorTurns}
-            turnNumber={turnIndex + 1}
-          />
-        )}
       </div>
     </div>
   );
@@ -1644,6 +1913,8 @@ export default function App() {
   const [agentCollection, setAgentCollection] = useState('');
   const [agentQuery, setAgentQuery] = useState('');
   const [agentEndpointMode, setAgentEndpointMode] = useState('stream'); // 'stream' | 'standard'
+  const [agentViewMode, setAgentViewMode] = useState('chat'); // 'chat' | 'steps'
+  const [focusedStepTurnId, setFocusedStepTurnId] = useState('latest');
   const [agentLoading, setAgentLoading] = useState(false);
 
   const fileInputRef = useRef(null);
@@ -1679,6 +1950,8 @@ export default function App() {
     setActiveThreadId(freshThread.id);
     setAgentCollection('');
     setAgentQuery('');
+    setAgentViewMode('chat');
+    setFocusedStepTurnId('latest');
     setAgentLoading(false);
     setNotification(null);
   };
@@ -2065,6 +2338,9 @@ export default function App() {
       return;
     }
 
+    setAgentViewMode('chat');
+    setFocusedStepTurnId('latest');
+
     if (current && current.turns.length === 0) {
       setAgentThreads((prev) =>
         prev.map((t) =>
@@ -2119,6 +2395,8 @@ export default function App() {
       setActiveThreadId(fresh.id);
     }
 
+    setAgentViewMode('chat');
+    setFocusedStepTurnId('latest');
     setAgentQuery('');
     setNotification(null);
     setTimeout(() => agentInputRef.current?.focus(), 30);
@@ -2130,6 +2408,8 @@ export default function App() {
     if (thread.collection && collections.includes(thread.collection)) {
       setAgentCollection(thread.collection);
     }
+    setAgentViewMode('chat');
+    setFocusedStepTurnId('latest');
     setNotification(null);
   };
 
@@ -2142,6 +2422,8 @@ export default function App() {
       const fresh = createConversationThread(fallbackCol);
       setAgentThreads([fresh]);
       setActiveThreadId(fresh.id);
+      setAgentViewMode('chat');
+      setFocusedStepTurnId('latest');
     } else {
       setAgentThreads(remaining);
       if (activeThreadId === threadId) {
@@ -2150,8 +2432,15 @@ export default function App() {
         if (nextActive.collection && collections.includes(nextActive.collection)) {
           setAgentCollection(nextActive.collection);
         }
+        setAgentViewMode('chat');
+        setFocusedStepTurnId('latest');
       }
     }
+  };
+
+  const handleOpenTurnSteps = (turnId) => {
+    setFocusedStepTurnId(turnId || 'latest');
+    setAgentViewMode('steps');
   };
 
   const handleStopAgent = () => {
@@ -2246,6 +2535,7 @@ export default function App() {
     if (!retryTurnId) {
       setAgentQuery('');
     }
+    setFocusedStepTurnId(turnId);
     setAgentLoading(true);
 
     setTimeout(() => {
@@ -2982,16 +3272,55 @@ export default function App() {
                     </h2>
                   </div>
 
-                  <button
-                    type="button"
-                    className="btn-new-thread"
-                    onClick={handleNewThread}
-                    disabled={agentLoading || (activeTurns.length === 0 && agentThreads.length <= 1)}
-                    title="Start a new chat"
-                  >
-                    <MessageSquarePlus size={15} />
-                    <span>New Chat</span>
-                  </button>
+                  <div className="agent-workspace-header-actions">
+                    <div
+                      className="agent-main-view-toggle"
+                      role="tablist"
+                      aria-label="Assistant view"
+                    >
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={agentViewMode === 'chat'}
+                        className={`agent-main-view-btn ${
+                          agentViewMode === 'chat' ? 'active' : ''
+                        }`}
+                        onClick={() => setAgentViewMode('chat')}
+                      >
+                        <MessageSquare size={14} />
+                        <span>Chat</span>
+                      </button>
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={agentViewMode === 'steps'}
+                        className={`agent-main-view-btn ${
+                          agentViewMode === 'steps' ? 'active' : ''
+                        }`}
+                        onClick={() => setAgentViewMode('steps')}
+                        title="See how the assistant searched your documents for each question"
+                      >
+                        <Search size={14} />
+                        <span>Search Steps</span>
+                        {activeTurns.length > 0 && (
+                          <span className="agent-view-toggle-count">
+                            {activeTurns.length}
+                          </span>
+                        )}
+                      </button>
+                    </div>
+
+                    <button
+                      type="button"
+                      className="btn-new-thread"
+                      onClick={handleNewThread}
+                      disabled={agentLoading || (activeTurns.length === 0 && agentThreads.length <= 1)}
+                      title="Start a new chat"
+                    >
+                      <MessageSquarePlus size={15} />
+                      <span>New Chat</span>
+                    </button>
+                  </div>
                 </div>
 
                 <p className="agent-workspace-subtitle">
@@ -3129,148 +3458,160 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Conversation Timeline */}
-                <div className="agent-chat-feed">
-                  {activeTurns.length === 0 ? (
-                    <div className="agent-empty-thread">
-                      <div className="agent-empty-icon-wrap">
-                        <MessageSquare size={22} />
-                      </div>
-                      <h3 className="agent-empty-title">
-                        Ask Anything About Your Documents
-                      </h3>
-                      <p className="agent-empty-desc">
-                        Ask a question
-                        {effectiveCollection ? (
-                          <>
-                            {' '}
-                            about <strong>{effectiveCollection}</strong>
-                          </>
-                        ) : null}{' '}
-                        below, or choose an example to get started. Follow-up questions
-                        automatically keep context from earlier answers.
-                      </p>
-                      {effectiveCollection && (
-                        <div className="agent-starter-chips">
-                          {STARTER_PROMPTS.map((promptText, pIdx) => (
-                            <button
-                              key={pIdx}
-                              type="button"
-                              className="agent-starter-chip"
-                              onClick={() => {
-                                setAgentQuery(promptText);
-                                agentInputRef.current?.focus();
-                              }}
-                            >
-                              <Sparkles size={12} className="agent-starter-chip-icon" />
-                              <span>{promptText}</span>
-                            </button>
+                {agentViewMode === 'steps' ? (
+                  <AgentSearchStepsView
+                    turns={activeTurns}
+                    focusedTurnId={focusedStepTurnId}
+                    onSelectTurnFilter={setFocusedStepTurnId}
+                    onBackToChat={() => setAgentViewMode('chat')}
+                  />
+                ) : (
+                  <>
+                    {/* Conversation Timeline */}
+                    <div className="agent-chat-feed">
+                      {activeTurns.length === 0 ? (
+                        <div className="agent-empty-thread">
+                          <div className="agent-empty-icon-wrap">
+                            <MessageSquare size={22} />
+                          </div>
+                          <h3 className="agent-empty-title">
+                            Ask Anything About Your Documents
+                          </h3>
+                          <p className="agent-empty-desc">
+                            Ask a question
+                            {effectiveCollection ? (
+                              <>
+                                {' '}
+                                about <strong>{effectiveCollection}</strong>
+                              </>
+                            ) : null}{' '}
+                            below, or choose an example to get started. Follow-up questions
+                            automatically keep context from earlier answers.
+                          </p>
+                          {effectiveCollection && (
+                            <div className="agent-starter-chips">
+                              {STARTER_PROMPTS.map((promptText, pIdx) => (
+                                <button
+                                  key={pIdx}
+                                  type="button"
+                                  className="agent-starter-chip"
+                                  onClick={() => {
+                                    setAgentQuery(promptText);
+                                    agentInputRef.current?.focus();
+                                  }}
+                                >
+                                  <Sparkles size={12} className="agent-starter-chip-icon" />
+                                  <span>{promptText}</span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="agent-turns-timeline">
+                          {activeTurns.map((turn, idx) => (
+                            <ConversationTurnCard
+                              key={turn.id}
+                              turn={turn}
+                              turnIndex={idx}
+                              priorTurns={activeTurns.slice(0, idx)}
+                              onRetryTurn={handleRetryTurn}
+                              onStopTurn={
+                                turn.status === 'streaming' ? handleStopAgent : null
+                              }
+                              onOpenSteps={handleOpenTurnSteps}
+                              agentLoading={agentLoading}
+                            />
                           ))}
+                          <div ref={conversationEndRef} />
                         </div>
                       )}
                     </div>
-                  ) : (
-                    <div className="agent-turns-timeline">
-                      {activeTurns.map((turn, idx) => (
-                        <ConversationTurnCard
-                          key={turn.id}
-                          turn={turn}
-                          turnIndex={idx}
-                          priorTurns={activeTurns.slice(0, idx)}
-                          onRetryTurn={handleRetryTurn}
-                          onStopTurn={
-                            turn.status === 'streaming' ? handleStopAgent : null
-                          }
-                          agentLoading={agentLoading}
-                        />
-                      ))}
-                      <div ref={conversationEndRef} />
-                    </div>
-                  )}
-                </div>
 
-                {/* Question Composer */}
-                <form className="agent-composer-form" onSubmit={handleAgentSubmit}>
-                  <div className="agent-composer-header">
-                    {activeTurns.length > 0 ? (
-                      <span className="composer-memory-cue follow-up">
-                        <CornerDownLeft size={13} />
-                        <span>
-                          Follow-up question
-                          {effectiveCollection ? (
-                            <>
-                              {' '}
-                              in <code>{effectiveCollection}</code>
-                            </>
-                          ) : null}
-                        </span>
-                      </span>
-                    ) : (
-                      <span className="composer-memory-cue">
-                        <span>Your question</span>
-                      </span>
-                    )}
+                    {/* Question Composer */}
+                    <form className="agent-composer-form" onSubmit={handleAgentSubmit}>
+                      <div className="agent-composer-header">
+                        {activeTurns.length > 0 ? (
+                          <span className="composer-memory-cue follow-up">
+                            <CornerDownLeft size={13} />
+                            <span>
+                              Follow-up question
+                              {effectiveCollection ? (
+                                <>
+                                  {' '}
+                                  in <code>{effectiveCollection}</code>
+                                </>
+                              ) : null}
+                            </span>
+                          </span>
+                        ) : (
+                          <span className="composer-memory-cue">
+                            <span>Your question</span>
+                          </span>
+                        )}
 
-                    {activeTurns.length > 0 && !agentLoading && (
-                      <button
-                        type="button"
-                        className="composer-reset-link"
-                        onClick={handleNewThread}
-                      >
-                        <PlusCircle size={12} />
-                        <span>New chat</span>
-                      </button>
-                    )}
-                  </div>
+                        {activeTurns.length > 0 && !agentLoading && (
+                          <button
+                            type="button"
+                            className="composer-reset-link"
+                            onClick={handleNewThread}
+                          >
+                            <PlusCircle size={12} />
+                            <span>New chat</span>
+                          </button>
+                        )}
+                      </div>
 
-                  <textarea
-                    ref={agentInputRef}
-                    rows={activeTurns.length > 0 ? 2 : 3}
-                    className="form-textarea agent-composer-textarea"
-                    placeholder={
-                      activeTurns.length > 0
-                        ? 'Ask a follow-up question (e.g., Explain the second point in more detail, or compare those numbers in a table)…'
-                        : 'Ask a question about your documents (e.g., Summarize the main takeaways and cite the pages)…'
-                    }
-                    value={agentQuery}
-                    onChange={(e) => setAgentQuery(e.target.value)}
-                    onKeyDown={handleAgentKeyDown}
-                    disabled={apiStatus === 'offline'}
-                  />
-
-                  <div className="agent-composer-footer">
-                    <span className="composer-shortcut-hint">
-                      Press <kbd>Enter</kbd> to send · <kbd>Shift</kbd> +{' '}
-                      <kbd>Enter</kbd> for new line
-                    </span>
-
-                    {agentLoading ? (
-                      <button
-                        type="button"
-                        className="btn-stop-agent"
-                        onClick={handleStopAgent}
-                      >
-                        <Square size={14} />
-                        <span>Stop</span>
-                      </button>
-                    ) : (
-                      <button
-                        type="submit"
-                        className="btn-send-agent"
-                        disabled={
-                          apiStatus === 'offline' ||
-                          !effectiveCollection ||
-                          !agentQuery.trim()
+                      <textarea
+                        ref={agentInputRef}
+                        rows={activeTurns.length > 0 ? 2 : 3}
+                        className="form-textarea agent-composer-textarea"
+                        placeholder={
+                          activeTurns.length > 0
+                            ? 'Ask a follow-up question (e.g., Explain the second point in more detail, or compare those numbers in a table)…'
+                            : 'Ask a question about your documents (e.g., Summarize the main takeaways and cite the pages)…'
                         }
-                      >
-                        <Send size={15} />
-                        <span>
-                          {activeTurns.length > 0 ? 'Send' : 'Ask'}
+                        value={agentQuery}
+                        onChange={(e) => setAgentQuery(e.target.value)}
+                        onKeyDown={handleAgentKeyDown}
+                        disabled={apiStatus === 'offline'}
+                      />
+
+                      <div className="agent-composer-footer">
+                        <span className="composer-shortcut-hint">
+                          Press <kbd>Enter</kbd> to send · <kbd>Shift</kbd> +{' '}
+                          <kbd>Enter</kbd> for new line
                         </span>
-                      </button>
-                    )}
-                  </div>
-                </form>
+
+                        {agentLoading ? (
+                          <button
+                            type="button"
+                            className="btn-stop-agent"
+                            onClick={handleStopAgent}
+                          >
+                            <Square size={14} />
+                            <span>Stop</span>
+                          </button>
+                        ) : (
+                          <button
+                            type="submit"
+                            className="btn-send-agent"
+                            disabled={
+                              apiStatus === 'offline' ||
+                              !effectiveCollection ||
+                              !agentQuery.trim()
+                            }
+                          >
+                            <Send size={15} />
+                            <span>
+                              {activeTurns.length > 0 ? 'Send' : 'Ask'}
+                            </span>
+                          </button>
+                        )}
+                      </div>
+                    </form>
+                  </>
+                )}
               </div>
             );
           })()}
