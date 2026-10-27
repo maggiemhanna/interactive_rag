@@ -27,8 +27,8 @@ flowchart TB
 
     subgraph LockedCloudRun["Cloud Run (INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER)"]
         FE["frontend\n(Static React SPA + Nginx)"]
-        Ingest["ingestion-api (src/add_documents.py)\nDirect VPC Egress: ALL_TRAFFIC"]
-        Agent["agent-api (src/agentic_rag.py)\nDirect VPC Egress: ALL_TRAFFIC"]
+        Ingest["ingestion-api (src/ingestion/app.py)\nDirect VPC Egress: ALL_TRAFFIC"]
+        Agent["agent-api (src/agent/app.py)\nDirect VPC Egress: ALL_TRAFFIC"]
     end
 
     subgraph CustomVPC["Private Custom VPC (No Public Internet Route)"]
