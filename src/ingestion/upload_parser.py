@@ -1,96 +1,71 @@
+"""HTTP upload parser, binary PDF validator, and per-request `/tmp` staging manager.
+
+Handles both `multipart/form-data` binary PDF uploads and local-dev `application/json`
+`pdf_paths` payloads for `POST /ingest`:
+- Blocks `pdf_paths` server filesystem reads inside Cloud Run (`HTTP 403`).
+- Validates `%PDF-` magic header bytes, non-empty payloads, `MAX_UPLOAD_MB` (`HTTP 413`),
+  `MAX_FILES_PER_REQUEST` (`HTTP 400`), and `MAX_CHUNKS_PER_INGEST` (`HTTP 400`).
+- Optionally archives validated PDFs to `gs://<bucket>/users/{uid}/uploads/` and guarantees
+  per-request `/tmp/uploads/{uid}/{request_uuid}` cleanup inside a `finally` block.
+"""
+
 import contextlib
-import os
-import re
-import shutil
-import uuid
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+import os
+import shutil
+from typing import Any, Dict, List, Optional, Tuple
+import uuid
 
 from fastapi import HTTPException, Request
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from src.core.auth import is_cloud_run
-from src.core.config import (
-    get_max_chunks_per_ingest,
-    get_max_files_per_request,
-    get_max_upload_mb,
+from src.core.ai_security.guardrails import (
+    validate_chunk_count,
+    validate_collection_name,
+    validate_embedding_model,
+    validate_file_count,
 )
+from src.core.config import get_max_upload_mb, is_cloud_run
 from src.core.logger import setup_logging
-from src.core.security import validate_collection_name, validate_embedding_model
 from src.core.storage import archive_upload, get_bucket_name, get_upload_user_dir
+from src.ingestion.splitter import sanitize_filename, split_pdfs
 
-logger = setup_logging(name="ingestion.loader")
+logger = setup_logging(name="ingestion.upload_parser")
 
-_SAFE_UPLOAD_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 _PDF_MAGIC_PREFIX = b"%PDF-"
 
 
 @dataclass
 class IngestPayload:
+    """Validated and chunked document ingestion payload ready for Chroma indexing.
+
+    Attributes:
+        chunks: Split LangChain `Document` chunks enriched with `source` and optional `gcs_uri`.
+        processed_files: Ordered list of sanitized filenames or local paths processed.
+        collection_name: Validated target Chroma collection identifier.
+        embedding_model: Approved Vertex AI embedding model identifier.
+    """
+
     chunks: List[Document]
     processed_files: List[str]
     collection_name: str
     embedding_model: str
 
 
-def sanitize_filename(raw_filename: str) -> str:
-    """Strips path components and enforces a safe .pdf filename."""
-    basename = os.path.basename((raw_filename or "").replace("\\", "/")).strip()
-    cleaned = _SAFE_UPLOAD_NAME_RE.sub("_", basename).strip("._")
-    if not cleaned:
-        cleaned = "document.pdf"
-    if not cleaned.lower().endswith(".pdf"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Only PDF uploads are supported (received '{basename or raw_filename}').",
-        )
-    return cleaned
-
-
-def split_pdfs(
-    pdf_paths: Union[str, List[str]], chunk_size: int = 1000, chunk_overlap: int = 200
-) -> List[Document]:
-    """Loads PDF documents and splits them into text chunks.
+def _parse_json_body(
+    body: Dict[str, Any],
+) -> Tuple[List[str], Optional[str], Optional[str]]:
+    """Extracts `pdf_paths`, `collection_name`, and `embedding_model` from a JSON request body.
 
     Args:
-        pdf_paths: Path or list of paths to PDF files.
-        chunk_size: Target character count per chunk.
-        chunk_overlap: Overlap character count between consecutive chunks.
+        body: Parsed JSON dictionary from `await request.json()`.
 
     Returns:
-        List of document chunks across all PDFs.
+        Tuple `(raw_server_paths, collection_name, embedding_model)`.
+
+    Raises:
+        HTTPException: HTTP 422 if `embedding_model` is provided with a non-string type.
     """
-    if isinstance(pdf_paths, str):
-        pdf_paths = [pdf_paths]
-
-    all_chunks: List[Document] = []
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size, chunk_overlap=chunk_overlap
-    )
-
-    for pdf_path in pdf_paths:
-        if not os.path.exists(pdf_path):
-            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-
-        try:
-            pdf_loader = PyPDFLoader(pdf_path)
-            pages = pdf_loader.load()
-            logger.info(f"Loaded PDF '{pdf_path}' ({len(pages)} pages).")
-            chunks = text_splitter.split_documents(pages)
-            logger.info(f"Split PDF '{pdf_path}' into {len(chunks)} chunks.")
-            all_chunks.extend(chunks)
-        except Exception as e:
-            logger.error(f"Error loading PDF '{pdf_path}': {e}")
-            raise
-
-    return all_chunks
-
-
-def _parse_json_body(
-    body: dict,
-) -> Tuple[List[str], Optional[str], Optional[str]]:
     raw_server_paths: List[str] = []
     raw_paths = body.get("pdf_paths")
     if isinstance(raw_paths, str) and raw_paths.strip():
@@ -110,7 +85,18 @@ def _validate_ingest_params(
     collection_name: Optional[str],
     embedding_model: Optional[str],
 ) -> Tuple[str, str]:
-    """Validates `collection_name` and `embedding_model`, raising HTTP 422 on invalid input."""
+    """Validates `collection_name` and `embedding_model`, raising HTTP 422 on invalid input.
+
+    Args:
+        collection_name: Candidate Chroma collection identifier.
+        embedding_model: Optional candidate Vertex AI embedding model identifier.
+
+    Returns:
+        Tuple `(safe_collection_name, safe_embedding_model)`.
+
+    Raises:
+        HTTPException: HTTP 422 when either parameter fails guardrail validation.
+    """
     try:
         safe_col = validate_collection_name(collection_name)
         safe_emb = validate_embedding_model(embedding_model)
@@ -119,18 +105,44 @@ def _validate_ingest_params(
         raise HTTPException(status_code=422, detail=str(e))
 
 
+def _enforce_file_ceiling(count: int) -> None:
+    """Enforces `MAX_FILES_PER_REQUEST`, mapping `ValueError` to `HTTP 400`."""
+    try:
+        validate_file_count(count)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def _enforce_chunk_ceiling(count: int) -> None:
+    """Enforces `MAX_CHUNKS_PER_INGEST`, mapping `ValueError` to `HTTP 400`."""
+    try:
+        validate_chunk_count(count)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 async def prepare_payload(request: Request, uid: str) -> IngestPayload:
-    """Parses JSON or multipart PDF uploads, enforces upload ceilings, splits chunks, and cleans /tmp."""
+    """Parses JSON or multipart PDF uploads, enforces upload ceilings, splits chunks, and cleans `/tmp`.
+
+    Args:
+        request: Incoming FastAPI `Request` (`multipart/form-data` or `application/json`).
+        uid: Verified tenant user identifier.
+
+    Returns:
+        `IngestPayload` containing validated document chunks and collection metadata.
+
+    Raises:
+        HTTPException: HTTP 400/403/413/422 when validation, signature, or ceiling checks fail.
+        FileNotFoundError: When a local-dev `pdf_paths` entry does not exist on disk.
+    """
     content_type = request.headers.get("content-type", "")
     raw_server_paths: List[str] = []
     uploaded_files_info: List[Tuple[str, str, Optional[str]]] = []  # (local_path, display_name, gcs_uri)
     collection_name: str = ""
     embedding_model: str = ""
 
-    max_files = get_max_files_per_request()
     max_upload_mb = get_max_upload_mb()
     max_upload_bytes = max_upload_mb * 1024 * 1024
-    max_chunks = get_max_chunks_per_ingest()
 
     user_upload_dir = get_upload_user_dir(uid)
     request_upload_dir: Optional[str] = None
@@ -173,15 +185,7 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                     files = form.getlist("file")
 
                 valid_uploads = [f for f in files if hasattr(f, "filename") and f.filename]
-                total_requested_files = len(valid_uploads) + len(raw_server_paths)
-                if total_requested_files > max_files:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"Too many PDF files in a single request (received {total_requested_files}, "
-                            f"maximum allowed is {max_files})."
-                        ),
-                    )
+                _enforce_file_ceiling(len(valid_uploads) + len(raw_server_paths))
 
                 if valid_uploads:
                     request_upload_dir = os.path.join(user_upload_dir, uuid.uuid4().hex)
@@ -253,14 +257,7 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                 detail="Server-side filesystem 'pdf_paths' ingestion is disabled in Cloud Run. Please upload PDF files directly.",
             )
 
-        if len(raw_server_paths) > max_files:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Too many PDF files in a single request (received {len(raw_server_paths)}, "
-                    f"maximum allowed is {max_files})."
-                ),
-            )
+        _enforce_file_ceiling(len(raw_server_paths))
 
         if not uploaded_files_info and not raw_server_paths:
             raise HTTPException(
@@ -279,28 +276,14 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                 if gcs_uri:
                     chunk.metadata["gcs_uri"] = gcs_uri
             all_chunks.extend(file_chunks)
-            if len(all_chunks) > max_chunks:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Ingestion exceeded the maximum allowed {max_chunks} chunks per request "
-                        f"(already reached {len(all_chunks)} chunks). Please upload smaller or fewer PDFs."
-                    ),
-                )
+            _enforce_chunk_ceiling(len(all_chunks))
             processed_files.append(display_name)
 
         # 2. Load & split local server paths (local dev mode only)
         for server_path in raw_server_paths:
             file_chunks = split_pdfs([server_path])
             all_chunks.extend(file_chunks)
-            if len(all_chunks) > max_chunks:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Ingestion exceeded the maximum allowed {max_chunks} chunks per request "
-                        f"(already reached {len(all_chunks)} chunks). Please upload smaller or fewer PDFs."
-                    ),
-                )
+            _enforce_chunk_ceiling(len(all_chunks))
             processed_files.append(server_path)
 
         return IngestPayload(
@@ -315,3 +298,6 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
         with contextlib.suppress(OSError):
             if os.path.exists(user_upload_dir) and not os.listdir(user_upload_dir):
                 os.rmdir(user_upload_dir)
+
+
+__all__ = ["IngestPayload", "prepare_payload"]

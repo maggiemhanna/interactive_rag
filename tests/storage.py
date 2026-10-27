@@ -11,7 +11,7 @@ from unittest.mock import patch
 import chromadb
 from google.api_core import exceptions as gcs_exceptions
 
-from src.core import storage as chroma_storage
+from src.core.storage import gcs_sync as gcs_sync_module
 from src.core.logger import setup_logging
 from src.core.storage import (
     LockTimeoutError,
@@ -157,7 +157,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
         return base
 
     def test_01_strict_per_user_isolation_same_collection_name(self):
-        with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container1_tmp), clear=False
         ):
             # Alice creates 'stock_market_vs' with 2 documents
@@ -181,7 +181,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
                 )
 
             # Verify isolated reads on a completely fresh container (container 2)
-        with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container2_tmp), clear=False
         ):
             alice_read_dir = sync_user_dir("user_alice")
@@ -199,7 +199,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
 
     def test_02_cross_service_version_invalidation_refreshes_cached_chroma_client(self):
         # Step 1: Container 1 (ingestion-api) writes 1 doc
-        with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container1_tmp), clear=False
         ):
             with user_write_lock("user_alice") as dir_c1:
@@ -207,14 +207,14 @@ class TestPerUserChromaStorage(unittest.TestCase):
                 col.add(ids=["1"], documents=["Doc 1"], embeddings=[[0.1, 0.2, 0.3]])
 
         # Step 2: Container 2 (agent-api) syncs and opens PersistentClient (populates Chroma internal cache)
-        with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container2_tmp), clear=False
         ):
             dir_c2 = sync_user_dir("user_alice")
             self.assertEqual(chromadb.PersistentClient(path=dir_c2).get_collection("reports").count(), 1)
 
         # Step 3: Container 1 adds a second doc -> bumps version.json in GCS
-        with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container1_tmp), clear=False
         ):
             with user_write_lock("user_alice") as dir_c1:
@@ -222,7 +222,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
                 col.add(ids=["2"], documents=["Doc 2"], embeddings=[[0.4, 0.5, 0.6]])
 
         # Step 4: Container 2 syncs again -> detects version bump, invalidates Chroma system cache, sees 2 docs!
-        with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container2_tmp), clear=False
         ):
             dir_c2_refreshed = sync_user_dir("user_alice")
@@ -232,7 +232,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
             )
 
     def test_03_deleted_collection_cleans_up_remote_gcs_blobs(self):
-        with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container1_tmp), clear=False
         ):
             with user_write_lock("user_alice") as alice_dir:
@@ -252,7 +252,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
             self.assertLessEqual(len(blobs_after), len(blobs_before))
 
         # Fresh container only sees 'keep_me'
-        with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container2_tmp), clear=False
         ):
             restored_dir = sync_user_dir("user_alice")
@@ -273,7 +273,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
             expired_lock, if_generation_match=0
         )
 
-        with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container1_tmp), clear=False
         ):
             # Should recover expired lock automatically and release it afterward
@@ -298,7 +298,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
             active_lock, if_generation_match=0
         )
 
-        with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ,
             self._env(self.container1_tmp, CHROMA_LOCK_TIMEOUT_SECONDS="0.4"),
             clear=False,
@@ -308,7 +308,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
                     pass
 
     def test_05_lru_tmp_eviction_preserves_active_users_and_evicts_oldest_inactive(self):
-        with patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket), patch.dict(
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container1_tmp), clear=False
         ):
             for uid in ("u_oldest", "u_middle", "u_newest"):

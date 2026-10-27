@@ -145,9 +145,9 @@ flowchart TB
 
 ### Phase 4: Policy Enforcement (Fail-Closed Screening, Rate Limits, Collection Quotas & Pre-Deploy Checks)
 - [ ] **Fail-Closed Model Armor Enforcement:**
-  - Update `src/core/config.py` and `src/core/security.py`: Add `MODEL_ARMOR_FAIL_CLOSED` (default `"false"` locally, set to `"true"` in `infra/cloud_run.tf`). Raise `SecurityScreeningUnavailableError` on upstream Model Armor / DLP errors when fail-closed is active, returning `HTTP 503` in `src/agent/app.py` / `src/agent/stream.py` with an audit event.
+  - Update `src/core/config.py` and `src/core/ai_security/armor.py`: Add `MODEL_ARMOR_FAIL_CLOSED` (default `"false"` locally, set to `"true"` in `infra/cloud_run.tf`). Raise `SecurityScreeningUnavailableError` on upstream Model Armor / DLP errors when fail-closed is active, returning `HTTP 503` in `src/agent/app.py` / `src/agent/stream.py` / `src/ingestion/app.py` with an audit event.
 - [ ] **Per-User Rate Limits & Collection Count Quota:**
-  - Create `src/core/policy.py`:
+  - Create `src/core/compliance/policy.py`:
     - Sliding-window per-UID rate limiters enforcing `RATE_LIMIT_INGEST_PER_MINUTE` (default `10`) and `RATE_LIMIT_QUERY_PER_MINUTE` (default `30`), raising `HTTP 429` with `Retry-After` header and emitting `policy.rate_limit_exceeded` audit events.
     - `enforce_collection_quota(uid, collection_name)` enforcing `MAX_COLLECTIONS_PER_USER` (default `20`) when creating a **new** collection (raising `HTTP 403` and emitting `policy.collection_quota_exceeded`), while allowing appends to existing collections.
   - Wire rate limits and collection quotas into `src/ingestion/app.py`, `src/agent/app.py`, `infra/variables.tf`, `infra/terraform.tfvars.example`, and `infra/cloud_run.tf`.
@@ -186,18 +186,16 @@ flowchart TB
 | `infra/load_balancer.tf` | Modify | Enable HTTP access `log_config` on `ingestion_backend` and `agent_backend` |
 | `infra/outputs.tf` | Modify | Export regional audit log bucket ID, audit sink writer identity, and pinned `GOOGLE_CLOUD_LOCATION` |
 | `src/core/config.py` | Modify | Unify on `GOOGLE_CLOUD_LOCATION` (drop `DEFAULT_LOCATION`), add `MODEL_ARMOR_FAIL_CLOSED`, `RATE_LIMIT_*`, and `MAX_COLLECTIONS_PER_USER` |
-| `src/core/security.py` | Modify | Add `validate_gcp_region()` and fail-closed `SecurityScreeningUnavailableError` handling |
-| `src/core/chroma.py` | Modify | Pass `location=validate_gcp_region()` explicitly to `GoogleGenerativeAIEmbeddings` |
-| `src/core/audit.py` | **Create** | `contextvars` trace/request correlation, SHA-256 query hashing, and `emit_audit_event()` shipping directly to GCP Cloud Logging (`interactiverag-audit`) |
-| `src/core/policy.py` | **Create** | Per-UID sliding-window rate limiters (`429`) and `MAX_COLLECTIONS_PER_USER` quota enforcer (`403`) |
-| `src/core/storage.py` | Modify | Add `get_user_data_inventory(uid)` and version-aware `purge_all_user_data(uid)` |
-| `src/core/routes.py` | Modify | Add correlation middleware, collection audit events, and `GET/DELETE /compliance/my-data` DSAR routes |
+| `src/core/ai_security/` | **Create** | Modular AI security package (`armor.py`, `safety.py`, `guardrails.py`) including fail-closed `SecurityScreeningUnavailableError` handling |
+| `src/core/storage/` | **Create** | Modular multi-tenant persistence package (`paths.py`, `gcs_sync.py`, `locks.py`, `chroma.py`, `routes.py`) with regional Vertex AI embeddings |
+| `src/core/compliance/` | **Create** | Modular compliance & governance package (`residency.py`, `context.py`, `audit.py`, `provenance.py`, `dsar.py`, `routes.py`, and Phase 4 `policy.py`) |
+| `src/core/app_factory.py` | **Create** | Shared FastAPI factory wiring CORS, `AuditCorrelationMiddleware`, `/collections`, and `/compliance/my-data` |
 | `src/core/auth.py` | Modify | Emit structured audit events on authentication failures (`check_revoked=False` preserved) |
 | `src/ingestion/app.py` | Modify | Enforce ingest/query rate limits & collection quota; emit structured audit events |
 | `src/ingestion/service.py` | Modify | Scrub raw query text from similarity-search logs |
-| `src/agent/memory.py` | Modify | Add `clear_user_memory(uid)` for GDPR Art. 17 erasure of `{uid}:*` threads |
-| `src/agent/schemas.py` | Modify | Add `ComplianceMetadata` model to `AgentResponse` |
-| `src/agent/graph.py` | Modify | Replace `DEFAULT_LOCATION` with `validate_gcp_region()`, emit screening/redaction audit events, and record PII redaction flag |
+| `src/agent/memory.py` | **Create** | Tenant-namespaced `MEMORY_SAVER` checkpoints and `purge_user_memory_threads(uid)` for GDPR Art. 17 erasure |
+| `src/agent/schemas.py` | Modify | Attach `ComplianceMetadata` model to `AgentResponse` |
+| `src/agent/graph.py` | Modify | Pin `validate_gcp_region()` on `ChatGoogleGenerativeAI` and screen input/output via `src.core.ai_security` |
 | `src/agent/app.py` | Modify | Scrub raw query logs, enforce query rate limit, handle fail-closed `503`, attach `compliance` metadata, and register memory purge hook |
 | `src/agent/stream.py` | Modify | Scrub raw query logs, handle fail-closed `503` SSE frames, and emit `compliance` metadata in SSE output |
 | `frontend/src/api.js` | Modify | Add `fetchMyDataInventory()` and `deleteMyData()` API helpers |

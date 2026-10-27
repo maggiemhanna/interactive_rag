@@ -1,7 +1,15 @@
+"""Rich terminal formatting utilities for interactive LangGraph CLI sessions.
+
+Renders structured color-coded console dividers, Markdown bodies, and tool-call tables
+for `SystemMessage`, `HumanMessage`, `AIMessage`, and `ToolMessage` events during local
+interactive debugging.
+"""
+
 import logging
+from typing import Any, Dict, Sequence
 import warnings
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -14,14 +22,22 @@ warnings.filterwarnings("ignore")
 console = Console()
 
 
-def print_event(message):
-    def print_message_header(label, color):
+def print_event(message: BaseMessage) -> None:
+    """Renders a single LangChain `BaseMessage` (including tool calls or tool output) to the console.
+
+    Args:
+        message: LangChain `SystemMessage`, `HumanMessage`, `AIMessage`, or `ToolMessage` instance.
+    """
+
+    def print_message_header(label: str, color: str) -> None:
+        """Prints a centered horizontal divider header for a message role."""
         box_width = 112
         padding = (box_width - len(label)) // 2
         text = f"\n[bold {color}]{'-' * padding} {label} {'-' * (box_width - len(label) - padding)}[/bold {color}]"
         console.print(text)
 
-    def format_tool_calls(tool_calls):
+    def format_tool_calls(tool_calls: Sequence[Dict[str, Any]]) -> None:
+        """Renders an `AIMessage`'s structured tool calls inside a Rich `Panel` grid."""
         # Create a table for displaying tools and arguments
         table = Table.grid(padding=(0, 1))
         table.add_column(style="bold")
@@ -44,20 +60,21 @@ def print_event(message):
 
     if isinstance(message, SystemMessage):
         print_message_header("System Message", "blue")
-        console.print(Markdown(message.content))
+        console.print(Markdown(str(message.content)))
 
     if isinstance(message, HumanMessage):
         print_message_header("Human Message", "green")
-        console.print(Markdown(message.content))
+        console.print(Markdown(str(message.content)))
 
     elif isinstance(message, AIMessage):
         print_message_header("AI Message", "magenta")
         if message.content:
             if isinstance(message.content, list):
                 for item in message.content:
-                    console.print(Markdown(item["text"]))
+                    if isinstance(item, dict) and "text" in item:
+                        console.print(Markdown(str(item["text"])))
             else:
-                console.print(Markdown(message.content))
+                console.print(Markdown(str(message.content)))
 
         # Handle tool calls if they exist
         if message.tool_calls:
@@ -67,12 +84,21 @@ def print_event(message):
         print_message_header("Tool Message", "red")
         console.print(f"[bold]Tool Name: [/bold]{message.name}")
         console.print("[bold]Tool Result:[/bold]")
-        console.print(Markdown(message.content))
+        console.print(Markdown(str(message.content)))
 
 
-def print_header(label, color):
+def print_header(label: str, color: str) -> None:
+    """Prints a centered Rich banner `Panel` when launching the CLI or FastAPI server.
+
+    Args:
+        label: Banner title text to center inside the panel.
+        color: Rich style color name (e.g., `'magenta'`).
+    """
     box_width = 112
     padding = (box_width - len(label)) // 2
     text = f"{' ' * padding}{label}{' ' * (box_width - len(label) - padding)}"
     panel = Panel(text, expand=False, style=color)
     console.print(panel)
+
+
+__all__ = ["console", "print_event", "print_header"]

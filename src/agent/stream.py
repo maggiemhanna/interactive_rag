@@ -1,3 +1,10 @@
+"""LangGraph event stream deduplication, bounded recursion handling, and SSE payload generators.
+
+Provides both internal Python generators (`stream_events`) and FastAPI `text/event-stream`
+generators (`stream_sse`) that pin per-user `/tmp` Chroma caches, enforce `AGENT_RECURSION_LIMIT`,
+emit EU AI Act Art. 50 `compliance` frames, and publish PII-free audit events.
+"""
+
 import json
 import os
 from typing import Any, Dict, Generator, Optional
@@ -8,15 +15,16 @@ from langgraph.errors import GraphRecursionError
 
 from src.agent.display import print_event, print_header
 from src.agent.graph import build_agent
-from src.agent.schemas import AgentRequest, build_compliance_metadata
+from src.agent.memory import MEMORY_SAVER
+from src.agent.schemas import AgentRequest
 from src.agent.tools import get_retriever_tool
-from src.core.audit import emit_audit_event, hash_query
-from src.core.auth import is_cloud_run
-from src.core.chroma import has_sqlite
-from src.core.config import get_agent_recursion_limit
+from src.core.ai_security.guardrails import get_bounded_recursion_limit
+from src.core.ai_security.safety import INTERNAL_ERROR_MESSAGE, RECURSION_LIMIT_MESSAGE
+from src.core.compliance.audit import emit_audit_event, hash_query
+from src.core.compliance.provenance import build_compliance_metadata
+from src.core.config import is_cloud_run
 from src.core.logger import setup_logging
-from src.core.security import INTERNAL_ERROR_MESSAGE, RECURSION_LIMIT_MESSAGE
-from src.core.storage import user_read_lock
+from src.core.storage import has_sqlite, user_read_lock
 
 logger = setup_logging(name="agent.stream")
 
@@ -27,7 +35,15 @@ SSE_HEADERS = {
 }
 
 
-def extract_text(content) -> str:
+def extract_text(content: Any) -> str:
+    """Extracts plain text from a string or multimodal list `BaseMessage.content` payload.
+
+    Args:
+        content: Raw `BaseMessage.content` value.
+
+    Returns:
+        Normalized plain-text string.
+    """
     if isinstance(content, str):
         return content
     elif isinstance(content, list):
@@ -42,7 +58,18 @@ def extract_text(content) -> str:
 
 
 def _should_print_console(verbose_console: Optional[bool], is_cli_mode: bool) -> bool:
-    """Determines whether Rich message panels should print to stdout (never in Cloud Run or HTTP API calls unless opted in)."""
+    """Determines whether Rich message panels should print to stdout.
+
+    Never prints interactive Rich panels inside Cloud Run containers so Cloud Logging
+    remains clean and free of raw prompt/document text.
+
+    Args:
+        verbose_console: Explicit caller override (`True` or `False`), or `None` for auto-detect.
+        is_cli_mode: True when invoked directly from interactive Python/CLI mode.
+
+    Returns:
+        True if Rich message trace panels should be rendered to stdout.
+    """
     if is_cloud_run():
         return False
     if verbose_console is not None:
@@ -61,6 +88,23 @@ def _stream_events(
     embedding_model: Optional[str] = None,
     show_console: bool = False,
 ) -> Generator[Dict[str, Any], None, None]:
+    """Executes the compiled LangGraph agent and yields deduplicated message event dicts.
+
+    Catches `GraphRecursionError` when tool-calling exceeds `AGENT_RECURSION_LIMIT` and
+    yields a polite `RECURSION_LIMIT_MESSAGE` fallback turn.
+
+    Args:
+        query: Validated user question.
+        persist_directory: Local filesystem path of the tenant's ChromaDB directory.
+        collection_name: Validated Chroma collection identifier.
+        thread_id: Tenant-namespaced (`{uid}:{thread_id}`) checkpoint thread identifier.
+        model_name: Optional approved Vertex AI generative LLM model identifier.
+        embedding_model: Optional approved Vertex AI embedding model identifier.
+        show_console: Whether to render Rich message panels to stdout.
+
+    Yields:
+        Dictionaries of the form `{'event': 'message', 'message': {...}, 'raw_message': BaseMessage}`.
+    """
     retriever_tool = get_retriever_tool(
         collection_name=collection_name,
         persist_directory=persist_directory,
@@ -68,7 +112,7 @@ def _stream_events(
     )
     agent = build_agent(retriever_tool, model_name=model_name)
 
-    recursion_limit = get_agent_recursion_limit()
+    recursion_limit = get_bounded_recursion_limit()
     config: RunnableConfig = {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": recursion_limit,
@@ -149,7 +193,20 @@ def stream_events(
     persist_directory: Optional[str] = None,
     verbose_console: Optional[bool] = None,
 ) -> Generator[Dict[str, Any], None, None]:
-    """Streams graph message output, printing Rich console panels only in interactive CLI mode."""
+    """Streams LangGraph message events, resolving per-user Chroma storage when called from CLI.
+
+    Args:
+        query: User question to answer against `collection_name`.
+        collection_name: Target Chroma collection identifier.
+        thread_id: Session thread identifier (already `{uid}:`-scoped when `persist_directory` is passed).
+        model_name: Optional approved Vertex AI generative LLM model identifier.
+        embedding_model: Optional approved Vertex AI embedding model identifier.
+        persist_directory: Optional pre-locked tenant ChromaDB directory (used by HTTP handlers).
+        verbose_console: Optional flag controlling Rich terminal panel output.
+
+    Yields:
+        Deduplicated LangGraph message event dictionaries.
+    """
     show_console = _should_print_console(
         verbose_console=verbose_console,
         is_cli_mode=(persist_directory is None),
@@ -185,7 +242,19 @@ def stream_sse(
     request: AgentRequest,
     scoped_thread_id: str,
 ) -> Generator[str, None, None]:
-    """Generator yielding Server-Sent Events (SSE) payloads while pinning user Chroma cache."""
+    """Yields Server-Sent Events (`data: ...\n\n`) frames while pinning the user's Chroma cache.
+
+    Emits each message event frame followed by a terminal `event="compliance"` provenance frame
+    and `data: [DONE]`, or a sanitized `event="error"` frame if an unexpected failure occurs.
+
+    Args:
+        uid: Verified tenant user identifier.
+        request: Validated `AgentRequest` payload.
+        scoped_thread_id: Tenant-namespaced `{uid}:{request.thread_id}` checkpoint key.
+
+    Yields:
+        SSE-formatted UTF-8 event strings (`data: <json>\n\n`).
+    """
     query_digest = hash_query(request.query)
     query_len = len(request.query)
     final_answer = ""
@@ -216,6 +285,7 @@ def stream_sse(
             answer=final_answer,
             messages=streamed_messages,
             scoped_thread_id=scoped_thread_id,
+            checkpointer=MEMORY_SAVER,
         ).model_dump()
         compliance_frame = {
             "event": "compliance",
@@ -237,7 +307,9 @@ def stream_sse(
             grounded=compliance_meta["grounded"],
             citation_count=compliance_meta["citation_count"],
             pii_filtered=compliance_meta["pii_filtered"],
-            guardrail_actions=[a["filter"] + ":" + a["action"] for a in compliance_meta["guardrail_actions"]],
+            guardrail_actions=[
+                a["filter"] + ":" + a["action"] for a in compliance_meta["guardrail_actions"]
+            ],
         )
         yield "data: [DONE]\n\n"
     except Exception:
@@ -272,7 +344,12 @@ def run_interactive(
     collection_name: str,
     query: str = "What is ARM Holdings?",
 ) -> None:
-    """Interactive runner to stream message output and pretty print message components."""
+    """Runs an interactive local CLI query and renders Rich message panels to the terminal.
+
+    Args:
+        collection_name: Target Chroma collection identifier.
+        query: Sample or custom question to execute against the collection.
+    """
     print_header("Agentic RAG Assistant Initialized", "magenta")
     logger.info(
         f"Running interactive agent on collection '{collection_name}' "
@@ -281,3 +358,5 @@ def run_interactive(
     for _ in stream_events(query=query, collection_name=collection_name, verbose_console=True):
         pass
 
+
+__all__ = ["SSE_HEADERS", "extract_text", "run_interactive", "stream_events", "stream_sse"]

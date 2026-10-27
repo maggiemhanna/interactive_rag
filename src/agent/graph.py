@@ -1,3 +1,10 @@
+"""Hardened LangGraph Agentic RAG workflow (`START -> input_guard -> model_call <-> tools -> output_guard -> END`).
+
+Combines XML-spotlighted instruction hierarchy prompts, regional Vertex AI Gemini execution,
+explicit `HarmBlockThreshold` safety settings, and pre/post Google Cloud Model Armor + Cloud DLP
+guardrail nodes so unscreened prompts never reach Gemini and unsanitized answers never stream out.
+"""
+
 import os
 from typing import Any, Dict, Optional, Sequence
 
@@ -9,18 +16,17 @@ from langgraph.prebuilt import ToolNode
 
 from src.agent.memory import MEMORY_SAVER
 from src.agent.schemas import AgentState
-from src.core.audit import emit_audit_event, record_guardrail_action
-from src.core.logger import setup_logging
-from src.core.security import (
+from src.core.ai_security.armor import sanitize_model_output, screen_user_prompt
+from src.core.ai_security.guardrails import validate_llm_model, validate_query_text
+from src.core.ai_security.safety import (
     SAFETY_REFUSAL_MESSAGE,
     get_gemini_safety_settings,
     is_safety_blocked,
-    sanitize_model_output,
-    screen_user_prompt,
-    validate_gcp_region,
-    validate_llm_model,
-    validate_query_text,
 )
+from src.core.compliance.audit import emit_audit_event
+from src.core.compliance.context import record_guardrail_action
+from src.core.compliance.residency import validate_gcp_region
+from src.core.logger import setup_logging
 
 logger = setup_logging(name="agent.graph")
 
@@ -44,7 +50,14 @@ SYSTEM_PROMPT = (
 
 
 def _extract_message_text(content: Any) -> str:
-    """Normalizes string or multimodal list message content into plain text."""
+    """Normalizes string or multimodal list message content into plain text.
+
+    Args:
+        content: Raw `BaseMessage.content` (string, list of content blocks, or None).
+
+    Returns:
+        Plain-text string representation of `content`.
+    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -59,7 +72,14 @@ def _extract_message_text(content: Any) -> str:
 
 
 def _latest_human_text(messages: Sequence[BaseMessage]) -> str:
-    """Returns the text of the most recent HumanMessage in the conversation state."""
+    """Returns the plain text of the most recent `HumanMessage` in `messages`.
+
+    Args:
+        messages: Conversation message history stored in `AgentState["messages"]`.
+
+    Returns:
+        Text of the latest user turn, or an empty string if none is present.
+    """
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage) or getattr(msg, "type", "") == "human":
             return _extract_message_text(getattr(msg, "content", ""))
@@ -67,11 +87,23 @@ def _latest_human_text(messages: Sequence[BaseMessage]) -> str:
 
 
 def build_agent(
-    retriever_tool,
+    retriever_tool: Any,
     model_name: Optional[str] = None,
     checkpointer: Optional[InMemorySaver] = None,
-):
-    """Constructs and compiles the hardened LangGraph Agentic RAG graph."""
+) -> Any:
+    """Constructs and compiles the hardened LangGraph Agentic RAG `CompiledStateGraph`.
+
+    Args:
+        retriever_tool: LangChain `StructuredTool` bound for Chroma retrieval.
+        model_name: Optional approved Vertex AI generative LLM model identifier.
+        checkpointer: Optional LangGraph checkpointer override (defaults to `MEMORY_SAVER`).
+
+    Returns:
+        Compiled LangGraph `StateGraph` instance ready for `.invoke()` or `.stream()`.
+
+    Raises:
+        ValueError: If `model_name` is unapproved or `GOOGLE_CLOUD_LOCATION` violates residency.
+    """
     safe_model_name = validate_llm_model(model_name)
     safe_location = validate_gcp_region()
 
@@ -87,6 +119,7 @@ def build_agent(
     model_with_tools = llm.bind_tools(tools)
 
     def input_guard(state: AgentState) -> Dict[str, Any]:
+        """Validates query length and screens the latest user prompt via Cloud Model Armor."""
         raw_query = _latest_human_text(state["messages"])
         try:
             cleaned_query = validate_query_text(raw_query)
@@ -117,9 +150,11 @@ def build_agent(
         return {"input_blocked": False, "pending_response": None}
 
     def route_after_input_guard(state: AgentState) -> str:
+        """Routes blocked prompts directly to `END`, or clean prompts to `model_call`."""
         return "blocked" if state.get("input_blocked") else "allow"
 
     def model_call(state: AgentState) -> Dict[str, Any]:
+        """Invokes Vertex AI Gemini with `SYSTEM_PROMPT` and stages final answers in `pending_response`."""
         system_prompt = SystemMessage(content=SYSTEM_PROMPT)
         response = model_with_tools.invoke([system_prompt] + list(state["messages"]))
 
@@ -148,6 +183,7 @@ def build_agent(
         return {"pending_response": response}
 
     def should_continue(state: AgentState) -> str:
+        """Routes tool-calling turns to `tools` and final turns to `output_guard`."""
         if state.get("pending_response") is not None:
             return "end"
         last_message = state["messages"][-1]
@@ -156,6 +192,7 @@ def build_agent(
         return "end"
 
     def output_guard(state: AgentState) -> Dict[str, Any]:
+        """Sanitizes `pending_response` through Model Armor + Cloud DLP before appending to `messages`."""
         pending = state.get("pending_response")
         if pending is None:
             return {}
@@ -205,3 +242,6 @@ def build_agent(
     graph.add_edge("output_guard", END)
 
     return graph.compile(checkpointer=checkpointer or MEMORY_SAVER)
+
+
+__all__ = ["SYSTEM_PROMPT", "build_agent"]

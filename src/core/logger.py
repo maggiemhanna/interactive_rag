@@ -1,6 +1,12 @@
 # Copyright (c) 2024 Maggie Mhanna
 # All rights reserved.
 
+"""Centralized application logging configuration and safe dictionary formatting utilities.
+
+Installs consistent colored console handlers on stdout across local development and
+Cloud Run containers, and provides recursive truncation helpers for diagnostic state dumps.
+"""
+
 import json
 import logging
 import sys
@@ -22,9 +28,15 @@ LOG_FORMAT = (
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
-def setup_logging(level=logging.INFO, name: Optional[str] = None) -> logging.Logger:
-    """
-    Configures and installs coloredlogs for consistent formatting.
+def setup_logging(level: int = logging.INFO, name: Optional[str] = None) -> logging.Logger:
+    """Configures and installs `coloredlogs` on the root logger and returns a named logger.
+
+    Args:
+        level: Minimum Python logging level to emit (defaults to `logging.INFO`).
+        name: Optional logger namespace (e.g., `'ingestion'`, `'agent'`, `'audit'`).
+
+    Returns:
+        Configured `logging.Logger` instance at the requested level.
     """
     # Define custom styles for standard levels
     custom_level_styles = deepcopy(coloredlogs.DEFAULT_LEVEL_STYLES)
@@ -59,15 +71,24 @@ def setup_logging(level=logging.INFO, name: Optional[str] = None) -> logging.Log
 
 
 def format_dict_for_logs(state_dict: Any, max_len: int = 100) -> str:
-    """
-    Formats a dictionary into a pretty-printed JSON string.
-    It deep-copies the dictionary and truncates string values if they exceed max_len.
+    """Formats a nested dictionary or list into a pretty-printed, length-bounded JSON string.
+
+    Deep-copies `state_dict` so caller state is never mutated and truncates any string
+    values exceeding `max_len` characters.
+
+    Args:
+        state_dict: Arbitrary JSON-serializable dictionary, list, or primitive structure.
+        max_len: Maximum character length allowed per string value before truncation.
+
+    Returns:
+        Indented JSON string safe for diagnostic log output.
     """
     # 1. Use deepcopy to avoid modifying the original session state
     truncated_dict = deepcopy(state_dict)
 
     # 2. Define a recursive function to walk through the dictionary/list structure
-    def truncate_recursive(data):
+    def truncate_recursive(data: Any) -> Any:
+        """Recursively truncates string leaves inside nested dicts and lists."""
         if isinstance(data, dict):
             return {k: truncate_recursive(v) for k, v in data.items()}
 

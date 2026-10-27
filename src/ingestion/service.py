@@ -1,14 +1,25 @@
+"""ChromaDB batch indexing and Cloud DLP-sanitized similarity search orchestration.
+
+Coordinates multi-tenant vector storage writes inside `user_write_lock` and executes
+similarity searches inside `user_read_lock` with concurrent Model Armor / Cloud DLP
+chunk masking and PII-free SHA-256 query logging.
+"""
+
 import os
 from typing import Any, Dict, List, Optional
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
-from src.core.audit import hash_query
-from src.core.chroma import get_vectorstore, require_collection
+from src.core.ai_security.armor import sanitize_retrieved_documents
+from src.core.compliance.audit import hash_query
 from src.core.logger import setup_logging
-from src.core.security import sanitize_retrieved_documents
-from src.core.storage import user_read_lock, user_write_lock
+from src.core.storage import (
+    get_vectorstore,
+    require_collection,
+    user_read_lock,
+    user_write_lock,
+)
 
 logger = setup_logging(name="ingestion.service")
 
@@ -19,16 +30,16 @@ def index_documents(
     persist_directory: str = "chroma_db",
     embedding_model: Optional[str] = None,
 ) -> Chroma:
-    """Initializes or loads a Chroma vectorstore and indexes document chunks into it.
+    """Initializes or loads a Chroma vectorstore and indexes document chunks in batches of 100.
 
     Args:
-        documents: List of document chunks to add.
-        collection_name: Name of the vector collection.
-        persist_directory: Path to store Chroma DB.
-        embedding_model: Name of the Vertex AI embedding model.
+        documents: List of split `Document` chunks to embed and store.
+        collection_name: Validated target Chroma collection identifier.
+        persist_directory: Local filesystem path of the ChromaDB directory.
+        embedding_model: Optional approved Vertex AI embedding model identifier.
 
     Returns:
-        Chroma vectorstore instance.
+        Updated `langchain_chroma.Chroma` vectorstore instance.
     """
     if not os.path.exists(persist_directory):
         os.makedirs(persist_directory)
@@ -65,7 +76,14 @@ def ingest_documents(
     collection_name: str,
     embedding_model: Optional[str] = None,
 ) -> None:
-    """Mutates the user's isolated ChromaDB inside the GCS distributed write lock."""
+    """Indexes document chunks into `uid`'s isolated ChromaDB inside the distributed GCS write lock.
+
+    Args:
+        uid: Verified tenant user identifier.
+        documents: List of split `Document` chunks to index.
+        collection_name: Validated target Chroma collection identifier.
+        embedding_model: Optional approved Vertex AI embedding model identifier.
+    """
     with user_write_lock(uid) as persist_directory:
         vectorstore = index_documents(
             documents=documents,
@@ -83,7 +101,21 @@ def search_collection(
     k: int = 5,
     embedding_model: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Performs similarity search against a user's Chroma vectorstore collection and masks PII/secrets."""
+    """Performs top-`k` similarity search on a user's Chroma collection and masks sensitive spans.
+
+    Args:
+        uid: Verified tenant user identifier.
+        query: Validated user search query string.
+        collection_name: Validated Chroma collection identifier.
+        k: Number of top matching passages to retrieve (`1..50`).
+        embedding_model: Optional approved Vertex AI embedding model identifier.
+
+    Returns:
+        List of `{'page_content': ..., 'metadata': ...}` dictionaries after SDP/DLP sanitization.
+
+    Raises:
+        FileNotFoundError: If `collection_name` does not exist for `uid`.
+    """
     with user_read_lock(uid) as persist_directory:
         require_collection(persist_directory, collection_name)
         vectorstore = get_vectorstore(
@@ -112,3 +144,5 @@ def search_collection(
     )
     return results
 
+
+__all__ = ["index_documents", "ingest_documents", "search_collection"]

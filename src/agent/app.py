@@ -1,25 +1,29 @@
-import os
+"""FastAPI LangGraph Agentic RAG microservice (`agent-api`).
 
-import uvicorn
+Exposes authenticated `POST /agent` (synchronous JSON or optional SSE) and `POST /agent/stream`
+(dedicated SSE) endpoints alongside shared `/health`, `/collections`, and `/compliance/my-data`
+DSAR routes wired with `MEMORY_SAVER` thread inventory and purge hooks.
+"""
+
+import os
+from typing import Any
+
 from fastapi import Depends, HTTPException
 from fastapi.responses import StreamingResponse
+import uvicorn
 
 from src.agent.display import print_header
-from src.agent.memory import clear_user_memory, list_user_memory_threads
-from src.agent.schemas import AgentRequest, build_compliance_metadata
-from src.agent.stream import (
-    SSE_HEADERS,
-    stream_events,
-    stream_sse,
-)
-from src.core.audit import emit_audit_event, hash_query
+from src.agent.memory import MEMORY_SAVER, clear_user_memory, list_user_memory_threads
+from src.agent.schemas import AgentRequest
+from src.agent.stream import SSE_HEADERS, stream_events, stream_sse
+from src.core.ai_security.safety import INTERNAL_ERROR_MESSAGE
+from src.core.app_factory import create_app
 from src.core.auth import get_current_user
-from src.core.chroma import require_collection
+from src.core.compliance.audit import emit_audit_event, hash_query
+from src.core.compliance.provenance import build_compliance_metadata
 from src.core.config import AGENT_PORT, is_reload_enabled
 from src.core.logger import setup_logging
-from src.core.routes import create_app
-from src.core.security import INTERNAL_ERROR_MESSAGE
-from src.core.storage import LockTimeoutError, user_read_lock
+from src.core.storage import LockTimeoutError, require_collection, user_read_lock
 
 logger = setup_logging(name="agent")
 
@@ -35,8 +39,19 @@ app = create_app(
 def agent(
     request: AgentRequest,
     uid: str = Depends(get_current_user),
-):
-    """FastAPI endpoint to run the Agentic RAG assistant with a query."""
+) -> Any:
+    """Executes an Agentic RAG turn for `uid`, returning grounded JSON or an SSE `StreamingResponse`.
+
+    Pre-validates the tenant's synced ChromaDB collection before starting execution so missing
+    collections consistently return `HTTP 404` in both synchronous and streaming modes.
+
+    Args:
+        request: Validated `AgentRequest` specifying `query`, `collection_name`, models, and `stream`.
+        uid: Verified tenant user identifier injected by `get_current_user`.
+
+    Returns:
+        JSON dictionary (conforming to `AgentResponse`) when `stream=False`, or `StreamingResponse` when `stream=True`.
+    """
     scoped_thread_id = f"{uid}:{request.thread_id}"
     query_digest = hash_query(request.query)
     query_len = len(request.query)
@@ -85,6 +100,7 @@ def agent(
             answer=final_answer,
             messages=formatted_messages,
             scoped_thread_id=scoped_thread_id,
+            checkpointer=MEMORY_SAVER,
         ).model_dump()
 
         emit_audit_event(
@@ -100,7 +116,9 @@ def agent(
             grounded=compliance_meta["grounded"],
             citation_count=compliance_meta["citation_count"],
             pii_filtered=compliance_meta["pii_filtered"],
-            guardrail_actions=[a["filter"] + ":" + a["action"] for a in compliance_meta["guardrail_actions"]],
+            guardrail_actions=[
+                a["filter"] + ":" + a["action"] for a in compliance_meta["guardrail_actions"]
+            ],
         )
 
         return {
@@ -157,12 +175,21 @@ def agent(
 def agent_stream(
     request: AgentRequest,
     uid: str = Depends(get_current_user),
-):
-    """Dedicated streaming endpoint using Server-Sent Events (SSE) by default."""
+) -> Any:
+    """Dedicated Server-Sent Events (`text/event-stream`) endpoint forcing `stream=True`.
+
+    Args:
+        request: Validated `AgentRequest` payload.
+        uid: Verified tenant user identifier injected by `get_current_user`.
+
+    Returns:
+        `StreamingResponse` yielding SSE `message`, `compliance`, and `[DONE]` frames.
+    """
     return agent(request=request.model_copy(update={"stream": True}), uid=uid)
 
 
 def main() -> None:
+    """Starts the Uvicorn HTTP server for `agent-api` on `PORT` (default `8001`)."""
     print_header("Agentic RAG Assistant Server Initialized", "magenta")
     port = int(os.getenv("PORT", str(AGENT_PORT)))
     uvicorn.run(

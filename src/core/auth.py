@@ -1,3 +1,12 @@
+"""Google Identity Platform / Firebase JWT authentication and tenant UID validation.
+
+Implements Pillar 1 & Pillar 2 identity enforcement for FastAPI endpoints:
+- Verifies RS256 Bearer ID tokens via the Firebase Admin SDK using Application Default Credentials.
+- Validates user identifiers (`UID_PATTERN`) to prevent filesystem and GCS prefix path traversal.
+- Supports local-only developer bypass (`AUTH_DISABLED=true`) while hard-blocking bypass in Cloud Run.
+- Records structured `auth.failure` compliance audit events and binds verified UIDs to request state.
+"""
+
 import os
 import re
 import threading
@@ -8,7 +17,9 @@ from fastapi import Depends, Header, HTTPException, status
 from firebase_admin import auth as firebase_auth
 from pydantic import BaseModel
 
-from src.core.audit import emit_audit_event, set_audit_uid
+from src.core.compliance.audit import emit_audit_event
+from src.core.compliance.context import set_audit_uid
+from src.core.config import get_allowed_origins, is_cloud_run
 from src.core.logger import setup_logging
 
 logger = setup_logging(name="auth")
@@ -22,7 +33,13 @@ WWW_AUTHENTICATE_HEADER = {"WWW-Authenticate": "Bearer"}
 
 
 class AuthenticatedUser(BaseModel):
-    """Verified user identity extracted from a Google Identity Platform / Firebase ID token."""
+    """Verified user identity extracted from a Google Identity Platform / Firebase ID token.
+
+    Attributes:
+        uid: Path-safe unique user subject identifier.
+        email: Optional primary email claim from the verified token.
+        name: Optional display name claim from the verified token.
+    """
 
     uid: str
     email: Optional[str] = None
@@ -30,7 +47,17 @@ class AuthenticatedUser(BaseModel):
 
 
 def validate_uid(uid: Optional[str]) -> str:
-    """Validates that a user ID is safe for filesystem and GCS object prefix construction."""
+    """Validates that a user ID is safe for filesystem directory and GCS object prefix construction.
+
+    Args:
+        uid: Candidate user identifier extracted from JWT claims or local dev headers.
+
+    Returns:
+        Validated `uid` string matching `UID_PATTERN`.
+
+    Raises:
+        HTTPException: HTTP 401 if `uid` is missing, empty, overlong, or contains unsafe characters.
+    """
     if not uid or not isinstance(uid, str) or not UID_PATTERN.match(uid):
         logger.warning("Rejected unsafe or malformed uid format.")
         emit_audit_event(
@@ -47,15 +74,14 @@ def validate_uid(uid: Optional[str]) -> str:
     return uid
 
 
-def is_cloud_run() -> bool:
-    """Returns True when running inside a Google Cloud Run container (K_SERVICE is injected by Cloud Run)."""
-    return bool(os.getenv("K_SERVICE", "").strip())
-
-
 def is_auth_bypassed() -> bool:
-    """Checks whether local-only authentication bypass is active.
+    """Checks whether local-only authentication bypass (`AUTH_DISABLED=true`) is active.
 
-    Never allows bypass when K_SERVICE is set (Cloud Run), even if AUTH_DISABLED=true is misconfigured.
+    Never allows bypass when `K_SERVICE` is set (Cloud Run), even if `AUTH_DISABLED=true`
+    is accidentally configured in container environment variables.
+
+    Returns:
+        True only when `AUTH_DISABLED` is truthy and the service is not running in Cloud Run.
     """
     auth_disabled = os.getenv("AUTH_DISABLED", "").strip().lower() in {"1", "true", "yes"}
     if not auth_disabled:
@@ -71,35 +97,15 @@ def is_auth_bypassed() -> bool:
     return True
 
 
-def get_allowed_origins() -> list[str]:
-    """Parses ALLOWED_ORIGINS from the environment (comma-separated).
-
-    Defaults to standard localhost dev ports when running locally, and fails closed ([])
-    in Cloud Run if ALLOWED_ORIGINS is omitted.
-    """
-    raw = os.getenv("ALLOWED_ORIGINS", "").strip()
-    if raw:
-        origins: list[str] = []
-        for item in raw.split(","):
-            cleaned = item.strip()
-            if not cleaned:
-                continue
-            origins.append("*" if cleaned == "*" else cleaned.rstrip("/"))
-        return origins
-
-    if is_cloud_run():
-        return []
-
-    return [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ]
-
-
 def init_firebase() -> firebase_admin.App:
-    """Initializes the Firebase Admin SDK once per process using Application Default Credentials."""
+    """Initializes the Firebase Admin SDK once per process using Application Default Credentials.
+
+    Returns:
+        Initialized `firebase_admin.App` singleton bound to the configured GCP project.
+
+    Raises:
+        HTTPException: HTTP 500 if neither `GOOGLE_CLOUD_PROJECT` nor `FIREBASE_PROJECT_ID` is set.
+    """
     if firebase_admin._apps:
         return firebase_admin.get_app()
 
@@ -126,7 +132,17 @@ def init_firebase() -> firebase_admin.App:
 
 
 def _extract_bearer_token(authorization: Optional[str]) -> str:
-    """Extracts the raw JWT from an 'Authorization: Bearer <token>' header."""
+    """Extracts the raw JWT string from an `'Authorization: Bearer <ID_TOKEN>'` HTTP header.
+
+    Args:
+        authorization: Raw `Authorization` request header value, if present.
+
+    Returns:
+        Trimmed raw JWT token string.
+
+    Raises:
+        HTTPException: HTTP 401 if the header is missing or does not follow `Bearer <token>` syntax.
+    """
     if not authorization:
         emit_audit_event(
             "auth.failure",
@@ -158,7 +174,18 @@ def _extract_bearer_token(authorization: Optional[str]) -> str:
 
 
 def verify_bearer_token(token: str) -> Dict[str, Any]:
-    """Verifies a Firebase / Google Identity Platform ID token and returns decoded claims."""
+    """Verifies a Firebase / Google Identity Platform ID token and returns decoded claims.
+
+    Args:
+        token: Raw RS256 JWT extracted from the `Authorization: Bearer` header.
+
+    Returns:
+        Dictionary of verified JWT claims (including `uid`/`sub`, `email`, and `name`).
+
+    Raises:
+        HTTPException: HTTP 401 on expired, revoked, or invalid tokens; HTTP 503 if signing
+            certificates cannot be fetched.
+    """
     app = init_firebase()
     try:
         decoded_claims = firebase_auth.verify_id_token(
@@ -237,7 +264,18 @@ def get_current_user_info(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_dev_user_id: Optional[str] = Header(default=None, alias="X-Dev-User-Id"),
 ) -> AuthenticatedUser:
-    """FastAPI dependency returning full verified user metadata (`uid`, `email`, `name`)."""
+    """FastAPI dependency returning full verified user metadata (`uid`, `email`, `name`).
+
+    Binds the verified `uid` into the active request's compliance audit context so
+    downstream storage, guardrail, and endpoint events carry tenant attribution.
+
+    Args:
+        authorization: Optional `Authorization: Bearer <ID_TOKEN>` header.
+        x_dev_user_id: Optional `X-Dev-User-Id` header honored only when `is_auth_bypassed()` is True.
+
+    Returns:
+        Verified `AuthenticatedUser` model instance.
+    """
     if is_auth_bypassed():
         raw_dev_uid = (x_dev_user_id or os.getenv("DEV_USER_ID", "local-dev")).strip()
         uid = validate_uid(raw_dev_uid)
@@ -264,6 +302,27 @@ def get_current_user_info(
 def get_current_user(
     user: AuthenticatedUser = Depends(get_current_user_info),
 ) -> str:
-    """FastAPI dependency returning the verified, path-safe user `uid` string."""
+    """FastAPI dependency returning the verified, path-safe tenant `uid` string.
+
+    Args:
+        user: Verified `AuthenticatedUser` injected by `get_current_user_info`.
+
+    Returns:
+        Path-safe tenant `uid` string.
+    """
     return user.uid
 
+
+__all__ = [
+    "AuthenticatedUser",
+    "UID_PATTERN",
+    "WWW_AUTHENTICATE_HEADER",
+    "get_allowed_origins",
+    "get_current_user",
+    "get_current_user_info",
+    "init_firebase",
+    "is_auth_bypassed",
+    "is_cloud_run",
+    "validate_uid",
+    "verify_bearer_token",
+]

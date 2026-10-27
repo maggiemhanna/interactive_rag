@@ -1,18 +1,25 @@
+"""FastAPI Document Ingestion & Vector Search microservice (`ingestion-api`).
+
+Exposes authenticated `POST /ingest` and `POST /query` endpoints alongside the shared
+`/health`, `/collections`, and `/compliance/my-data` routes wired by `create_app`.
+"""
+
 import os
+from typing import Any, Dict
 
-import uvicorn
 from fastapi import Depends, HTTPException, Request
+import uvicorn
 
-from src.core.audit import emit_audit_event, hash_query
+from src.core.ai_security.safety import INTERNAL_ERROR_MESSAGE
+from src.core.app_factory import create_app
 from src.core.auth import get_current_user
+from src.core.compliance.audit import emit_audit_event, hash_query
 from src.core.config import INGESTION_PORT, is_reload_enabled
 from src.core.logger import setup_logging
-from src.core.routes import create_app
-from src.core.security import INTERNAL_ERROR_MESSAGE
 from src.core.storage import LockTimeoutError
-from src.ingestion.loader import prepare_payload
 from src.ingestion.schemas import QueryRequest
 from src.ingestion.service import ingest_documents, search_collection
+from src.ingestion.upload_parser import prepare_payload
 
 logger = setup_logging(name="ingestion")
 
@@ -20,8 +27,19 @@ app = create_app(title="Document Ingestion API", service_name="ingestion-api")
 
 
 @app.post("/ingest")
-async def ingest(request: Request, uid: str = Depends(get_current_user)):
-    """FastAPI endpoint to load, split, and ingest PDF documents (via file upload or file paths) into Chroma vectorstore."""
+async def ingest(
+    request: Request,
+    uid: str = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Loads, chunks, and indexes uploaded PDF documents into the user's Chroma collection.
+
+    Args:
+        request: Raw FastAPI `Request` carrying multipart PDF uploads or local JSON `pdf_paths`.
+        uid: Verified tenant user identifier injected by `get_current_user`.
+
+    Returns:
+        JSON confirmation containing `chunks_added`, `collection_name`, and `processed_files`.
+    """
     try:
         payload = await prepare_payload(request=request, uid=uid)
 
@@ -92,8 +110,19 @@ async def ingest(request: Request, uid: str = Depends(get_current_user)):
 
 
 @app.post("/query")
-def query(request: QueryRequest, uid: str = Depends(get_current_user)):
-    """FastAPI endpoint to search/query documents in a specific Chroma vectorstore collection."""
+def query(
+    request: QueryRequest,
+    uid: str = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Executes top-`k` vector similarity search over a user's Chroma collection.
+
+    Args:
+        request: Validated `QueryRequest` specifying `query`, `collection_name`, `k`, and `embedding_model`.
+        uid: Verified tenant user identifier injected by `get_current_user`.
+
+    Returns:
+        JSON response containing sanitized passage `results` and `results_count`.
+    """
     query_digest = hash_query(request.query)
     query_len = len(request.query)
     try:
@@ -151,6 +180,7 @@ def query(request: QueryRequest, uid: str = Depends(get_current_user)):
 
 
 def main() -> None:
+    """Starts the Uvicorn HTTP server for `ingestion-api` on `PORT` (default `8000`)."""
     port = int(os.getenv("PORT", str(INGESTION_PORT)))
     uvicorn.run(
         "src.ingestion.app:app",

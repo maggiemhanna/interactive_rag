@@ -20,16 +20,16 @@ from src.agent.tools import (
     format_retrieved_chunks,
     get_retriever_tool,
 )
-from src.core import chroma as chroma_module
-from src.core import security as security_module
-from src.core import storage as chroma_storage
-from src.core.logger import setup_logging
-from src.core.security import (
+from src.core.ai_security import armor as armor_module
+from src.core.ai_security.safety import (
     INTERNAL_ERROR_MESSAGE,
     PROMPT_BLOCKED_MESSAGE,
     RECURSION_LIMIT_MESSAGE,
     SAFETY_REFUSAL_MESSAGE,
 )
+from src.core.logger import setup_logging
+from src.core.storage import chroma as chroma_module
+from src.core.storage import gcs_sync as gcs_sync_module
 from src.core.storage import release_client_cache
 from src.ingestion import app as ingestion_module
 from tests.multi_tenant_api import DeterministicFakeEmbeddings, make_test_pdf
@@ -126,7 +126,7 @@ class TestAISecuritySuite(unittest.TestCase):
         self.uploads_tmp = tempfile.mkdtemp(prefix="ai_sec_uploads_")
         self.fake_bucket = FakeGCSBucket("interactive-rag-sec-bucket")
         agent_graph_module.MEMORY_SAVER.storage.clear()
-        security_module._model_armor_clients.clear()
+        armor_module._model_armor_clients.clear()
 
         self.ingestion_client = TestClient(ingestion_module.app)
         self.agent_client = TestClient(agent_module.app)
@@ -138,7 +138,7 @@ class TestAISecuritySuite(unittest.TestCase):
                     release_client_cache(entry.path)
             shutil.rmtree(self.chroma_tmp, ignore_errors=True)
         shutil.rmtree(self.uploads_tmp, ignore_errors=True)
-        security_module._model_armor_clients.clear()
+        armor_module._model_armor_clients.clear()
 
     def _env(self, **overrides) -> Dict[str, str]:
         env = {
@@ -430,7 +430,7 @@ class TestAISecuritySuite(unittest.TestCase):
 
             # 4. MAX_CHUNKS_PER_INGEST -> 400 Bad Request
             with patch.dict(os.environ, {"MAX_CHUNKS_PER_INGEST": "2"}, clear=False), patch(
-                "src.ingestion.loader.split_pdfs",
+                "src.ingestion.upload_parser.split_pdfs",
                 return_value=[
                     Document(page_content="c1", metadata={"page": 0}),
                     Document(page_content="c2", metadata={"page": 0}),
@@ -450,7 +450,7 @@ class TestAISecuritySuite(unittest.TestCase):
                 os.environ,
                 {"GCS_BUCKET_NAME": self.fake_bucket.name, "ARCHIVE_UPLOADS_TO_GCS": "true"},
                 clear=False,
-            ), patch.object(chroma_storage, "_get_bucket", return_value=self.fake_bucket):
+            ), patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket):
                 r_ok = self.ingestion_client.post(
                     "/ingest",
                     data={"collection_name": "meta_keep"},
@@ -486,7 +486,7 @@ class TestAISecuritySuite(unittest.TestCase):
         ), patch.object(
             agent_graph_module, "ChatGoogleGenerativeAI", side_effect=_track_llm
         ), patch.object(
-            security_module.modelarmor_v1, "ModelArmorClient", return_value=mock_armor_client
+            armor_module.modelarmor_v1, "ModelArmorClient", return_value=mock_armor_client
         ) as mock_client_cls:
             self._seed_collection("armor_in")
 
@@ -558,7 +558,7 @@ class TestAISecuritySuite(unittest.TestCase):
         ), patch.object(
             agent_graph_module, "ChatGoogleGenerativeAI", side_effect=PIIAnswerLLM
         ), patch.object(
-            security_module.modelarmor_v1, "ModelArmorClient", return_value=mock_armor_client
+            armor_module.modelarmor_v1, "ModelArmorClient", return_value=mock_armor_client
         ):
             self._seed_collection("dlp_col")
 
@@ -742,7 +742,7 @@ class TestAISecuritySuite(unittest.TestCase):
                 self.assertEqual(r2.json()["detail"], INTERNAL_ERROR_MESSAGE)
                 self.assertNotIn("hunter2", r2.text)
 
-            with patch("src.core.routes.list_collections", side_effect=secret_exc):
+            with patch("src.core.storage.routes.list_collections", side_effect=secret_exc):
                 r3 = self.ingestion_client.get("/collections")
                 self.assertEqual(r3.status_code, 500)
                 self.assertEqual(r3.json()["detail"], INTERNAL_ERROR_MESSAGE)
@@ -814,7 +814,7 @@ class TestAISecuritySuite(unittest.TestCase):
         ), patch.object(
             agent_graph_module, "ChatGoogleGenerativeAI", side_effect=GroundedCitingChatModel
         ), patch.object(
-            security_module.modelarmor_v1, "ModelArmorClient", return_value=mock_armor_client
+            armor_module.modelarmor_v1, "ModelArmorClient", return_value=mock_armor_client
         ):
             ing = self.ingestion_client.post(
                 "/ingest",

@@ -1,67 +1,50 @@
+"""Google Cloud Model Armor and Cloud DLP screening for prompts, chunks, and outputs (Pillar 3: AI Security).
+
+Provides regional, fail-closed runtime inspection across three RAG stages:
+1. **Input Screening (`screen_user_prompt`)**: Blocks prompt injection / jailbreak attempts,
+   malicious URIs, RAI violations, and CSAM before invoking Vertex AI Gemini.
+2. **Retrieval Sanitization (`sanitize_chunk_text`, `sanitize_retrieved_documents`)**: Masks
+   sensitive PII/secrets in retrieved Chroma chunks with `[INFO_TYPE]` placeholders via
+   Cloud Sensitive Data Protection (Cloud DLP) while preserving surrounding context.
+3. **Output Filtering (`sanitize_model_output`)**: Screens final LLM answers and redacts any
+   residual sensitive data prior to JSON or SSE emission.
+"""
+
 from concurrent.futures import ThreadPoolExecutor
 import contextvars
+from dataclasses import dataclass
 import os
 import re
 import threading
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from google.cloud import modelarmor_v1
 from langchain_core.documents import Document
-from langchain_google_genai import HarmBlockThreshold, HarmCategory
 
-from src.core.audit import (
-    emit_audit_event,
-    hash_query,
+from src.core.ai_security.safety import (
+    INTERNAL_ERROR_MESSAGE,
+    PROMPT_BLOCKED_MESSAGE,
+    SAFETY_REFUSAL_MESSAGE,
+)
+from src.core.compliance.audit import emit_audit_event, hash_query
+from src.core.compliance.context import (
     mark_model_armor_active,
     mark_pii_filtered,
     record_guardrail_action,
 )
-from src.core.auth import is_cloud_run
+from src.core.compliance.residency import validate_gcp_region
 from src.core.config import (
-    COLLECTION_NAME_PATTERN,
-    GCP_REGION_PATTERN,
-    get_allowed_embedding_models,
-    get_allowed_llm_models,
-    get_gemini_safety_threshold,
-    get_google_cloud_location,
-    get_max_query_chars,
     get_model_armor_location,
     get_model_armor_template_id,
+    is_cloud_run,
 )
 from src.core.logger import setup_logging
 
 logger = setup_logging(name="security")
 
-PROMPT_BLOCKED_MESSAGE = (
-    "This request cannot be processed because it triggered AI prompt security policies."
-)
-SAFETY_REFUSAL_MESSAGE = (
-    "I cannot fulfill this request due to content safety policies."
-)
-RECURSION_LIMIT_MESSAGE = (
-    "I reached the maximum number of document search steps without finding a complete answer. "
-    "Please narrow or rephrase your question."
-)
-INTERNAL_ERROR_MESSAGE = "An internal server error occurred. Please try again later."
-
 _TEMPLATE_PATH_RE = re.compile(
     r"^projects/(?P<project>[^/]+)/locations/(?P<location>[^/]+)/templates/(?P<template>[^/]+)$"
 )
-
-_SAFETY_THRESHOLD_MAP: Dict[str, HarmBlockThreshold] = {
-    "BLOCK_LOW_AND_ABOVE": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
-    "BLOCK_MEDIUM_AND_ABOVE": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-    "BLOCK_ONLY_HIGH": HarmBlockThreshold.BLOCK_ONLY_HIGH,
-}
-
-_SAFETY_BLOCK_REASONS = {
-    "SAFETY",
-    "BLOCKLIST",
-    "PROHIBITED_CONTENT",
-    "SPII",
-    "IMAGE_SAFETY",
-}
 
 _client_lock = threading.Lock()
 _model_armor_clients: Dict[str, modelarmor_v1.ModelArmorClient] = {}
@@ -69,7 +52,15 @@ _model_armor_clients: Dict[str, modelarmor_v1.ModelArmorClient] = {}
 
 @dataclass(frozen=True)
 class ScreeningDecision:
-    """Structured outcome returned by prompt screening and output sanitization."""
+    """Structured outcome returned by Model Armor prompt screening and output sanitization.
+
+    Attributes:
+        allowed: True when the text may proceed; False when blocked by policy or error.
+        text: Sanitized/de-identified text when `allowed=True`, or refusal text when `allowed=False`.
+        blocked_reason: Machine-readable identifier of the primary blocking filter, if blocked.
+        redacted: True when Cloud DLP / SDP replaced sensitive spans with `[INFO_TYPE]` tokens.
+        triggered_filters: Tuple of `(filter_name, action, details_tuple)` entries triggered on this call.
+    """
 
     allowed: bool
     text: str
@@ -78,108 +69,20 @@ class ScreeningDecision:
     triggered_filters: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = ()
 
 
-def validate_gcp_region(location: Optional[str] = None) -> str:
-    """Validates that `GOOGLE_CLOUD_LOCATION` is a concrete single GCP region (never 'global' or a multi-region)."""
-    raw = location if location is not None else get_google_cloud_location()
-    cleaned = (raw or "").strip().lower()
-    if not GCP_REGION_PATTERN.match(cleaned):
-        raise ValueError(
-            f"Invalid GOOGLE_CLOUD_LOCATION '{raw}'. Data residency requires a concrete single GCP "
-            f"region (e.g., 'us-central1'), never 'global' or multi-regions ('us', 'eu', 'asia')."
-        )
-    return cleaned
-
-
-def validate_collection_name(collection_name: Optional[str]) -> str:
-    """Validates that `collection_name` is explicitly provided and matches a strict safe identifier pattern."""
-    if collection_name is None or not isinstance(collection_name, str):
-        raise ValueError("collection_name is required.")
-    cleaned = collection_name.strip()
-    if not cleaned:
-        raise ValueError("collection_name is required and cannot be empty.")
-    if not COLLECTION_NAME_PATTERN.match(cleaned):
-        raise ValueError(
-            "Invalid collection_name. Use 1-64 characters consisting only of letters, numbers, "
-            "hyphens (-), and underscores (_)."
-        )
-    return cleaned
-
-
-def validate_llm_model(model_name: Optional[str] = None) -> str:
-    """Validates `model_name` against `ALLOWED_LLM_MODELS` (defaulting to the first approved model)."""
-    allowed = get_allowed_llm_models()
-    cleaned = (model_name or "").strip() or allowed[0]
-    if cleaned not in allowed:
-        allowed_csv = ", ".join(allowed)
-        raise ValueError(
-            f"Unsupported model_name '{cleaned}'. Approved LLM models: {allowed_csv}."
-        )
-    return cleaned
-
-
-def validate_embedding_model(embedding_model: Optional[str] = None) -> str:
-    """Validates `embedding_model` against `ALLOWED_EMBEDDING_MODELS` (defaulting to the first approved model)."""
-    allowed = get_allowed_embedding_models()
-    cleaned = (embedding_model or "").strip() or allowed[0]
-    if cleaned not in allowed:
-        allowed_csv = ", ".join(allowed)
-        raise ValueError(
-            f"Unsupported embedding_model '{cleaned}'. Approved embedding models: {allowed_csv}."
-        )
-    return cleaned
-
-
-def validate_query_text(query: Optional[str]) -> str:
-    """Validates that a user query is non-empty and within `MAX_QUERY_CHARS`."""
-    if query is None or not isinstance(query, str):
-        raise ValueError("Query text must be a non-empty string.")
-    cleaned = query.strip()
-    if not cleaned:
-        raise ValueError("Query text cannot be empty or whitespace only.")
-    max_chars = get_max_query_chars()
-    if len(cleaned) > max_chars:
-        raise ValueError(
-            f"Query exceeds the maximum length of {max_chars} characters (received {len(cleaned)})."
-        )
-    return cleaned
-
-
-def get_gemini_safety_settings() -> Dict[HarmCategory, HarmBlockThreshold]:
-    """Builds explicit Gemini HarmCategory -> HarmBlockThreshold settings from configuration."""
-    threshold_name = get_gemini_safety_threshold()
-    threshold = _SAFETY_THRESHOLD_MAP.get(threshold_name)
-    if threshold is None:
-        logger.warning(
-            f"Unrecognized GEMINI_SAFETY_THRESHOLD='{threshold_name}'; falling back to BLOCK_LOW_AND_ABOVE."
-        )
-        threshold = HarmBlockThreshold.BLOCK_LOW_AND_ABOVE
-
-    return {
-        HarmCategory.HARM_CATEGORY_HATE_SPEECH: threshold,
-        HarmCategory.HARM_CATEGORY_HARASSMENT: threshold,
-        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: threshold,
-        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: threshold,
-    }
-
-
-def is_safety_blocked(response: Any) -> bool:
-    """Returns True when a Gemini AIMessage indicates generation was blocked by safety filters."""
-    metadata = getattr(response, "response_metadata", None) or {}
-    finish_reason = str(metadata.get("finish_reason", "")).strip().upper()
-    if finish_reason in _SAFETY_BLOCK_REASONS:
-        return True
-
-    prompt_feedback = metadata.get("prompt_feedback") or {}
-    if isinstance(prompt_feedback, dict):
-        block_reason = str(prompt_feedback.get("block_reason", "")).strip().upper()
-        if block_reason and block_reason not in {"BLOCK_REASON_UNSPECIFIED", "0", "NONE"}:
-            return True
-
-    return False
-
-
 def _resolve_model_armor_target() -> Optional[Tuple[str, str]]:
-    """Resolves `(template_resource_name, location)` for Model Armor, or None when unconfigured."""
+    """Resolves `(template_resource_name, location)` for Model Armor, or `None` when unconfigured.
+
+    Accepts either a full resource path (`projects/.../locations/.../templates/...`) or a short
+    template ID combined with `GOOGLE_CLOUD_PROJECT` and `MODEL_ARMOR_LOCATION`, enforcing single-region
+    data residency on the resolved location.
+
+    Returns:
+        Tuple of `(full_template_name, validated_gcp_region)`, or `None` if `MODEL_ARMOR_TEMPLATE_ID` is empty.
+
+    Raises:
+        ValueError: If the template location is `'global'` or a multi-region identifier.
+        RuntimeError: If a short template ID is provided without `GOOGLE_CLOUD_PROJECT`.
+    """
     raw_template = get_model_armor_template_id()
     if not raw_template:
         return None
@@ -198,7 +101,14 @@ def _resolve_model_armor_target() -> Optional[Tuple[str, str]]:
 
 
 def _get_model_armor_client(location: str) -> modelarmor_v1.ModelArmorClient:
-    """Returns a cached regional ModelArmorClient pointing to `modelarmor.<location>.rep.googleapis.com`."""
+    """Returns a cached regional `ModelArmorClient` bound to `modelarmor.<location>.rep.googleapis.com`.
+
+    Args:
+        location: Validated single-region GCP identifier (e.g., `'us-central1'`).
+
+    Returns:
+        Thread-safe cached `modelarmor_v1.ModelArmorClient` for `location`.
+    """
     client = _model_armor_clients.get(location)
     if client is not None:
         return client
@@ -216,7 +126,15 @@ def _get_model_armor_client(location: str) -> modelarmor_v1.ModelArmorClient:
 
 
 def _has_proto_field(msg: Any, field_name: str) -> bool:
-    """Safely checks whether a proto-plus message or mock object populates `field_name`."""
+    """Safely checks whether a proto-plus message or test double populates `field_name`.
+
+    Args:
+        msg: Protobuf / proto-plus message wrapper or mock object.
+        field_name: Name of the submessage field to check.
+
+    Returns:
+        True when `field_name` is present and non-None on `msg`.
+    """
     if "_pb" in getattr(msg, "__dict__", {}):
         return field_name in msg
     try:
@@ -229,7 +147,14 @@ def _has_proto_field(msg: Any, field_name: str) -> bool:
 
 
 def _extract_matched_rai_types(rai_res: Any) -> Tuple[str, ...]:
-    """Extracts matched RAI filter category names (e.g. HARASSMENT, HATE_SPEECH, DANGEROUS, SEXUALLY_EXPLICIT)."""
+    """Extracts matched Responsible AI subcategory names from a Model Armor `RaiFilterResult`.
+
+    Args:
+        rai_res: `modelarmor_v1.RaiFilterResult` message from `filter_results`.
+
+    Returns:
+        Sorted deduplicated tuple of matched category names (e.g., `('DANGEROUS', 'HARASSMENT')`).
+    """
     match_found = modelarmor_v1.FilterMatchState.MATCH_FOUND
     type_results = getattr(rai_res, "rai_filter_type_results", None) or {}
     matched: List[str] = []
@@ -249,7 +174,16 @@ def _inspect_sanitization_result(
     original_text: str,
     block_message_for_pi: str,
 ) -> ScreeningDecision:
-    """Evaluates per-filter Model Armor results, blocking threats while preserving SDP de-identified text."""
+    """Evaluates per-filter Model Armor results, blocking threats while preserving SDP de-identified text.
+
+    Args:
+        sanitization_result: `modelarmor_v1.SanitizationResult` returned by Model Armor.
+        original_text: Unmodified input prompt or model output string.
+        block_message_for_pi: User-facing refusal string used if prompt-injection or URI filters match.
+
+    Returns:
+        `ScreeningDecision` describing whether the text is allowed, redacted, or blocked.
+    """
     match_found = modelarmor_v1.FilterMatchState.MATCH_FOUND
     filter_results = getattr(sanitization_result, "filter_results", None) or {}
 
@@ -346,12 +280,22 @@ def _inspect_sanitization_result(
 
 
 def _is_model_armor_fail_closed() -> bool:
-    """Returns True when unconfigured Model Armor should fail closed (`MODEL_ARMOR_FAIL_CLOSED=true`)."""
+    """Returns True when unconfigured Model Armor must fail closed (`MODEL_ARMOR_FAIL_CLOSED=true`)."""
     return os.getenv("MODEL_ARMOR_FAIL_CLOSED", "").strip().lower() in {"1", "true", "yes"}
 
 
 def screen_user_prompt(prompt: str) -> ScreeningDecision:
-    """Screens an incoming user prompt via Google Cloud Model Armor (`sanitize_user_prompt`)."""
+    """Screens an incoming user prompt via Google Cloud Model Armor (`sanitize_user_prompt`).
+
+    Records per-request guardrail actions and PII-free SHA-256 audit events when a prompt
+    is blocked or when Model Armor encounters a runtime failure.
+
+    Args:
+        prompt: Validated user prompt string prior to LLM invocation.
+
+    Returns:
+        `ScreeningDecision` indicating whether the prompt is allowed or blocked.
+    """
     prompt_digest = hash_query(prompt)
     prompt_len = len(prompt)
     target = _resolve_model_armor_target()
@@ -431,7 +375,15 @@ def sanitize_model_output(
     output_text: str,
     user_prompt: Optional[str] = None,
 ) -> ScreeningDecision:
-    """Screens and redacts PII/secrets in LLM output via Model Armor + Cloud DLP (`sanitize_model_response`)."""
+    """Screens and redacts PII/secrets in LLM output via Model Armor + Cloud DLP (`sanitize_model_response`).
+
+    Args:
+        output_text: Candidate final response text generated by the LLM.
+        user_prompt: Optional original user prompt supplied to Model Armor for context.
+
+    Returns:
+        `ScreeningDecision` containing clean/redacted text or a policy refusal message.
+    """
     if not output_text or not output_text.strip():
         return ScreeningDecision(allowed=True, text=output_text)
 
@@ -521,7 +473,21 @@ def _extract_sdp_deidentified_text(
     sanitization_result: Any,
     original_text: str,
 ) -> str:
-    """Extracts Cloud DLP `[INFO_TYPE]`-masked text from `sdp_filter_result` while preserving surrounding chunk text."""
+    """Extracts Cloud DLP `[INFO_TYPE]`-masked text from `sdp_filter_result` while preserving surrounding chunk text.
+
+    Fails closed by raising `RuntimeError` if SDP execution was skipped or matched sensitive
+    data under an inspect-only template without returning de-identified text.
+
+    Args:
+        sanitization_result: `modelarmor_v1.SanitizationResult` returned for a retrieved chunk.
+        original_text: Unmodified retrieved document chunk text.
+
+    Returns:
+        De-identified chunk text with `[INFO_TYPE]` placeholders, or `original_text` when no PII matched.
+
+    Raises:
+        RuntimeError: If SDP execution was skipped or matched PII without de-identification output.
+    """
     match_found = modelarmor_v1.FilterMatchState.MATCH_FOUND
     exec_skipped = modelarmor_v1.FilterExecutionState.EXECUTION_SKIPPED
     filter_results = getattr(sanitization_result, "filter_results", None) or {}
@@ -558,7 +524,17 @@ def _extract_sdp_deidentified_text(
 
 
 def sanitize_chunk_text(chunk_text: str) -> str:
-    """Masks sensitive spans in a retrieved chunk with `[INFO_TYPE]` placeholders via Model Armor SDP + Cloud DLP."""
+    """Masks sensitive spans in a retrieved chunk with `[INFO_TYPE]` placeholders via Model Armor SDP + Cloud DLP.
+
+    Args:
+        chunk_text: Raw text content of a single retrieved Chroma `Document` chunk.
+
+    Returns:
+        Sanitized chunk string safe for LLM context and `/query` responses.
+
+    Raises:
+        RuntimeError: If Model Armor is configured (or fail-closed) and chunk screening fails.
+    """
     if not chunk_text or not chunk_text.strip():
         return chunk_text
 
@@ -616,7 +592,17 @@ def sanitize_chunk_text(chunk_text: str) -> str:
 
 
 def sanitize_retrieved_documents(docs: Sequence[Document]) -> List[Document]:
-    """Sanitizes a sequence of retrieved Document chunks concurrently while preserving chunk order and metadata."""
+    """Sanitizes a sequence of retrieved `Document` chunks concurrently while preserving order and metadata.
+
+    Propagates active `contextvars` into worker threads so `request_id`, `uid`, `pii_filtered`,
+    and `guardrail_actions` correlate accurately back to the parent HTTP request.
+
+    Args:
+        docs: Sequence of LangChain `Document` objects returned by Chroma similarity search.
+
+    Returns:
+        List of new `Document` instances with sensitive spans replaced by `[INFO_TYPE]` tokens.
+    """
     if not docs:
         return []
 
@@ -648,3 +634,10 @@ def sanitize_retrieved_documents(docs: Sequence[Document]) -> List[Document]:
     ]
 
 
+__all__ = [
+    "ScreeningDecision",
+    "sanitize_chunk_text",
+    "sanitize_model_output",
+    "sanitize_retrieved_documents",
+    "screen_user_prompt",
+]

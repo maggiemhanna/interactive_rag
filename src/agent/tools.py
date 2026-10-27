@@ -1,3 +1,13 @@
+"""XML-spotlighted and Cloud DLP-sanitized LangChain retriever tool builder.
+
+Constructs a Gemini-compatible `StructuredTool` over a tenant's Chroma collection that:
+1. Retrieves top-`k` passages via similarity search.
+2. Masks sensitive PII/secrets concurrently through Cloud Model Armor + Cloud DLP.
+3. Records retrieved passage counts on the active request context for EU AI Act grounding provenance.
+4. Encloses untrusted document text inside `<retrieved_chunk source="..." page="...">` XML tags
+   with angle-bracket escaping to prevent indirect prompt injection tag breakout.
+"""
+
 import os
 import re
 from typing import Any, Dict, Optional, Sequence
@@ -6,13 +16,13 @@ from langchain_core.documents import Document
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
-from src.core.audit import record_retrieved_chunks
-from src.core.chroma import get_vectorstore, require_collection
-from src.core.security import (
-    sanitize_retrieved_documents,
+from src.core.ai_security.armor import sanitize_retrieved_documents
+from src.core.ai_security.guardrails import (
     validate_collection_name,
     validate_embedding_model,
 )
+from src.core.compliance.context import record_retrieved_chunks
+from src.core.storage import get_vectorstore, require_collection
 
 EMPTY_RETRIEVAL_MARKER = (
     '<retrieved_context status="empty">'
@@ -31,7 +41,14 @@ class RetrieverInput(BaseModel):
 
 
 def safe_tool_name(collection_name: str) -> str:
-    """Constructs a Vertex AI / Gemini-compatible function tool name for the collection."""
+    """Constructs a Vertex AI / Gemini-compatible function tool identifier for `collection_name`.
+
+    Args:
+        collection_name: Validated Chroma collection name.
+
+    Returns:
+        Safe tool name (`<= 64` chars, starting with a letter/underscore) ending in `_retriever`.
+    """
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", collection_name or "collection").strip("_")
     if not cleaned or cleaned[0].isdigit():
         cleaned = f"col_{cleaned}"
@@ -39,7 +56,14 @@ def safe_tool_name(collection_name: str) -> str:
 
 
 def _escape_xml_attr(value: str) -> str:
-    """Escapes special characters inside XML attribute values."""
+    """Escapes special XML characters inside `source` and `page` attribute values.
+
+    Args:
+        value: Raw attribute string.
+
+    Returns:
+        XML-escaped attribute string.
+    """
     return (
         value.replace("&", "&amp;")
         .replace('"', "&quot;")
@@ -49,12 +73,26 @@ def _escape_xml_attr(value: str) -> str:
 
 
 def _escape_chunk_text(text: str) -> str:
-    """Escapes `<` and `>` inside retrieved document text to prevent `</retrieved_chunk>` tag breakout."""
+    """Escapes `<` and `>` inside retrieved document text to prevent `</retrieved_chunk>` breakout.
+
+    Args:
+        text: Sanitized chunk body text.
+
+    Returns:
+        Chunk body text with angle brackets escaped as `&lt;` and `&gt;`.
+    """
     return text.replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _resolve_one_indexed_page(metadata: Dict[str, Any]) -> str:
-    """Converts PyPDF's 0-indexed `page` metadata into a human-readable 1-indexed page string."""
+    """Converts PyPDF's 0-indexed `page` metadata into a human-readable 1-indexed page string.
+
+    Args:
+        metadata: Document chunk metadata dictionary from ChromaDB.
+
+    Returns:
+        1-indexed page label string (defaults to `'1'` when absent).
+    """
     raw_page = metadata.get("page")
     if raw_page is not None and not isinstance(raw_page, bool):
         try:
@@ -71,7 +109,14 @@ def _resolve_one_indexed_page(metadata: Dict[str, Any]) -> str:
 
 
 def format_retrieved_chunks(docs: Sequence[Document]) -> str:
-    """Formats retrieved documents inside `<retrieved_chunk source="..." page="...">` spotlighting tags."""
+    """Formats retrieved documents inside `<retrieved_chunk source="..." page="...">` spotlighting tags.
+
+    Args:
+        docs: Sequence of sanitized LangChain `Document` chunks.
+
+    Returns:
+        XML-spotlighted passage string, or `EMPTY_RETRIEVAL_MARKER` when `docs` is empty.
+    """
     if not docs:
         return EMPTY_RETRIEVAL_MARKER
 
@@ -101,8 +146,22 @@ def get_retriever_tool(
         "Search and retrieve relevant document chunks from collection '{collection_name}'. "
         "Passages are returned inside <retrieved_chunk source=\"...\" page=\"...\"> XML tags."
     ),
-):
-    """Loads a Chroma vectorstore collection and creates an XML-spotlighted LangChain retriever tool."""
+) -> StructuredTool:
+    """Loads a Chroma collection and creates an XML-spotlighted LangChain `StructuredTool`.
+
+    Args:
+        collection_name: Validated Chroma collection identifier.
+        persist_directory: Local filesystem path of the tenant's ChromaDB directory.
+        k: Number of top matching chunks retrieved per tool call (defaults to `5`).
+        embedding_model: Optional approved Vertex AI embedding model identifier.
+        description: Tool description template exposed to the Gemini tool-calling model.
+
+    Returns:
+        Configured `StructuredTool` ready to bind to `ChatGoogleGenerativeAI`.
+
+    Raises:
+        FileNotFoundError: If `collection_name` does not exist in `persist_directory`.
+    """
     safe_collection = validate_collection_name(collection_name)
     safe_embedding = validate_embedding_model(embedding_model)
     require_collection(persist_directory, safe_collection)
@@ -124,6 +183,7 @@ def get_retriever_tool(
     )
 
     def _retrieve(query: str) -> str:
+        """Executes similarity search, sanitizes chunks via DLP, and formats XML spotlight blocks."""
         docs = retriever.invoke(query)
         safe_docs = sanitize_retrieved_documents(docs)
         record_retrieved_chunks(len(safe_docs))
@@ -135,3 +195,12 @@ def get_retriever_tool(
         description=tool_description,
         args_schema=RetrieverInput,
     )
+
+
+__all__ = [
+    "EMPTY_RETRIEVAL_MARKER",
+    "RetrieverInput",
+    "format_retrieved_chunks",
+    "get_retriever_tool",
+    "safe_tool_name",
+]

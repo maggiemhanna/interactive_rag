@@ -15,13 +15,14 @@ from langchain_core.tools import tool
 from scripts.check_region_policy import evaluate_effective_location_policy
 from src.agent import app as agent_app_module
 from src.agent import graph as agent_graph_module
-from src.core import audit as audit_module
-from src.core import chroma as chroma_module
 from src.core import config as config_module
-from src.core import security as security_module
-from src.core.audit import hash_query, register_audit_listener
+from src.core.ai_security import armor as armor_module
+from src.core.ai_security import guardrails as guardrails_module
+from src.core.compliance import audit as audit_module
+from src.core.compliance.audit import hash_query, register_audit_listener
+from src.core.compliance.residency import validate_gcp_region
 from src.core.config import get_google_cloud_location, get_model_armor_location
-from src.core.security import validate_gcp_region
+from src.core.storage import chroma as chroma_module
 from src.core.storage import release_client_cache
 from src.ingestion import app as ingestion_app_module
 from tests.ai_security import (
@@ -111,7 +112,7 @@ class TestPhase1DataResidency(unittest.TestCase):
             clear=False,
         ):
             with self.assertRaises(ValueError):
-                security_module._resolve_model_armor_target()
+                armor_module._resolve_model_armor_target()
 
         with patch.dict(
             os.environ,
@@ -123,7 +124,7 @@ class TestPhase1DataResidency(unittest.TestCase):
             clear=False,
         ):
             with self.assertRaises(ValueError):
-                security_module._resolve_model_armor_target()
+                armor_module._resolve_model_armor_target()
 
     def test_get_embeddings_pins_google_cloud_location_and_rejects_global(self):
         mock_embeddings_cls = MagicMock()
@@ -258,13 +259,13 @@ class TestPhase1DataResidency(unittest.TestCase):
             with self.assertRaises(ValueError):
                 config_module.get_allowed_llm_models()
             with self.assertRaises(ValueError):
-                security_module.validate_llm_model(None)
+                guardrails_module.validate_llm_model(None)
 
         with patch.dict(os.environ, {"ALLOWED_EMBEDDING_MODELS": ""}, clear=False):
             with self.assertRaises(ValueError):
                 config_module.get_allowed_embedding_models()
             with self.assertRaises(ValueError):
-                security_module.validate_embedding_model(None)
+                guardrails_module.validate_embedding_model(None)
 
         # Default selection dynamically tracks the first configured model in each allowlist
         with patch.dict(
@@ -275,15 +276,15 @@ class TestPhase1DataResidency(unittest.TestCase):
             },
             clear=False,
         ):
-            self.assertEqual(security_module.validate_llm_model(None), "gemini-2.5-pro")
-            self.assertEqual(security_module.validate_llm_model(""), "gemini-2.5-pro")
-            self.assertEqual(security_module.validate_embedding_model(None), "text-embedding-005")
-            self.assertEqual(security_module.validate_embedding_model(""), "text-embedding-005")
+            self.assertEqual(guardrails_module.validate_llm_model(None), "gemini-2.5-pro")
+            self.assertEqual(guardrails_module.validate_llm_model(""), "gemini-2.5-pro")
+            self.assertEqual(guardrails_module.validate_embedding_model(None), "text-embedding-005")
+            self.assertEqual(guardrails_module.validate_embedding_model(""), "text-embedding-005")
 
         # collection_name is mandatory (no fallback default collection)
         for missing_col in (None, "", "   "):
             with self.assertRaises(ValueError):
-                security_module.validate_collection_name(missing_col)  # type: ignore[arg-type]
+                guardrails_module.validate_collection_name(missing_col)  # type: ignore[arg-type]
 
         # Verify .env and Terraform variables stay aligned on the regional model catalogs
         expected_llms = "gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite"
@@ -318,7 +319,7 @@ class TestPhase2AuditLogging(unittest.TestCase):
         self.chroma_tmp = tempfile.mkdtemp(prefix="comp_audit_chroma_")
         self.uploads_tmp = tempfile.mkdtemp(prefix="comp_audit_uploads_")
         agent_graph_module.MEMORY_SAVER.storage.clear()
-        security_module._model_armor_clients.clear()
+        armor_module._model_armor_clients.clear()
         audit_module._cloud_loggers.clear()
 
         self.captured_events: list[dict] = []
@@ -335,7 +336,7 @@ class TestPhase2AuditLogging(unittest.TestCase):
                     release_client_cache(entry.path)
             shutil.rmtree(self.chroma_tmp, ignore_errors=True)
         shutil.rmtree(self.uploads_tmp, ignore_errors=True)
-        security_module._model_armor_clients.clear()
+        armor_module._model_armor_clients.clear()
         audit_module._cloud_loggers.clear()
 
     def _env(self, **overrides: str) -> dict[str, str]:
@@ -451,7 +452,9 @@ class TestPhase2AuditLogging(unittest.TestCase):
             "agent",
             "agent.stream",
             "agent.graph",
-            "security",
+            "ai_security.armor",
+            "ai_security.safety",
+            "ai_security.guardrails",
         ]
         loggers = [logging.getLogger(name) for name in monitored_logger_names]
         for lg in loggers:
@@ -576,7 +579,7 @@ class TestPhase2AuditLogging(unittest.TestCase):
         ), patch.object(
             agent_graph_module, "ChatGoogleGenerativeAI", side_effect=GroundedCitingChatModel
         ), patch.object(
-            security_module.modelarmor_v1, "ModelArmorClient", return_value=mock_armor_client
+            armor_module.modelarmor_v1, "ModelArmorClient", return_value=mock_armor_client
         ):
             self.ingestion_client.post(
                 "/ingest",
@@ -850,7 +853,7 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         MEMORY_SAVER.writes.clear()
         MEMORY_SAVER.blobs.clear()
 
-        from src.core import storage as storage_module
+        from src.core.storage import gcs_sync as gcs_sync_module
 
         self._env_patcher = patch.dict(
             os.environ,
@@ -874,7 +877,7 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         self._env_patcher.start()
 
         self._bucket_patcher = patch.object(
-            storage_module, "_get_bucket", return_value=self.fake_bucket
+            gcs_sync_module, "_get_bucket", return_value=self.fake_bucket
         )
         self._bucket_patcher.start()
 
@@ -1147,7 +1150,7 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
                 "MODEL_ARMOR_TEMPLATE_ID": "projects/interactive-rag/locations/us-central1/templates/guard",
             },
             clear=False,
-        ), patch.object(security_module, "_get_model_armor_client", return_value=mock_armor_client):
+        ), patch.object(armor_module, "_get_model_armor_client", return_value=mock_armor_client):
             r_sse = self.agent_client.post(
                 "/agent/stream",
                 headers={"X-Dev-User-Id": "alice_gdpr", "X-Request-Id": "req-eu-sse-pii"},
@@ -1223,7 +1226,7 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         pi_client = MagicMock()
         pi_client.sanitize_user_prompt.return_value = _blocked_pi_prompt_response()
         with patch.dict(os.environ, armor_env, clear=False), patch.object(
-            security_module, "_get_model_armor_client", return_value=pi_client
+            armor_module, "_get_model_armor_client", return_value=pi_client
         ):
             r_pi = self.agent_client.post(
                 "/agent",
@@ -1263,7 +1266,7 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
             )
         )
         with patch.dict(os.environ, armor_env, clear=False), patch.object(
-            security_module, "_get_model_armor_client", return_value=uri_client
+            armor_module, "_get_model_armor_client", return_value=uri_client
         ):
             r_uri = self.agent_client.post(
                 "/agent",
@@ -1323,7 +1326,7 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         )
         rai_client.sanitize_model_response.side_effect = [rai_clean_chunk, rai_blocked_output]
         with patch.dict(os.environ, armor_env, clear=False), patch.object(
-            security_module, "_get_model_armor_client", return_value=rai_client
+            armor_module, "_get_model_armor_client", return_value=rai_client
         ):
             r_rai = self.agent_client.post(
                 "/agent",

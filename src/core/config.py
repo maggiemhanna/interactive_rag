@@ -1,6 +1,13 @@
+"""Centralized environment configuration and runtime settings for InteractiveRAG.
+
+Loads `.env` files once on startup and exposes typed, validated runtime getters for
+approved Vertex AI model catalogs, regional GCP location pinning, Cloud Run runtime
+detection, CORS allowlists, upload/query ceilings, and Model Armor configuration.
+"""
+
 import os
 import re
-from typing import Tuple
+from typing import List, Tuple
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -8,7 +15,7 @@ SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def load_env() -> None:
-    """Loads environment variables from root .env and src/.env files if present."""
+    """Loads environment variables from repository root `.env` and `src/.env` if present."""
     load_dotenv(find_dotenv())
     load_dotenv(os.path.join(SRC_DIR, ".env"))
 
@@ -27,6 +34,17 @@ GCP_REGION_PATTERN = re.compile(r"^[a-z]+-[a-z]+[0-9]+$")
 
 
 def _parse_required_csv_models(env_var: str) -> Tuple[str, ...]:
+    """Parses a required comma-separated environment variable into a deduplicated model tuple.
+
+    Args:
+        env_var: Name of the environment variable containing approved model identifiers.
+
+    Returns:
+        Deduplicated tuple of non-empty model identifier strings preserving declaration order.
+
+    Raises:
+        ValueError: If the environment variable is unset or contains no valid model names.
+    """
     raw = os.getenv(env_var, "").strip()
     parsed = tuple(dict.fromkeys(item.strip() for item in raw.split(",") if item.strip()))
     if not parsed:
@@ -37,6 +55,15 @@ def _parse_required_csv_models(env_var: str) -> Tuple[str, ...]:
 
 
 def _parse_positive_int(env_var: str, default: int) -> int:
+    """Parses a positive integer ceiling from an environment variable with a safe fallback.
+
+    Args:
+        env_var: Name of the integer environment variable to read.
+        default: Fallback positive integer returned when unset, non-numeric, or <= 0.
+
+    Returns:
+        Positive integer value from the environment or `default`.
+    """
     raw = os.getenv(env_var, "").strip()
     if not raw:
         return default
@@ -47,23 +74,76 @@ def _parse_positive_int(env_var: str, default: int) -> int:
         return default
 
 
+def is_cloud_run() -> bool:
+    """Checks whether the process is executing inside a Google Cloud Run container.
+
+    Returns:
+        True when Cloud Run's standard `K_SERVICE` environment variable is populated.
+    """
+    return bool(os.getenv("K_SERVICE", "").strip())
+
+
+def get_allowed_origins() -> List[str]:
+    """Parses `ALLOWED_ORIGINS` from the environment for FastAPI CORS middleware.
+
+    Defaults to standard localhost React/Vite development ports when running locally,
+    and fails closed (`[]`) inside Cloud Run if `ALLOWED_ORIGINS` is omitted.
+
+    Returns:
+        List of normalized origin URLs (with trailing slashes stripped) or `["*"]`.
+    """
+    raw = os.getenv("ALLOWED_ORIGINS", "").strip()
+    if raw:
+        origins: List[str] = []
+        for item in raw.split(","):
+            cleaned = item.strip()
+            if not cleaned:
+                continue
+            origins.append("*" if cleaned == "*" else cleaned.rstrip("/"))
+        return origins
+
+    if is_cloud_run():
+        return []
+
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+
+
 def get_allowed_llm_models() -> Tuple[str, ...]:
-    """Returns the server-approved tuple of Vertex AI generative LLM model names from ALLOWED_LLM_MODELS."""
+    """Returns the server-approved tuple of Vertex AI generative LLM model names.
+
+    Returns:
+        Ordered tuple of model names parsed from `ALLOWED_LLM_MODELS`.
+
+    Raises:
+        ValueError: If `ALLOWED_LLM_MODELS` is missing or empty.
+    """
     return _parse_required_csv_models("ALLOWED_LLM_MODELS")
 
 
 def get_allowed_embedding_models() -> Tuple[str, ...]:
-    """Returns the server-approved tuple of Vertex AI embedding model names from ALLOWED_EMBEDDING_MODELS."""
+    """Returns the server-approved tuple of Vertex AI embedding model names.
+
+    Returns:
+        Ordered tuple of embedding model names parsed from `ALLOWED_EMBEDDING_MODELS`.
+
+    Raises:
+        ValueError: If `ALLOWED_EMBEDDING_MODELS` is missing or empty.
+    """
     return _parse_required_csv_models("ALLOWED_EMBEDDING_MODELS")
 
 
 def get_default_llm_model() -> str:
-    """Returns the primary approved generative LLM model (first entry in ALLOWED_LLM_MODELS)."""
+    """Returns the primary approved generative LLM model (first entry in `ALLOWED_LLM_MODELS`)."""
     return get_allowed_llm_models()[0]
 
 
 def get_default_embedding_model() -> str:
-    """Returns the primary approved embedding model (first entry in ALLOWED_EMBEDDING_MODELS)."""
+    """Returns the primary approved embedding model (first entry in `ALLOWED_EMBEDDING_MODELS`)."""
     return get_allowed_embedding_models()[0]
 
 
@@ -73,7 +153,7 @@ def get_max_query_chars() -> int:
 
 
 def get_agent_recursion_limit() -> int:
-    """Returns the LangGraph recursion_limit ceiling for agent tool-call cycles."""
+    """Returns the LangGraph `recursion_limit` ceiling for agent tool-call cycles."""
     return _parse_positive_int("AGENT_RECURSION_LIMIT", 6)
 
 
@@ -93,22 +173,22 @@ def get_max_chunks_per_ingest() -> int:
 
 
 def get_gemini_safety_threshold() -> str:
-    """Returns the configured Gemini HarmBlockThreshold name."""
+    """Returns the configured Vertex AI Gemini `HarmBlockThreshold` name."""
     return os.getenv("GEMINI_SAFETY_THRESHOLD", "BLOCK_LOW_AND_ABOVE").strip().upper() or "BLOCK_LOW_AND_ABOVE"
 
 
 def get_google_cloud_location() -> str:
-    """Returns the unified regional GCP location (`GOOGLE_CLOUD_LOCATION`, defaulting to 'us-central1')."""
+    """Returns the unified single-region GCP location (`GOOGLE_CLOUD_LOCATION`, defaulting to `'us-central1'`)."""
     return os.getenv("GOOGLE_CLOUD_LOCATION", "").strip() or "us-central1"
 
 
 def get_model_armor_template_id() -> str:
-    """Returns the configured Google Cloud Model Armor template resource ID (or empty if unset)."""
+    """Returns the configured Google Cloud Model Armor template resource ID (or empty string if unset)."""
     return os.getenv("MODEL_ARMOR_TEMPLATE_ID", "").strip()
 
 
 def get_model_armor_location() -> str:
-    """Returns the regional GCP location hosting the Model Armor template (defaults to GOOGLE_CLOUD_LOCATION)."""
+    """Returns the regional GCP location hosting the Model Armor template (defaults to `GOOGLE_CLOUD_LOCATION`)."""
     return os.getenv("MODEL_ARMOR_LOCATION", "").strip() or get_google_cloud_location()
 
 
@@ -125,5 +205,5 @@ MODEL_ARMOR_LOCATION: str = get_model_armor_location()
 
 
 def is_reload_enabled() -> bool:
-    """Returns True when UVICORN_RELOAD is enabled in the environment."""
+    """Returns True when `UVICORN_RELOAD` hot-reloading is enabled in the environment."""
     return os.getenv("UVICORN_RELOAD", "").strip().lower() in {"1", "true", "yes"}

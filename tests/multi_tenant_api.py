@@ -12,8 +12,8 @@ from langchain_core.messages import AIMessage
 
 from src.agent import app as agent_module
 from src.agent import graph as agent_graph_module
-from src.core import chroma as chroma_module
-from src.core import storage as chroma_storage
+from src.core.storage import chroma as chroma_module
+from src.core.storage import gcs_sync as gcs_sync_module
 from src.core.logger import setup_logging
 from src.core.storage import release_client_cache
 from src.ingestion import app as ingestion_module
@@ -167,7 +167,7 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
 
     def test_02_cloud_run_blocks_arbitrary_server_pdf_paths(self):
         with patch("src.core.auth.verify_bearer_token", side_effect=fake_verify_bearer_token), patch.object(
-            chroma_storage, "_get_bucket", return_value=self.fake_bucket
+            gcs_sync_module, "_get_bucket", return_value=self.fake_bucket
         ), patch.dict(os.environ, self._base_env(self.ingestion_tmp), clear=False):
             headers = {"Authorization": "Bearer token-alice"}
 
@@ -192,7 +192,7 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
         bob_headers = {"Authorization": "Bearer token-bob"}
 
         with patch("src.core.auth.verify_bearer_token", side_effect=fake_verify_bearer_token), patch.object(
-            chroma_storage, "_get_bucket", return_value=self.fake_bucket
+            gcs_sync_module, "_get_bucket", return_value=self.fake_bucket
         ), patch.object(
             chroma_module, "GoogleGenerativeAIEmbeddings", return_value=DeterministicFakeEmbeddings()
         ), patch.object(

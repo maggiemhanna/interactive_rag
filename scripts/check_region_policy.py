@@ -15,6 +15,14 @@ LOCATION_GROUP_SUFFIX = "-locations"
 
 
 def _normalize_policy_values(values: List[str]) -> Set[str]:
+    """Normalizes GCP Organization Policy location strings by stripping `in:` prefixes.
+
+    Args:
+        values: Raw `allowedValues` or `deniedValues` list from `listPolicy`.
+
+    Returns:
+        Lowercased set of location tokens without `in:` prefixes.
+    """
     normalized: Set[str] = set()
     for raw in values or []:
         cleaned = (raw or "").strip().lower()
@@ -26,6 +34,15 @@ def _normalize_policy_values(values: List[str]) -> Set[str]:
 
 
 def _matches_location_set(region: str, normalized_values: Set[str]) -> bool:
+    """Checks whether `region` matches an exact region or macro location group in `normalized_values`.
+
+    Args:
+        region: Lowercased single GCP region (e.g., `"us-central1"`).
+        normalized_values: Normalized Organization Policy location tokens.
+
+    Returns:
+        `True` if `region` is covered by `normalized_values`, otherwise `False`.
+    """
     if region in normalized_values or f"{region}{LOCATION_GROUP_SUFFIX}" in normalized_values:
         return True
     if region.startswith("us-") and (
@@ -44,6 +61,14 @@ def _matches_location_set(region: str, normalized_values: Set[str]) -> bool:
 
 
 def _summarize_allowed_regions(normalized_allowed: Set[str]) -> str:
+    """Formats normalized Organization Policy `allowedValues` into a human-readable summary.
+
+    Args:
+        normalized_allowed: Normalized Organization Policy `allowedValues` tokens.
+
+    Returns:
+        Comma-separated string of concrete regions and macro location groups.
+    """
     regions: Set[str] = set()
     macro_groups: Set[str] = set()
     for val in normalized_allowed:
@@ -160,6 +185,11 @@ def fetch_effective_location_policy(project_id: str) -> Dict[str, Any]:
 
 
 def main() -> int:
+    """CLI entrypoint verifying `--region` against the live project Organization Policy.
+
+    Returns:
+        Exit status `0` when compliant, or `1` when invalid or non-compliant.
+    """
     parser = argparse.ArgumentParser(
         description="Verify deployment region against live GCP Organization Policy (gcp.resourceLocations)."
     )

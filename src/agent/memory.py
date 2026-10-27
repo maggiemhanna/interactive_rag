@@ -1,3 +1,10 @@
+"""Tenant-namespaced in-memory LangGraph conversation checkpointer and DSAR lifecycle helpers.
+
+Maintains a shared `InMemorySaver` keyed by `{uid}:{thread_id}` across warm requests and
+provides thread-safe enumeration (`list_user_memory_threads`) and GDPR Art. 17 erasure
+(`clear_user_memory`) scoped strictly to a single tenant `uid`.
+"""
+
 import threading
 from typing import List, Set
 
@@ -15,6 +22,14 @@ _memory_lock = threading.RLock()
 
 
 def _collect_matching_thread_ids(prefix: str) -> Set[str]:
+    """Collects all internal `MEMORY_SAVER` thread keys matching `prefix` (`'{uid}:'`).
+
+    Args:
+        prefix: Tenant namespace prefix ending with `':'`.
+
+    Returns:
+        Set of full `{uid}:{thread_id}` checkpoint keys present across storage, writes, and blobs.
+    """
     matched: Set[str] = set()
     for tid in list(getattr(MEMORY_SAVER, "storage", {}).keys()):
         if isinstance(tid, str) and tid.startswith(prefix):
@@ -29,7 +44,14 @@ def _collect_matching_thread_ids(prefix: str) -> Set[str]:
 
 
 def list_user_memory_threads(uid: str) -> List[str]:
-    """Returns sorted user-local thread identifiers stored in MEMORY_SAVER for `uid`."""
+    """Returns sorted user-local thread identifiers stored in `MEMORY_SAVER` for `uid`.
+
+    Args:
+        uid: Verified tenant user identifier.
+
+    Returns:
+        Sorted list of unprefixed client `thread_id` strings belonging to `uid`.
+    """
     safe_uid = validate_uid(uid)
     prefix = f"{safe_uid}:"
     with _memory_lock:
@@ -38,9 +60,13 @@ def list_user_memory_threads(uid: str) -> List[str]:
 
 
 def clear_user_memory(uid: str) -> int:
-    """Purges all `{uid}:*` conversation checkpoints, writes, and blobs from MEMORY_SAVER.
+    """Purges all `{uid}:*` conversation checkpoints, writes, and blobs from `MEMORY_SAVER`.
 
-    Returns the number of distinct conversation threads erased for `uid`.
+    Args:
+        uid: Verified tenant user identifier.
+
+    Returns:
+        Number of distinct conversation threads permanently erased for `uid`.
     """
     safe_uid = validate_uid(uid)
     prefix = f"{safe_uid}:"
@@ -54,3 +80,6 @@ def clear_user_memory(uid: str) -> int:
             f"Purged {len(matched)} conversation thread(s) from MEMORY_SAVER for uid='{safe_uid}'."
         )
     return len(matched)
+
+
+__all__ = ["MEMORY_SAVER", "clear_user_memory", "list_user_memory_threads"]
