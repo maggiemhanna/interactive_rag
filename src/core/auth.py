@@ -8,6 +8,7 @@ from fastapi import Depends, Header, HTTPException, status
 from firebase_admin import auth as firebase_auth
 from pydantic import BaseModel
 
+from src.core.audit import emit_audit_event, set_audit_uid
 from src.core.logger import setup_logging
 
 logger = setup_logging(name="auth")
@@ -31,7 +32,13 @@ class AuthenticatedUser(BaseModel):
 def validate_uid(uid: Optional[str]) -> str:
     """Validates that a user ID is safe for filesystem and GCS object prefix construction."""
     if not uid or not isinstance(uid, str) or not UID_PATTERN.match(uid):
-        logger.warning(f"Rejected unsafe or malformed uid: {uid!r}")
+        logger.warning("Rejected unsafe or malformed uid format.")
+        emit_audit_event(
+            "auth.failure",
+            severity="WARNING",
+            status="denied",
+            reason="invalid_uid_format",
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid user identifier format.",
@@ -121,6 +128,12 @@ def init_firebase() -> firebase_admin.App:
 def _extract_bearer_token(authorization: Optional[str]) -> str:
     """Extracts the raw JWT from an 'Authorization: Bearer <token>' header."""
     if not authorization:
+        emit_audit_event(
+            "auth.failure",
+            severity="WARNING",
+            status="denied",
+            reason="missing_authorization_header",
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing Authorization header. Expected 'Bearer <ID_TOKEN>'.",
@@ -129,6 +142,12 @@ def _extract_bearer_token(authorization: Optional[str]) -> str:
 
     parts = authorization.strip().split(" ", 1)
     if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
+        emit_audit_event(
+            "auth.failure",
+            severity="WARNING",
+            status="denied",
+            reason="malformed_authorization_header",
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Malformed Authorization header. Expected 'Bearer <ID_TOKEN>'.",
@@ -149,12 +168,24 @@ def verify_bearer_token(token: str) -> Dict[str, Any]:
         )
         return decoded_claims
     except firebase_auth.ExpiredIdTokenError:
+        emit_audit_event(
+            "auth.failure",
+            severity="WARNING",
+            status="denied",
+            reason="expired_token",
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication token has expired.",
             headers=WWW_AUTHENTICATE_HEADER,
         )
     except firebase_auth.RevokedIdTokenError:
+        emit_audit_event(
+            "auth.failure",
+            severity="WARNING",
+            status="denied",
+            reason="revoked_token",
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication token has been revoked.",
@@ -162,12 +193,24 @@ def verify_bearer_token(token: str) -> Dict[str, Any]:
         )
     except firebase_auth.CertificateFetchError as e:
         logger.error(f"Failed to fetch Google public signing certificates: {e}")
+        emit_audit_event(
+            "auth.failure",
+            severity="ERROR",
+            status="error",
+            reason="certificate_fetch_error",
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Unable to verify authentication token at this time.",
         )
     except (firebase_auth.InvalidIdTokenError, ValueError) as e:
         logger.warning(f"Rejected invalid ID token: {e}")
+        emit_audit_event(
+            "auth.failure",
+            severity="WARNING",
+            status="denied",
+            reason="invalid_token",
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication token.",
@@ -177,6 +220,12 @@ def verify_bearer_token(token: str) -> Dict[str, Any]:
         raise
     except Exception as e:
         logger.error(f"Unexpected error during ID token verification: {e}")
+        emit_audit_event(
+            "auth.failure",
+            severity="WARNING",
+            status="denied",
+            reason="verification_error",
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication failed.",
@@ -192,6 +241,7 @@ def get_current_user_info(
     if is_auth_bypassed():
         raw_dev_uid = (x_dev_user_id or os.getenv("DEV_USER_ID", "local-dev")).strip()
         uid = validate_uid(raw_dev_uid)
+        set_audit_uid(uid)
         return AuthenticatedUser(
             uid=uid,
             email=f"{uid}@local.dev",
@@ -202,6 +252,7 @@ def get_current_user_info(
     claims = verify_bearer_token(token)
     raw_uid = claims.get("uid") or claims.get("sub")
     uid = validate_uid(raw_uid)
+    set_audit_uid(uid)
 
     return AuthenticatedUser(
         uid=uid,
@@ -215,3 +266,4 @@ def get_current_user(
 ) -> str:
     """FastAPI dependency returning the verified, path-safe user `uid` string."""
     return user.uid
+

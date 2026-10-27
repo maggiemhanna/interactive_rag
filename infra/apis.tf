@@ -14,6 +14,7 @@ locals {
     "identitytoolkit.googleapis.com",
     "apikeys.googleapis.com",
     "secretmanager.googleapis.com",
+    "logging.googleapis.com",
   ])
 
   artifact_registry_url = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.docker_repo.repository_id}"

@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
+from src.core.audit import hash_query
 from src.core.chroma import get_vectorstore, require_collection
 from src.core.logger import setup_logging
 from src.core.security import sanitize_retrieved_documents
@@ -104,8 +105,10 @@ def search_collection(
         for doc in safe_docs
     ]
 
+    query_digest = hash_query(query)
     logger.info(
-        f"Query '{query}' by uid='{uid}' against collection '{collection_name}' "
-        f"returned {len(results)} results."
+        f"Similarity search by uid='{uid}' against collection '{collection_name}' "
+        f"(query_sha256='{query_digest}', query_chars={len(query)}) returned {len(results)} results."
     )
     return results
+

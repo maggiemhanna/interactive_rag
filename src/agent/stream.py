@@ -10,6 +10,8 @@ from src.agent.display import print_event, print_header
 from src.agent.graph import build_agent
 from src.agent.schemas import AgentRequest
 from src.agent.tools import get_retriever_tool
+from src.core.audit import emit_audit_event, hash_query
+from src.core.auth import is_cloud_run
 from src.core.chroma import has_sqlite
 from src.core.config import get_agent_recursion_limit
 from src.core.logger import setup_logging
@@ -39,6 +41,17 @@ def extract_text(content) -> str:
     return str(content)
 
 
+def _should_print_console(verbose_console: Optional[bool], is_cli_mode: bool) -> bool:
+    """Determines whether Rich message panels should print to stdout (never in Cloud Run or HTTP API calls unless opted in)."""
+    if is_cloud_run():
+        return False
+    if verbose_console is not None:
+        return verbose_console
+    if os.getenv("AGENT_CONSOLE_TRACE", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    return is_cli_mode
+
+
 def _stream_events(
     query: str,
     persist_directory: str,
@@ -46,6 +59,7 @@ def _stream_events(
     thread_id: str,
     model_name: Optional[str] = None,
     embedding_model: Optional[str] = None,
+    show_console: bool = False,
 ) -> Generator[Dict[str, Any], None, None]:
     retriever_tool = get_retriever_tool(
         collection_name=collection_name,
@@ -83,8 +97,8 @@ def _stream_events(
                     continue
                 emitted_keys.add(dedup_key)
 
-                # Print all components of the message using src/agent/display.py
-                print_event(last_msg)
+                if show_console:
+                    print_event(last_msg)
 
                 msg_dict = {
                     "type": getattr(last_msg, "type", "unknown"),
@@ -104,8 +118,18 @@ def _stream_events(
         logger.warning(
             f"Agent reached recursion_limit={recursion_limit} for thread_id='{thread_id}'."
         )
+        emit_audit_event(
+            "agent.recursion_limit",
+            severity="WARNING",
+            status="truncated",
+            collection_name=collection_name,
+            recursion_limit=recursion_limit,
+            query_sha256=hash_query(query),
+            query_chars=len(query),
+        )
         fallback_msg = AIMessage(content=RECURSION_LIMIT_MESSAGE)
-        print_event(fallback_msg)
+        if show_console:
+            print_event(fallback_msg)
         yield {
             "event": "message",
             "message": {
@@ -123,8 +147,13 @@ def stream_events(
     model_name: Optional[str] = None,
     embedding_model: Optional[str] = None,
     persist_directory: Optional[str] = None,
+    verbose_console: Optional[bool] = None,
 ) -> Generator[Dict[str, Any], None, None]:
-    """Streams graph message output, printing each message component using print_event."""
+    """Streams graph message output, printing Rich console panels only in interactive CLI mode."""
+    show_console = _should_print_console(
+        verbose_console=verbose_console,
+        is_cli_mode=(persist_directory is None),
+    )
     if persist_directory is not None:
         yield from _stream_events(
             query=query,
@@ -133,6 +162,7 @@ def stream_events(
             thread_id=thread_id,
             model_name=model_name,
             embedding_model=embedding_model,
+            show_console=show_console,
         )
         return
 
@@ -146,6 +176,7 @@ def stream_events(
             thread_id=f"{cli_uid}:{thread_id}",
             model_name=model_name,
             embedding_model=embedding_model,
+            show_console=show_console,
         )
 
 
@@ -155,6 +186,9 @@ def stream_sse(
     scoped_thread_id: str,
 ) -> Generator[str, None, None]:
     """Generator yielding Server-Sent Events (SSE) payloads while pinning user Chroma cache."""
+    query_digest = hash_query(request.query)
+    query_len = len(request.query)
+    answer_chars = 0
     try:
         with user_read_lock(uid) as stream_persist_dir:
             for evt in stream_events(
@@ -164,16 +198,43 @@ def stream_sse(
                 model_name=request.model_name,
                 embedding_model=request.embedding_model,
                 persist_directory=stream_persist_dir,
+                verbose_console=False,
             ):
+                msg = evt["message"]
+                if msg.get("type") == "ai" and msg.get("content"):
+                    answer_chars = len(str(msg["content"]))
                 data = {
                     "event": evt["event"],
-                    "message": evt["message"],
+                    "message": msg,
                 }
                 yield f"data: {json.dumps(data)}\n\n"
+        emit_audit_event(
+            "agent.query",
+            uid=uid,
+            collection_name=request.collection_name,
+            model_name=request.model_name,
+            embedding_model=request.embedding_model,
+            stream=True,
+            query_sha256=query_digest,
+            query_chars=query_len,
+            answer_chars=answer_chars,
+        )
         yield "data: [DONE]\n\n"
     except Exception:
         logger.exception(
             f"Unexpected error streaming Agentic RAG SSE for uid='{uid}' (thread_id='{scoped_thread_id}')"
+        )
+        emit_audit_event(
+            "agent.query",
+            severity="ERROR",
+            status="error",
+            uid=uid,
+            collection_name=request.collection_name,
+            model_name=request.model_name,
+            embedding_model=request.embedding_model,
+            stream=True,
+            query_sha256=query_digest,
+            query_chars=query_len,
         )
         err_data = {
             "event": "error",
@@ -193,6 +254,10 @@ def run_interactive(
 ) -> None:
     """Interactive runner to stream message output and pretty print message components."""
     print_header("Agentic RAG Assistant Initialized", "magenta")
-    logger.info(f"Running agent on collection '{collection_name}'")
-    for _ in stream_events(query=query, collection_name=collection_name):
+    logger.info(
+        f"Running interactive agent on collection '{collection_name}' "
+        f"(query_sha256='{hash_query(query)}', query_chars={len(query)})"
+    )
+    for _ in stream_events(query=query, collection_name=collection_name, verbose_console=True):
         pass
+

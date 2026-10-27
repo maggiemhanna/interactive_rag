@@ -11,6 +11,7 @@ from src.agent.stream import (
     stream_events,
     stream_sse,
 )
+from src.core.audit import emit_audit_event, hash_query
 from src.core.auth import get_current_user
 from src.core.chroma import require_collection
 from src.core.config import AGENT_PORT, is_reload_enabled
@@ -31,10 +32,12 @@ def agent(
 ):
     """FastAPI endpoint to run the Agentic RAG assistant with a query."""
     scoped_thread_id = f"{uid}:{request.thread_id}"
+    query_digest = hash_query(request.query)
+    query_len = len(request.query)
     try:
         logger.info(
-            f"Received Agentic RAG query from uid='{uid}': '{request.query}' "
-            f"for collection '{request.collection_name}' (stream={request.stream})"
+            f"Received Agentic RAG query from uid='{uid}' for collection '{request.collection_name}' "
+            f"(query_sha256='{query_digest}', query_chars={query_len}, stream={request.stream})"
         )
 
         # Pre-validate user's synced ChromaDB & collection so missing collections return 404 even when stream=True
@@ -60,6 +63,7 @@ def agent(
                     model_name=request.model_name,
                     embedding_model=request.embedding_model,
                     persist_directory=persist_directory,
+                    verbose_console=False,
                 )
             )
 
@@ -70,6 +74,18 @@ def agent(
                 final_answer = msg["content"]
                 break
 
+        emit_audit_event(
+            "agent.query",
+            uid=uid,
+            collection_name=request.collection_name,
+            model_name=request.model_name,
+            embedding_model=request.embedding_model,
+            stream=False,
+            query_sha256=query_digest,
+            query_chars=query_len,
+            answer_chars=len(final_answer),
+        )
+
         return {
             "status": "success",
             "query": request.query,
@@ -78,14 +94,44 @@ def agent(
             "messages": formatted_messages,
         }
     except LockTimeoutError as e:
+        emit_audit_event(
+            "agent.query",
+            severity="WARNING",
+            status="lock_timeout",
+            uid=uid,
+            collection_name=request.collection_name,
+            stream=request.stream,
+            query_sha256=query_digest,
+            query_chars=query_len,
+        )
         raise HTTPException(status_code=409, detail=str(e))
     except FileNotFoundError as e:
         logger.error(f"Collection not found for uid='{uid}': {e}")
+        emit_audit_event(
+            "agent.query",
+            severity="WARNING",
+            status="not_found",
+            uid=uid,
+            collection_name=request.collection_name,
+            stream=request.stream,
+            query_sha256=query_digest,
+            query_chars=query_len,
+        )
         raise HTTPException(status_code=404, detail=str(e))
     except HTTPException:
         raise
     except Exception:
         logger.exception(f"Error running Agentic RAG for uid='{uid}'")
+        emit_audit_event(
+            "agent.query",
+            severity="ERROR",
+            status="error",
+            uid=uid,
+            collection_name=request.collection_name,
+            stream=request.stream,
+            query_sha256=query_digest,
+            query_chars=query_len,
+        )
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_MESSAGE)
 
 

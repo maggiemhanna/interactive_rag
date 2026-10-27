@@ -120,17 +120,17 @@ flowchart TB
 - [x] **Pause for Phase 1 Review** (run unit tests + `make check-region-policy`).
 
 ### Phase 2: Audit Logging & End-to-End Trace Correlation in GCP Cloud Logging
-- [ ] **Application Audit Logger (`interactiverag-audit`) & Correlation Middleware:**
+- [x] **Application Audit Logger (`interactiverag-audit`) & Correlation Middleware:**
   - Add `google-cloud-logging` to `requirements.txt` and create `src/core/audit.py` with `contextvars`-backed request context (`request_id`, `trace_id`, `service_name`), `hash_query(text)`, and `emit_audit_event(...)` publishing structured entries directly to GCP Cloud Logging (`projects/<project>/logs/interactiverag-audit`, with clean stdout JSON fallback when offline/in unit tests).
   - Update `src/core/routes.py` (`create_app`) to install correlation middleware reading/generating `X-Request-Id`, extracting `X-Cloud-Trace-Context`, echoing `X-Request-Id` in response headers, and recording request lifecycle metadata.
   - Scrub raw `request.query` from logs in `src/agent/app.py`, `src/ingestion/service.py`, and `src/agent/stream.py`, replacing plaintext queries with `query_sha256` and `query_chars`.
   - Emit structured audit events on authentication failures (`src/core/auth.py`), collection list/delete (`src/core/routes.py`), ingestion & similarity search (`src/ingestion/app.py`), agent queries & SSE streams (`src/agent/app.py`, `src/agent/stream.py`), and Model Armor / DLP blocks or redactions (`src/core/security.py`, `src/agent/graph.py`).
-- [ ] **GCP Cloud Audit Logs, Load Balancer Logs & Regional Audit Sink (Terraform):**
+- [x] **GCP Cloud Audit Logs, Load Balancer Logs & Regional Audit Sink (Terraform):**
   - Update `Makefile` (`TF_DEPLOYER_ROLES` + `bootstrap`), `infra/apis.tf`, and `infra/iam.tf` to enable `logging.googleapis.com`, grant `roles/logging.configWriter` to `TF_DEPLOYER_SA`, and grant `roles/logging.logWriter` to `backend_sa`.
   - Create `infra/governance.tf`:
     - Provision `google_project_iam_audit_config` enabling `ADMIN_READ`, `DATA_READ`, and `DATA_WRITE` logs for `storage.googleapis.com`, `aiplatform.googleapis.com`, `dlp.googleapis.com`, and `modelarmor.googleapis.com`.
     - Provision `google_logging_project_bucket_config.compliance_audit` (`location = var.region`, `retention_days = var.audit_log_retention_days`, optional `locked = var.audit_log_bucket_locked`).
-    - Provision `google_logging_project_sink.compliance_audit_sink` (with `unique_writer_identity = true` and `roles/logging.bucketWriter`) copying Cloud Audit Logs and `interactiverag-audit` events into the regional audit bucket without excluding them from `_Default` (so **Logs Explorer** displays them immediately).
+    - Provision `google_logging_project_sink.compliance_audit_sink` copying Cloud Audit Logs, Load Balancer HTTP logs, and `interactiverag-audit` events into the same-project regional audit bucket without excluding them from `_Default` (so **Logs Explorer** displays them immediately; same-project log bucket sinks require no external `writer_identity` IAM grant).
   - Update `infra/load_balancer.tf`: Enable `log_config` (`enable = true`, `sample_rate = var.lb_log_sample_rate`) on `ingestion_backend` and `agent_backend`.
   - Update `infra/variables.tf`, `infra/terraform.tfvars.example`, `infra/cloud_run.tf` (`GOOGLE_CLOUD_PROJECT = var.project_id`), and `infra/outputs.tf`.
 

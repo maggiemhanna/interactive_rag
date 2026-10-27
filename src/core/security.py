@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import contextvars
 import os
 import re
 import threading
@@ -9,6 +10,7 @@ from google.cloud import modelarmor_v1
 from langchain_core.documents import Document
 from langchain_google_genai import HarmBlockThreshold, HarmCategory
 
+from src.core.audit import emit_audit_event, hash_query, mark_pii_filtered
 from src.core.auth import is_cloud_run
 from src.core.config import (
     COLLECTION_NAME_PATTERN,
@@ -313,10 +315,20 @@ def _is_model_armor_fail_closed() -> bool:
 
 def screen_user_prompt(prompt: str) -> ScreeningDecision:
     """Screens an incoming user prompt via Google Cloud Model Armor (`sanitize_user_prompt`)."""
+    prompt_digest = hash_query(prompt)
+    prompt_len = len(prompt)
     target = _resolve_model_armor_target()
     if target is None:
         if _is_model_armor_fail_closed():
             logger.error("MODEL_ARMOR_TEMPLATE_ID is unset with MODEL_ARMOR_FAIL_CLOSED=true; failing closed.")
+            emit_audit_event(
+                "security.prompt_blocked",
+                severity="ERROR",
+                status="blocked",
+                reason="missing_model_armor_config",
+                query_sha256=prompt_digest,
+                query_chars=prompt_len,
+            )
             return ScreeningDecision(
                 allowed=False,
                 text=PROMPT_BLOCKED_MESSAGE,
@@ -343,9 +355,25 @@ def screen_user_prompt(prompt: str) -> ScreeningDecision:
             logger.warning(
                 f"Model Armor blocked user prompt (reason={decision.blocked_reason})."
             )
+            emit_audit_event(
+                "security.prompt_blocked",
+                severity="WARNING",
+                status="blocked",
+                reason=decision.blocked_reason,
+                query_sha256=prompt_digest,
+                query_chars=prompt_len,
+            )
         return decision
     except Exception as e:
         logger.error(f"Model Armor prompt screening failed: {e}")
+        emit_audit_event(
+            "security.prompt_screening_error",
+            severity="ERROR",
+            status="error",
+            reason="model_armor_error",
+            query_sha256=prompt_digest,
+            query_chars=prompt_len,
+        )
         return ScreeningDecision(
             allowed=False,
             text=INTERNAL_ERROR_MESSAGE,
@@ -361,10 +389,18 @@ def sanitize_model_output(
     if not output_text or not output_text.strip():
         return ScreeningDecision(allowed=True, text=output_text)
 
+    output_len = len(output_text)
     target = _resolve_model_armor_target()
     if target is None:
         if _is_model_armor_fail_closed():
             logger.error("MODEL_ARMOR_TEMPLATE_ID is unset with MODEL_ARMOR_FAIL_CLOSED=true; failing closed.")
+            emit_audit_event(
+                "security.output_blocked",
+                severity="ERROR",
+                status="blocked",
+                reason="missing_model_armor_config",
+                output_chars=output_len,
+            )
             return ScreeningDecision(
                 allowed=False,
                 text=SAFETY_REFUSAL_MESSAGE,
@@ -395,11 +431,32 @@ def sanitize_model_output(
             logger.warning(
                 f"Model Armor blocked model response (reason={decision.blocked_reason})."
             )
+            emit_audit_event(
+                "security.output_blocked",
+                severity="WARNING",
+                status="blocked",
+                reason=decision.blocked_reason,
+                output_chars=output_len,
+            )
         elif decision.redacted:
             logger.info("Model Armor + Cloud DLP redacted sensitive data in model response.")
+            mark_pii_filtered(True)
+            emit_audit_event(
+                "security.output_dlp_redacted",
+                severity="INFO",
+                status="redacted",
+                output_chars=output_len,
+            )
         return decision
     except Exception as e:
         logger.error(f"Model Armor output sanitization failed: {e}")
+        emit_audit_event(
+            "security.output_screening_error",
+            severity="ERROR",
+            status="error",
+            reason="model_armor_error",
+            output_chars=output_len,
+        )
         return ScreeningDecision(
             allowed=False,
             text=INTERNAL_ERROR_MESSAGE,
@@ -452,10 +509,18 @@ def sanitize_chunk_text(chunk_text: str) -> str:
     if not chunk_text or not chunk_text.strip():
         return chunk_text
 
+    chunk_len = len(chunk_text)
     target = _resolve_model_armor_target()
     if target is None:
         if _is_model_armor_fail_closed():
             logger.error("MODEL_ARMOR_TEMPLATE_ID is unset with MODEL_ARMOR_FAIL_CLOSED=true; failing closed.")
+            emit_audit_event(
+                "security.chunk_screening_error",
+                severity="ERROR",
+                status="error",
+                reason="missing_model_armor_config",
+                chunk_chars=chunk_len,
+            )
             raise RuntimeError("Model Armor chunk sanitization failed (missing_model_armor_config).")
         if is_cloud_run():
             logger.warning("MODEL_ARMOR_TEMPLATE_ID is unset in Cloud Run; skipping Model Armor chunk sanitization.")
@@ -475,9 +540,23 @@ def sanitize_chunk_text(chunk_text: str) -> str:
         )
         if redacted_text != chunk_text:
             logger.info("Model Armor + Cloud DLP masked sensitive infoTypes in retrieved document chunk.")
+            mark_pii_filtered(True)
+            emit_audit_event(
+                "security.chunk_dlp_masked",
+                severity="INFO",
+                status="redacted",
+                chunk_chars=chunk_len,
+            )
         return redacted_text
     except Exception as e:
         logger.error(f"Model Armor chunk sanitization failed: {e}")
+        emit_audit_event(
+            "security.chunk_screening_error",
+            severity="ERROR",
+            status="error",
+            reason="model_armor_error",
+            chunk_chars=chunk_len,
+        )
         raise RuntimeError("Model Armor chunk sanitization failed (model_armor_error).") from e
 
 
@@ -498,13 +577,19 @@ def sanitize_retrieved_documents(docs: Sequence[Document]) -> List[Document]:
         sanitized_texts = [sanitize_chunk_text(doc.page_content or "") for doc in docs]
     else:
         max_workers = min(len(docs), 8)
+        contexts = [contextvars.copy_context() for _ in docs]
+        raw_texts = [doc.page_content or "" for doc in docs]
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             sanitized_texts = list(
-                executor.map(sanitize_chunk_text, [doc.page_content or "" for doc in docs])
+                executor.map(
+                    lambda item: item[0].run(sanitize_chunk_text, item[1]),
+                    zip(contexts, raw_texts),
+                )
             )
 
     return [
         Document(page_content=text, metadata=dict(doc.metadata or {}))
         for doc, text in zip(docs, sanitized_texts)
     ]
+
 

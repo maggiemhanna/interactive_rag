@@ -40,3 +40,9 @@ max_files_per_request      = 10
 max_chunks_per_ingest      = 1000
 max_query_chars            = 4000
 agent_recursion_limit      = 6
+
+# Compliance & Audit Logging
+audit_log_retention_days = 365
+audit_log_bucket_locked  = false
+lb_log_sample_rate       = 1.0
+

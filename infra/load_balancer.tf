@@ -133,6 +133,11 @@ resource "google_compute_backend_service" "ingestion_backend" {
   backend {
     group = google_compute_region_network_endpoint_group.ingestion_neg.id
   }
+
+  log_config {
+    enable      = true
+    sample_rate = var.lb_log_sample_rate
+  }
 }
 
 resource "google_compute_backend_service" "agent_backend" {
@@ -144,6 +149,11 @@ resource "google_compute_backend_service" "agent_backend" {
 
   backend {
     group = google_compute_region_network_endpoint_group.agent_neg.id
+  }
+
+  log_config {
+    enable      = true
+    sample_rate = var.lb_log_sample_rate
   }
 }
 

@@ -222,3 +222,32 @@ variable "agent_recursion_limit" {
   type        = number
   default     = 6
 }
+
+variable "audit_log_retention_days" {
+  description = "Retention period in days for the regional Cloud Logging compliance audit bucket (1 to 3650 days)."
+  type        = number
+  default     = 365
+
+  validation {
+    condition     = var.audit_log_retention_days >= 1 && var.audit_log_retention_days <= 3650
+    error_message = "audit_log_retention_days must be between 1 and 3650 days."
+  }
+}
+
+variable "audit_log_bucket_locked" {
+  description = "Irreversibly lock retention on the regional Cloud Logging audit bucket (WORM immutability; enable only in strict regulated production)."
+  type        = bool
+  default     = false
+}
+
+variable "lb_log_sample_rate" {
+  description = "Sampling rate (0.0 to 1.0) for External HTTPS Load Balancer HTTP access logs on backend APIs."
+  type        = number
+  default     = 1.0
+
+  validation {
+    condition     = var.lb_log_sample_rate >= 0.0 && var.lb_log_sample_rate <= 1.0
+    error_message = "lb_log_sample_rate must be between 0.0 and 1.0."
+  }
+}
+

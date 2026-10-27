@@ -48,7 +48,8 @@ TF_DEPLOYER_ROLES := \
 	roles/secretmanager.secretAccessor \
 	roles/secretmanager.viewer \
 	roles/browser \
-	roles/logging.logWriter
+	roles/logging.logWriter \
+	roles/logging.configWriter
 
 PYTHON       ?= $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || command -v python3)
 
@@ -122,6 +123,7 @@ bootstrap: check-project ## Enable seed APIs, create GCS Terraform state bucket,
 		aiplatform.googleapis.com \
 		modelarmor.googleapis.com \
 		dlp.googleapis.com \
+		logging.googleapis.com \
 		--project="$(PROJECT_ID)"
 	@echo "==> Ensuring Terraform remote state bucket gs://$(TF_STATE_BUCKET) exists..."
 	@if ! gcloud storage buckets describe "gs://$(TF_STATE_BUCKET)" --project="$(PROJECT_ID)" >/dev/null 2>&1; then \

@@ -8,6 +8,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from src.agent.schemas import AgentState
+from src.core.audit import emit_audit_event
 from src.core.logger import setup_logging
 from src.core.security import (
     SAFETY_REFUSAL_MESSAGE,
@@ -94,6 +95,13 @@ def build_agent(
             cleaned_query = validate_query_text(raw_query)
         except ValueError as exc:
             logger.warning(f"input_guard rejected invalid query: {exc}")
+            emit_audit_event(
+                "security.prompt_blocked",
+                severity="WARNING",
+                status="blocked",
+                reason="invalid_query_text",
+                query_chars=len(raw_query or ""),
+            )
             return {
                 "messages": [AIMessage(content=str(exc))],
                 "input_blocked": True,
@@ -120,6 +128,12 @@ def build_agent(
         if is_safety_blocked(response):
             logger.warning(
                 "Gemini blocked model response via safety_settings; returning polite refusal fallback."
+            )
+            emit_audit_event(
+                "security.gemini_safety_blocked",
+                severity="WARNING",
+                status="blocked",
+                model_name=safe_model_name,
             )
             refusal = AIMessage(
                 id=getattr(response, "id", None),

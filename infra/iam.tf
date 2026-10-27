@@ -47,3 +47,11 @@ resource "google_project_iam_member" "backend_dlp_user" {
   role    = "roles/dlp.user"
   member  = "serviceAccount:${google_service_account.backend_sa.email}"
 }
+
+# Allow backend services to publish structured compliance audit events to projects/<project>/logs/interactiverag-audit
+resource "google_project_iam_member" "backend_log_writer" {
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.backend_sa.email}"
+}
+

@@ -73,3 +73,19 @@ output "google_cloud_location" {
   description = "Pinned single GCP region enforced across Cloud Run, GCS, Model Armor, and Vertex AI."
   value       = var.region
 }
+
+output "compliance_audit_log_bucket_id" {
+  description = "Regional Cloud Logging bucket storing retained compliance & audit logs."
+  value       = google_logging_project_bucket_config.compliance_audit.id
+}
+
+output "compliance_audit_sink_name" {
+  description = "Project-level Cloud Logging sink routing compliance & audit logs into the regional audit bucket."
+  value       = google_logging_project_sink.compliance_audit_sink.name
+}
+
+output "application_audit_log_name" {
+  description = "Full GCP Cloud Logging logName for structured InteractiveRAG compliance events."
+  value       = "projects/${var.project_id}/logs/interactiverag-audit"
+}
+
