@@ -11,12 +11,7 @@ from src.agent.graph import build_agent
 from src.agent.schemas import AgentRequest
 from src.agent.tools import get_retriever_tool
 from src.core.chroma import has_sqlite
-from src.core.config import (
-    DEFAULT_COLLECTION,
-    DEFAULT_EMBEDDING_MODEL,
-    DEFAULT_LLM_MODEL,
-    get_agent_recursion_limit,
-)
+from src.core.config import get_agent_recursion_limit
 from src.core.logger import setup_logging
 from src.core.security import INTERNAL_ERROR_MESSAGE, RECURSION_LIMIT_MESSAGE
 from src.core.storage import user_read_lock
@@ -49,8 +44,8 @@ def _stream_events(
     persist_directory: str,
     collection_name: str,
     thread_id: str,
-    model_name: str,
-    embedding_model: str,
+    model_name: Optional[str] = None,
+    embedding_model: Optional[str] = None,
 ) -> Generator[Dict[str, Any], None, None]:
     retriever_tool = get_retriever_tool(
         collection_name=collection_name,
@@ -123,10 +118,10 @@ def _stream_events(
 
 def stream_events(
     query: str,
-    collection_name: str = DEFAULT_COLLECTION,
+    collection_name: str,
     thread_id: str = "1",
-    model_name: str = DEFAULT_LLM_MODEL,
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    model_name: Optional[str] = None,
+    embedding_model: Optional[str] = None,
     persist_directory: Optional[str] = None,
 ) -> Generator[Dict[str, Any], None, None]:
     """Streams graph message output, printing each message component using print_event."""
@@ -193,11 +188,11 @@ def stream_sse(
 
 
 def run_interactive(
+    collection_name: str,
     query: str = "What is ARM Holdings?",
-    collection_name: str = DEFAULT_COLLECTION,
 ) -> None:
     """Interactive runner to stream message output and pretty print message components."""
     print_header("Agentic RAG Assistant Initialized", "magenta")
-    logger.info(f"Running agent with query: '{query}'")
+    logger.info(f"Running agent on collection '{collection_name}'")
     for _ in stream_events(query=query, collection_name=collection_name):
         pass

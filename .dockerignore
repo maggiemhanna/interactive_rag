@@ -37,6 +37,7 @@ infra/crash.log
 
 # Docs, tests & OS metadata
 docs
+scripts
 tests
 .DS_Store
 .vscode

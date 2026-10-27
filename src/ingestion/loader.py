@@ -13,8 +13,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.core.auth import is_cloud_run
 from src.core.config import (
-    DEFAULT_COLLECTION,
-    DEFAULT_EMBEDDING_MODEL,
     get_max_chunks_per_ingest,
     get_max_files_per_request,
     get_max_upload_mb,
@@ -92,9 +90,7 @@ def split_pdfs(
 
 def _parse_json_body(
     body: dict,
-    default_collection: str,
-    default_embedding: str,
-) -> Tuple[List[str], str, str]:
+) -> Tuple[List[str], Optional[str], Optional[str]]:
     raw_server_paths: List[str] = []
     raw_paths = body.get("pdf_paths")
     if isinstance(raw_paths, str) and raw_paths.strip():
@@ -102,16 +98,18 @@ def _parse_json_body(
     elif isinstance(raw_paths, list):
         raw_server_paths.extend([str(p).strip() for p in raw_paths if str(p).strip()])
 
-    collection_name = (
-        str(body.get("collection_name") or default_collection).strip() or default_collection
-    )
-    embedding_model = (
-        str(body.get("embedding_model") or default_embedding).strip() or default_embedding
-    )
-    return raw_server_paths, collection_name, embedding_model
+    raw_col = body.get("collection_name")
+    collection_name = raw_col if isinstance(raw_col, str) else None
+    raw_emb = body.get("embedding_model")
+    if raw_emb is not None and not isinstance(raw_emb, str):
+        raise HTTPException(status_code=422, detail="embedding_model must be a string.")
+    return raw_server_paths, collection_name, raw_emb
 
 
-def _validate_ingest_params(collection_name: str, embedding_model: str) -> Tuple[str, str]:
+def _validate_ingest_params(
+    collection_name: Optional[str],
+    embedding_model: Optional[str],
+) -> Tuple[str, str]:
     """Validates `collection_name` and `embedding_model`, raising HTTP 422 on invalid input."""
     try:
         safe_col = validate_collection_name(collection_name)
@@ -126,8 +124,8 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
     content_type = request.headers.get("content-type", "")
     raw_server_paths: List[str] = []
     uploaded_files_info: List[Tuple[str, str, Optional[str]]] = []  # (local_path, display_name, gcs_uri)
-    collection_name = DEFAULT_COLLECTION
-    embedding_model = DEFAULT_EMBEDDING_MODEL
+    collection_name: str = ""
+    embedding_model: str = ""
 
     max_files = get_max_files_per_request()
     max_upload_mb = get_max_upload_mb()
@@ -141,27 +139,24 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
     try:
         if "application/json" in content_type:
             body = await request.json()
-            raw_server_paths, collection_name, embedding_model = _parse_json_body(
-                body, collection_name, embedding_model
-            )
+            raw_server_paths, raw_col, raw_emb = _parse_json_body(body)
             collection_name, embedding_model = _validate_ingest_params(
-                collection_name, embedding_model
+                raw_col, raw_emb
             )
         elif "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
             async with request.form() as form:
-                raw_col = form.get("collection_name", collection_name)
+                raw_col = form.get("collection_name")
                 if isinstance(raw_col, list):
-                    raw_col = raw_col[0]
-                collection_name = str(raw_col).strip() if raw_col else DEFAULT_COLLECTION
+                    raw_col = raw_col[0] if raw_col else None
+                col_str = raw_col if isinstance(raw_col, str) else None
 
-                raw_embedding = form.get("embedding_model", embedding_model)
+                raw_embedding = form.get("embedding_model")
                 if isinstance(raw_embedding, list):
-                    raw_embedding = raw_embedding[0]
-                embedding_model = (
-                    str(raw_embedding).strip() if raw_embedding else DEFAULT_EMBEDDING_MODEL
-                )
+                    raw_embedding = raw_embedding[0] if raw_embedding else None
+                emb_str = raw_embedding if isinstance(raw_embedding, str) else None
+
                 collection_name, embedding_model = _validate_ingest_params(
-                    collection_name, embedding_model
+                    col_str, emb_str
                 )
 
                 # Handle pdf_paths field if provided in form

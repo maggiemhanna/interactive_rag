@@ -68,3 +68,8 @@ output "model_armor_psc_endpoint_ip" {
   description = "Internal VPC IPv4 address of the regional Private Service Connect endpoint for Model Armor."
   value       = google_network_connectivity_regional_endpoint.modelarmor_psc.address
 }
+
+output "google_cloud_location" {
+  description = "Pinned single GCP region enforced across Cloud Run, GCS, Model Armor, and Vertex AI."
+  value       = var.region
+}

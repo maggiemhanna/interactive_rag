@@ -1,35 +1,43 @@
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import chromadb
 from langchain_chroma import Chroma
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-from src.core.config import DEFAULT_COLLECTION, DEFAULT_EMBEDDING_MODEL
+from src.core.security import (
+    validate_collection_name,
+    validate_embedding_model,
+    validate_gcp_region,
+)
 from src.core.storage import SQLITE_FILENAME
 
 
 def get_embeddings(
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    embedding_model: Optional[str] = None,
 ) -> GoogleGenerativeAIEmbeddings:
     """Builds a Vertex AI-backed GoogleGenerativeAIEmbeddings instance."""
+    safe_model = validate_embedding_model(embedding_model)
+    safe_location = validate_gcp_region()
     return GoogleGenerativeAIEmbeddings(
-        model=embedding_model,
+        model=safe_model,
         project=os.getenv("GOOGLE_CLOUD_PROJECT"),
+        location=safe_location,
         vertexai=True,
     )
 
 
 def get_vectorstore(
+    collection_name: str,
     persist_directory: str = "chroma_db",
-    collection_name: str = DEFAULT_COLLECTION,
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    embedding_model: Optional[str] = None,
 ) -> Chroma:
     """Initializes or loads a Chroma vectorstore instance for a given directory and collection."""
+    safe_collection = validate_collection_name(collection_name)
     return Chroma(
         persist_directory=persist_directory,
         embedding_function=get_embeddings(embedding_model=embedding_model),
-        collection_name=collection_name,
+        collection_name=safe_collection,
     )
 
 

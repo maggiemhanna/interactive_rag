@@ -146,6 +146,13 @@ resource "google_network_connectivity_regional_endpoint" "modelarmor_psc" {
   subnetwork        = google_compute_subnetwork.psc_endpoints.id
   description       = "Private Service Connect regional endpoint for Model Armor (modelarmor.${var.region}.rep.googleapis.com)."
 
+  lifecycle {
+    precondition {
+      condition     = can(regex("^[a-z]+-[a-z]+[0-9]+$", var.region))
+      error_message = "Model Armor regional PSC endpoint must reside in a concrete single GCP region."
+    }
+  }
+
   depends_on = [
     google_project_service.required_apis["networkconnectivity.googleapis.com"],
     google_project_service.required_apis["modelarmor.googleapis.com"],

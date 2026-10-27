@@ -50,7 +50,9 @@ TF_DEPLOYER_ROLES := \
 	roles/browser \
 	roles/logging.logWriter
 
-.PHONY: help check-project bootstrap ensure-deployer-sa tf-init build-push build-push-local plan deploy outputs destroy fmt validate
+PYTHON       ?= $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || command -v python3)
+
+.PHONY: help check-project check-region-policy bootstrap ensure-deployer-sa tf-init build-push build-push-local plan deploy outputs destroy fmt validate
 
 help: ## Show available reproducible build & deployment commands
 	@echo "InteractiveRAG — GCP Cloud Run & Terraform Automation"
@@ -65,7 +67,7 @@ help: ## Show available reproducible build & deployment commands
 	@echo "  TF_MODE         = $(TF_MODE)"
 	@echo ""
 	@echo "Targets:"
-	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
 
 check-project:
 	@if [ -z "$(PROJECT_ID)" ] || [ "$(PROJECT_ID)" = "your-gcp-project-id" ]; then \
@@ -79,6 +81,10 @@ check-project:
 		gcloud projects describe "$(PROJECT_ID)" --format="value(projectNumber)" >/dev/null || true; \
 		exit 1; \
 	fi
+
+check-region-policy: ## Verify REGION adheres to live GCP gcp.resourceLocations Organization Policy
+	@echo "==> Verifying REGION ($(REGION)) against live GCP Organization Policy on $(PROJECT_ID)..."
+	@$(PYTHON) scripts/check_region_policy.py --project="$(PROJECT_ID)" --region="$(REGION)"
 
 ensure-deployer-sa: check-project ## Create least-privilege Cloud Build deployer service account if missing
 	@echo "==> Ensuring Cloud Build deployer service account ($(TF_DEPLOYER_SA))..."
@@ -176,7 +182,7 @@ build-push-local: check-project ## Build & push linux/amd64 images locally using
 		-t "$(REGISTRY_URL)/frontend:latest" \
 		--push .
 
-plan: check-project ## Preview Terraform infrastructure changes
+plan: check-project check-region-policy ## Preview Terraform infrastructure changes
 	@if [ "$(TF_MODE)" = "local" ]; then \
 		GOOGLE_OAUTH_ACCESS_TOKEN="$$(gcloud auth print-access-token)" \
 		terraform -chdir=$(TF_DIR) plan \
@@ -192,7 +198,7 @@ plan: check-project ## Preview Terraform infrastructure changes
 			--substitutions="_TF_ACTION=plan,_TF_STATE_BUCKET=$(TF_STATE_BUCKET),_STATE_PREFIX=$(STATE_PREFIX),_PROJECT_ID=$(PROJECT_ID),_REGION=$(REGION),_IMAGE_TAG=$(IMAGE_TAG)"; \
 	fi
 
-deploy: check-project ## Apply full Terraform stack (GCS, IAM, Identity Platform, Cloud Run services)
+deploy: check-project check-region-policy ## Apply full Terraform stack (GCS, IAM, Identity Platform, Cloud Run services)
 	@if [ "$(TF_MODE)" = "local" ]; then \
 		GOOGLE_OAUTH_ACCESS_TOKEN="$$(gcloud auth print-access-token)" \
 		terraform -chdir=$(TF_DIR) apply \

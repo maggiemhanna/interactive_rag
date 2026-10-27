@@ -130,6 +130,13 @@ resource "google_model_armor_template" "rag_guard" {
     }
   }
 
+  lifecycle {
+    precondition {
+      condition     = can(regex("^[a-z]+-[a-z]+[0-9]+$", var.region))
+      error_message = "Model Armor template must reside in a concrete single GCP region."
+    }
+  }
+
   depends_on = [
     google_project_service.required_apis["modelarmor.googleapis.com"],
     google_project_iam_member.modelarmor_sa_dlp_user,

@@ -5,9 +5,14 @@ variable "project_id" {
 }
 
 variable "region" {
-  description = "GCP region for Cloud Run, Artifact Registry, GCS, and Vertex AI."
+  description = "Concrete single GCP region for Cloud Run, Artifact Registry, GCS, and Vertex AI (must satisfy project gcp.resourceLocations Organization Policy)."
   type        = string
   default     = "us-central1"
+
+  validation {
+    condition     = can(regex("^[a-z]+-[a-z]+[0-9]+$", var.region))
+    error_message = "var.region must be a concrete single GCP region (e.g., 'us-central1', 'us-west1'), never 'global' or a multi-region ('us', 'eu', 'asia')."
+  }
 }
 
 variable "app_name" {
@@ -141,13 +146,13 @@ variable "psc_subnet_cidr" {
 }
 
 variable "allowed_llm_models" {
-  description = "Comma-separated allowlist of approved Vertex AI generative LLM models."
+  description = "Comma-separated allowlist of approved regional Vertex AI generative LLM models."
   type        = string
-  default     = "gemini-3.8-flash,gemini-2.5-flash,gemini-2.5-pro"
+  default     = "gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite"
 }
 
 variable "allowed_embedding_models" {
-  description = "Comma-separated allowlist of approved Vertex AI embedding models."
+  description = "Comma-separated allowlist of approved regional Vertex AI embedding models."
   type        = string
   default     = "gemini-embedding-001,text-embedding-005"
 }

@@ -1,8 +1,7 @@
-from typing import List, Union
+from typing import Any, List, Union
 
 from pydantic import BaseModel, Field, field_validator
 
-from src.core.config import DEFAULT_COLLECTION, DEFAULT_EMBEDDING_MODEL
 from src.core.security import (
     validate_collection_name,
     validate_embedding_model,
@@ -15,12 +14,13 @@ class IngestRequest(BaseModel):
         ..., description="Path or list of paths (or a single path) to PDF files to ingest"
     )
     collection_name: str = Field(
-        default=DEFAULT_COLLECTION,
+        ...,
         description="Name of the Chroma vectorstore collection",
     )
     embedding_model: str = Field(
-        default=DEFAULT_EMBEDDING_MODEL,
-        description="Name of the approved Vertex AI embedding model",
+        default="",
+        validate_default=True,
+        description="Approved Vertex AI embedding model name (defaults to first entry in ALLOWED_EMBEDDING_MODELS)",
     )
 
     @field_validator("collection_name")
@@ -28,16 +28,18 @@ class IngestRequest(BaseModel):
     def _check_collection_name(cls, value: str) -> str:
         return validate_collection_name(value)
 
-    @field_validator("embedding_model")
+    @field_validator("embedding_model", mode="before")
     @classmethod
-    def _check_embedding_model(cls, value: str) -> str:
+    def _check_embedding_model(cls, value: Any) -> str:
+        if value is not None and not isinstance(value, str):
+            raise ValueError("embedding_model must be a string.")
         return validate_embedding_model(value)
 
 
 class QueryRequest(BaseModel):
     query: str = Field(..., description="Query text to search for in vector store")
     collection_name: str = Field(
-        default=DEFAULT_COLLECTION,
+        ...,
         description="Name of the Chroma vectorstore collection",
     )
     k: int = Field(
@@ -47,8 +49,9 @@ class QueryRequest(BaseModel):
         description="Number of results to retrieve (1-50)",
     )
     embedding_model: str = Field(
-        default=DEFAULT_EMBEDDING_MODEL,
-        description="Name of the approved Vertex AI embedding model",
+        default="",
+        validate_default=True,
+        description="Approved Vertex AI embedding model name (defaults to first entry in ALLOWED_EMBEDDING_MODELS)",
     )
 
     @field_validator("query")
@@ -61,7 +64,9 @@ class QueryRequest(BaseModel):
     def _check_collection_name(cls, value: str) -> str:
         return validate_collection_name(value)
 
-    @field_validator("embedding_model")
+    @field_validator("embedding_model", mode="before")
     @classmethod
-    def _check_embedding_model(cls, value: str) -> str:
+    def _check_embedding_model(cls, value: Any) -> str:
+        if value is not None and not isinstance(value, str):
+            raise ValueError("embedding_model must be a string.")
         return validate_embedding_model(value)

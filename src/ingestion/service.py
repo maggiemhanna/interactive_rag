@@ -1,11 +1,10 @@
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
 from src.core.chroma import get_vectorstore, require_collection
-from src.core.config import DEFAULT_COLLECTION, DEFAULT_EMBEDDING_MODEL
 from src.core.logger import setup_logging
 from src.core.security import sanitize_retrieved_documents
 from src.core.storage import user_read_lock, user_write_lock
@@ -15,16 +14,16 @@ logger = setup_logging(name="ingestion.service")
 
 def index_documents(
     documents: List[Document],
+    collection_name: str,
     persist_directory: str = "chroma_db",
-    collection_name: str = DEFAULT_COLLECTION,
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    embedding_model: Optional[str] = None,
 ) -> Chroma:
     """Initializes or loads a Chroma vectorstore and indexes document chunks into it.
 
     Args:
         documents: List of document chunks to add.
-        persist_directory: Path to store Chroma DB.
         collection_name: Name of the vector collection.
+        persist_directory: Path to store Chroma DB.
         embedding_model: Name of the Vertex AI embedding model.
 
     Returns:
@@ -35,8 +34,8 @@ def index_documents(
 
     try:
         vectorstore = get_vectorstore(
-            persist_directory=persist_directory,
             collection_name=collection_name,
+            persist_directory=persist_directory,
             embedding_model=embedding_model,
         )
 
@@ -62,15 +61,15 @@ def index_documents(
 def ingest_documents(
     uid: str,
     documents: List[Document],
-    collection_name: str = DEFAULT_COLLECTION,
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    collection_name: str,
+    embedding_model: Optional[str] = None,
 ) -> None:
     """Mutates the user's isolated ChromaDB inside the GCS distributed write lock."""
     with user_write_lock(uid) as persist_directory:
         vectorstore = index_documents(
             documents=documents,
-            persist_directory=persist_directory,
             collection_name=collection_name,
+            persist_directory=persist_directory,
             embedding_model=embedding_model,
         )
         del vectorstore
@@ -79,16 +78,16 @@ def ingest_documents(
 def search_collection(
     uid: str,
     query: str,
-    collection_name: str = DEFAULT_COLLECTION,
+    collection_name: str,
     k: int = 5,
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    embedding_model: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Performs similarity search against a user's Chroma vectorstore collection and masks PII/secrets."""
     with user_read_lock(uid) as persist_directory:
         require_collection(persist_directory, collection_name)
         vectorstore = get_vectorstore(
-            persist_directory=persist_directory,
             collection_name=collection_name,
+            persist_directory=persist_directory,
             embedding_model=embedding_model,
         )
         retriever = vectorstore.as_retriever(

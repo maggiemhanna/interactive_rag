@@ -12,12 +12,11 @@ from langchain_google_genai import HarmBlockThreshold, HarmCategory
 from src.core.auth import is_cloud_run
 from src.core.config import (
     COLLECTION_NAME_PATTERN,
-    DEFAULT_COLLECTION,
-    DEFAULT_EMBEDDING_MODEL,
-    DEFAULT_LLM_MODEL,
+    GCP_REGION_PATTERN,
     get_allowed_embedding_models,
     get_allowed_llm_models,
     get_gemini_safety_threshold,
+    get_google_cloud_location,
     get_max_query_chars,
     get_model_armor_location,
     get_model_armor_template_id,
@@ -70,11 +69,25 @@ class ScreeningDecision:
     redacted: bool = False
 
 
+def validate_gcp_region(location: Optional[str] = None) -> str:
+    """Validates that `GOOGLE_CLOUD_LOCATION` is a concrete single GCP region (never 'global' or a multi-region)."""
+    raw = location if location is not None else get_google_cloud_location()
+    cleaned = (raw or "").strip().lower()
+    if not GCP_REGION_PATTERN.match(cleaned):
+        raise ValueError(
+            f"Invalid GOOGLE_CLOUD_LOCATION '{raw}'. Data residency requires a concrete single GCP "
+            f"region (e.g., 'us-central1'), never 'global' or multi-regions ('us', 'eu', 'asia')."
+        )
+    return cleaned
+
+
 def validate_collection_name(collection_name: Optional[str]) -> str:
-    """Validates `collection_name` against a strict safe identifier pattern."""
-    cleaned = (collection_name if collection_name is not None else DEFAULT_COLLECTION).strip()
+    """Validates that `collection_name` is explicitly provided and matches a strict safe identifier pattern."""
+    if collection_name is None or not isinstance(collection_name, str):
+        raise ValueError("collection_name is required.")
+    cleaned = collection_name.strip()
     if not cleaned:
-        cleaned = DEFAULT_COLLECTION
+        raise ValueError("collection_name is required and cannot be empty.")
     if not COLLECTION_NAME_PATTERN.match(cleaned):
         raise ValueError(
             "Invalid collection_name. Use 1-64 characters consisting only of letters, numbers, "
@@ -83,10 +96,10 @@ def validate_collection_name(collection_name: Optional[str]) -> str:
     return cleaned
 
 
-def validate_llm_model(model_name: Optional[str]) -> str:
-    """Validates `model_name` against the server-approved generative LLM allowlist."""
-    cleaned = (model_name or "").strip() or DEFAULT_LLM_MODEL
+def validate_llm_model(model_name: Optional[str] = None) -> str:
+    """Validates `model_name` against `ALLOWED_LLM_MODELS` (defaulting to the first approved model)."""
     allowed = get_allowed_llm_models()
+    cleaned = (model_name or "").strip() or allowed[0]
     if cleaned not in allowed:
         allowed_csv = ", ".join(allowed)
         raise ValueError(
@@ -95,10 +108,10 @@ def validate_llm_model(model_name: Optional[str]) -> str:
     return cleaned
 
 
-def validate_embedding_model(embedding_model: Optional[str]) -> str:
-    """Validates `embedding_model` against the server-approved embedding model allowlist."""
-    cleaned = (embedding_model or "").strip() or DEFAULT_EMBEDDING_MODEL
+def validate_embedding_model(embedding_model: Optional[str] = None) -> str:
+    """Validates `embedding_model` against `ALLOWED_EMBEDDING_MODELS` (defaulting to the first approved model)."""
     allowed = get_allowed_embedding_models()
+    cleaned = (embedding_model or "").strip() or allowed[0]
     if cleaned not in allowed:
         allowed_csv = ", ".join(allowed)
         raise ValueError(
@@ -164,10 +177,10 @@ def _resolve_model_armor_target() -> Optional[Tuple[str, str]]:
 
     match = _TEMPLATE_PATH_RE.match(raw_template)
     if match:
-        return raw_template, match.group("location")
+        return raw_template, validate_gcp_region(match.group("location"))
 
     project = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
-    location = get_model_armor_location()
+    location = validate_gcp_region(get_model_armor_location())
     if not project:
         raise RuntimeError(
             "GOOGLE_CLOUD_PROJECT must be set when MODEL_ARMOR_TEMPLATE_ID is a short template ID."

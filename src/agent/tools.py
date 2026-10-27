@@ -1,13 +1,12 @@
 import os
 import re
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 from langchain_core.documents import Document
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
 from src.core.chroma import get_vectorstore, require_collection
-from src.core.config import DEFAULT_COLLECTION, DEFAULT_EMBEDDING_MODEL
 from src.core.security import (
     sanitize_retrieved_documents,
     validate_collection_name,
@@ -93,10 +92,10 @@ def format_retrieved_chunks(docs: Sequence[Document]) -> str:
 
 
 def get_retriever_tool(
-    collection_name: str = DEFAULT_COLLECTION,
+    collection_name: str,
     persist_directory: str = "chroma_db",
     k: int = 5,
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    embedding_model: Optional[str] = None,
     description: str = (
         "Search and retrieve relevant document chunks from collection '{collection_name}'. "
         "Passages are returned inside <retrieved_chunk source=\"...\" page=\"...\"> XML tags."

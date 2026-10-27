@@ -133,6 +133,8 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
             "AUTH_DISABLED": "false",
             "K_SERVICE": "interactive-rag-prod",
             "GOOGLE_CLOUD_PROJECT": "interactive-rag",
+            "ALLOWED_LLM_MODELS": "gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite",
+            "ALLOWED_EMBEDDING_MODELS": "gemini-embedding-001,text-embedding-005",
             "GCS_BUCKET_NAME": self.fake_bucket.name,
             "LOCAL_CHROMA_ROOT": chroma_root,
             "UPLOAD_TMP_ROOT": self.uploads_tmp,

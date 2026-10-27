@@ -8,7 +8,6 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from src.agent.schemas import AgentState
-from src.core.config import DEFAULT_LLM_MODEL, DEFAULT_LOCATION
 from src.core.logger import setup_logging
 from src.core.security import (
     SAFETY_REFUSAL_MESSAGE,
@@ -16,6 +15,7 @@ from src.core.security import (
     is_safety_blocked,
     sanitize_model_output,
     screen_user_prompt,
+    validate_gcp_region,
     validate_llm_model,
     validate_query_text,
 )
@@ -70,17 +70,18 @@ def _latest_human_text(messages: Sequence[BaseMessage]) -> str:
 
 def build_agent(
     retriever_tool,
-    model_name: str = DEFAULT_LLM_MODEL,
+    model_name: Optional[str] = None,
     checkpointer: Optional[InMemorySaver] = None,
 ):
     """Constructs and compiles the hardened LangGraph Agentic RAG graph."""
     safe_model_name = validate_llm_model(model_name)
+    safe_location = validate_gcp_region()
 
     llm = ChatGoogleGenerativeAI(
         model=safe_model_name,
         temperature=0,
         project=os.getenv("GOOGLE_CLOUD_PROJECT"),
-        location=os.getenv("GOOGLE_CLOUD_LOCATION", DEFAULT_LOCATION),
+        location=safe_location,
         safety_settings=get_gemini_safety_settings(),
     )
 

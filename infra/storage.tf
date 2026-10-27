@@ -39,6 +39,13 @@ resource "google_storage_bucket" "chroma_persistence" {
     purpose     = "per-user-chromadb-persistence"
   }
 
+  lifecycle {
+    precondition {
+      condition     = can(regex("^[a-z]+-[a-z]+[0-9]+$", var.region))
+      error_message = "ChromaDB persistence bucket must be provisioned in a concrete single GCP region (never 'global' or a multi-region)."
+    }
+  }
+
   depends_on = [
     google_project_service.required_apis["storage.googleapis.com"],
   ]
