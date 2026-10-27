@@ -5,7 +5,8 @@ from fastapi import Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from src.agent.display import print_header
-from src.agent.schemas import AgentRequest
+from src.agent.memory import clear_user_memory, list_user_memory_threads
+from src.agent.schemas import AgentRequest, build_compliance_metadata
 from src.agent.stream import (
     SSE_HEADERS,
     stream_events,
@@ -22,7 +23,12 @@ from src.core.storage import LockTimeoutError, user_read_lock
 
 logger = setup_logging(name="agent")
 
-app = create_app(title="Agentic RAG API", service_name="agent-api")
+app = create_app(
+    title="Agentic RAG API",
+    service_name="agent-api",
+    memory_inventory_fn=list_user_memory_threads,
+    on_user_purge=clear_user_memory,
+)
 
 
 @app.post("/agent")
@@ -74,6 +80,13 @@ def agent(
                 final_answer = msg["content"]
                 break
 
+        compliance_meta = build_compliance_metadata(
+            model_name=request.model_name,
+            answer=final_answer,
+            messages=formatted_messages,
+            scoped_thread_id=scoped_thread_id,
+        ).model_dump()
+
         emit_audit_event(
             "agent.query",
             uid=uid,
@@ -84,6 +97,10 @@ def agent(
             query_sha256=query_digest,
             query_chars=query_len,
             answer_chars=len(final_answer),
+            grounded=compliance_meta["grounded"],
+            citation_count=compliance_meta["citation_count"],
+            pii_filtered=compliance_meta["pii_filtered"],
+            guardrail_actions=[a["filter"] + ":" + a["action"] for a in compliance_meta["guardrail_actions"]],
         )
 
         return {
@@ -92,6 +109,7 @@ def agent(
             "answer": final_answer,
             "collection_name": request.collection_name,
             "messages": formatted_messages,
+            "compliance": compliance_meta,
         }
     except LockTimeoutError as e:
         emit_audit_event(

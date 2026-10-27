@@ -135,13 +135,13 @@ flowchart TB
   - Update `infra/variables.tf`, `infra/terraform.tfvars.example`, `infra/cloud_run.tf` (`GOOGLE_CLOUD_PROJECT = var.project_id`), and `infra/outputs.tf`.
 
 ### Phase 3: Regulatory Requirements (GDPR DSAR & EU AI Act Transparency)
-- [ ] **Storage Inventory & Complete User Purge (GDPR Art. 15 & Art. 17):**
+- [x] **Storage Inventory & Complete User Purge (GDPR Art. 15 & Art. 17):**
   - Update `src/core/storage.py`: Add `get_user_data_inventory(uid)` (listing collections, archived uploaded PDFs, object counts, and total bytes) and `purge_all_user_data(uid)` (deleting all live **and** noncurrent GCS object versions under `users/{uid}/` via `list_blobs(..., versions=True)`, plus `/tmp/chroma_db/{uid}` and `/tmp/uploads/{uid}`).
   - Update `src/agent/memory.py`: Add `clear_user_memory(uid)` removing all `{uid}:*` threads and writes from `MEMORY_SAVER`.
   - Update `src/core/routes.py` & `src/agent/app.py`: Expose `GET /compliance/my-data` (GDPR Art. 15) and `DELETE /compliance/my-data` (GDPR Art. 17, invoking `purge_all_user_data(uid)` + optional service-specific memory cleanup hook, and emitting `dsar.export_inventory` / `dsar.erase_user_data` audit events).
-- [ ] **EU AI Act Art. 50 Provenance Metadata & React Privacy UI:**
-  - Update `src/agent/schemas.py`, `src/agent/app.py`, and `src/agent/stream.py`: Include `compliance` metadata (`ai_generated`, `model`, `region`, `grounding_enforced`, `pii_filtered`, `request_id`) in `AgentResponse` and final SSE metadata frames.
-  - Update `frontend/src/api.js` and `frontend/src/App.jsx`: Display subtle AI-generated provenance badges (`model` + `region`) on assistant replies and add a **"My Data & Privacy"** modal allowing users to inspect their stored data inventory (`GET /compliance/my-data`) and trigger one-click GDPR erasure (`DELETE /compliance/my-data`).
+- [x] **EU AI Act Art. 50 Provenance Metadata, Grounding Status & Cloud Model Armor UI Badges:**
+  - Update `src/agent/schemas.py`, `src/agent/app.py`, and `src/agent/stream.py`: Include `compliance` metadata (`ai_generated`, `model`, `region`, `grounding_enforced`, `grounded`, `citation_count`, `retrieved_passages`, `pii_filtered`, `model_armor_active`, `filters_checked`, `guardrail_actions`, `request_id`) in `AgentResponse` and final SSE metadata frames.
+  - Update `frontend/src/api.js` and `frontend/src/App.jsx`: Display AI provenance (`AI-generated` vs. `Guardrail refusal`), explicit grounding status (`Grounded · N citations` vs. `Not grounded`), all Cloud Model Armor filter actions (`Prompt Injection / Jailbreak blocked`, `Malicious URI blocked`, `RAI blocked (...)`, `PII redacted`, `Gemini Safety blocked`, or `Model Armor verified` when clean), and a **"My Data & Privacy"** modal (`GET/DELETE /compliance/my-data`).
 
 ### Phase 4: Policy Enforcement (Fail-Closed Screening, Rate Limits, Collection Quotas & Pre-Deploy Checks)
 - [ ] **Fail-Closed Model Armor Enforcement:**

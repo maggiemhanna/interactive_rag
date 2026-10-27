@@ -10,7 +10,13 @@ from google.cloud import modelarmor_v1
 from langchain_core.documents import Document
 from langchain_google_genai import HarmBlockThreshold, HarmCategory
 
-from src.core.audit import emit_audit_event, hash_query, mark_pii_filtered
+from src.core.audit import (
+    emit_audit_event,
+    hash_query,
+    mark_model_armor_active,
+    mark_pii_filtered,
+    record_guardrail_action,
+)
 from src.core.auth import is_cloud_run
 from src.core.config import (
     COLLECTION_NAME_PATTERN,
@@ -69,6 +75,7 @@ class ScreeningDecision:
     text: str
     blocked_reason: Optional[str] = None
     redacted: bool = False
+    triggered_filters: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = ()
 
 
 def validate_gcp_region(location: Optional[str] = None) -> str:
@@ -221,6 +228,22 @@ def _has_proto_field(msg: Any, field_name: str) -> bool:
     return val is not None
 
 
+def _extract_matched_rai_types(rai_res: Any) -> Tuple[str, ...]:
+    """Extracts matched RAI filter category names (e.g. HARASSMENT, HATE_SPEECH, DANGEROUS, SEXUALLY_EXPLICIT)."""
+    match_found = modelarmor_v1.FilterMatchState.MATCH_FOUND
+    type_results = getattr(rai_res, "rai_filter_type_results", None) or {}
+    matched: List[str] = []
+    if hasattr(type_results, "items"):
+        for key, entry in type_results.items():
+            if getattr(entry, "match_state", None) == match_found:
+                ft = getattr(entry, "filter_type", None)
+                raw_name = getattr(ft, "name", None) or str(key)
+                cleaned = raw_name.strip().upper()
+                if cleaned and cleaned not in {"RAI_FILTER_TYPE_UNSPECIFIED", "0", "NONE"}:
+                    matched.append(cleaned)
+    return tuple(sorted(set(matched)))
+
+
 def _inspect_sanitization_result(
     sanitization_result: Any,
     original_text: str,
@@ -230,6 +253,11 @@ def _inspect_sanitization_result(
     match_found = modelarmor_v1.FilterMatchState.MATCH_FOUND
     filter_results = getattr(sanitization_result, "filter_results", None) or {}
 
+    pi_matched = False
+    uri_matched = False
+    rai_matched = False
+    rai_types: List[str] = []
+    csam_matched = False
     deidentified_text: Optional[str] = None
     sdp_inspect_only_matched = False
 
@@ -237,38 +265,23 @@ def _inspect_sanitization_result(
         if _has_proto_field(filter_result, "pi_and_jailbreak_filter_result"):
             pi_res = filter_result.pi_and_jailbreak_filter_result
             if getattr(pi_res, "match_state", None) == match_found:
-                return ScreeningDecision(
-                    allowed=False,
-                    text=block_message_for_pi,
-                    blocked_reason="pi_and_jailbreak",
-                )
+                pi_matched = True
 
         if _has_proto_field(filter_result, "malicious_uri_filter_result"):
             uri_res = filter_result.malicious_uri_filter_result
             if getattr(uri_res, "match_state", None) == match_found:
-                return ScreeningDecision(
-                    allowed=False,
-                    text=block_message_for_pi,
-                    blocked_reason="malicious_uri",
-                )
+                uri_matched = True
 
         if _has_proto_field(filter_result, "rai_filter_result"):
             rai_res = filter_result.rai_filter_result
             if getattr(rai_res, "match_state", None) == match_found:
-                return ScreeningDecision(
-                    allowed=False,
-                    text=SAFETY_REFUSAL_MESSAGE,
-                    blocked_reason="rai",
-                )
+                rai_matched = True
+                rai_types.extend(_extract_matched_rai_types(rai_res))
 
         if _has_proto_field(filter_result, "csam_filter_filter_result"):
             csam_res = filter_result.csam_filter_filter_result
             if getattr(csam_res, "match_state", None) == match_found:
-                return ScreeningDecision(
-                    allowed=False,
-                    text=SAFETY_REFUSAL_MESSAGE,
-                    blocked_reason="csam",
-                )
+                csam_matched = True
 
         if _has_proto_field(filter_result, "sdp_filter_result"):
             sdp_res = filter_result.sdp_filter_result
@@ -283,11 +296,33 @@ def _inspect_sanitization_result(
                 if getattr(insp, "match_state", None) == match_found:
                     sdp_inspect_only_matched = True
 
-    if sdp_inspect_only_matched and deidentified_text is None:
+    triggered: List[Tuple[str, str, Tuple[str, ...]]] = []
+    if pi_matched:
+        triggered.append(("pi_and_jailbreak", "blocked", ()))
+    if uri_matched:
+        triggered.append(("malicious_uri", "blocked", ()))
+    if rai_matched:
+        triggered.append(("rai", "blocked", tuple(sorted(set(rai_types)))))
+    if csam_matched:
+        triggered.append(("csam", "blocked", ()))
+    if deidentified_text is not None and deidentified_text != original_text:
+        triggered.append(("sdp", "redacted", ()))
+    elif sdp_inspect_only_matched and deidentified_text is None:
+        triggered.append(("sdp", "blocked", ()))
+
+    blocking_filters = [flt for flt, act, _ in triggered if act == "blocked"]
+    if blocking_filters:
+        primary_reason = blocking_filters[0]
+        refusal_text = (
+            block_message_for_pi
+            if primary_reason in {"pi_and_jailbreak", "malicious_uri"}
+            else SAFETY_REFUSAL_MESSAGE
+        )
         return ScreeningDecision(
             allowed=False,
-            text=SAFETY_REFUSAL_MESSAGE,
-            blocked_reason="sdp",
+            text=refusal_text,
+            blocked_reason=primary_reason,
+            triggered_filters=tuple(triggered),
         )
 
     if deidentified_text is not None:
@@ -295,6 +330,7 @@ def _inspect_sanitization_result(
             allowed=True,
             text=deidentified_text,
             redacted=(deidentified_text != original_text),
+            triggered_filters=tuple(triggered),
         )
 
     # Fallback if top-level match_found was set without populated per-filter details
@@ -303,6 +339,7 @@ def _inspect_sanitization_result(
             allowed=False,
             text=block_message_for_pi,
             blocked_reason="model_armor_policy",
+            triggered_filters=(("model_armor_policy", "blocked", ()),),
         )
 
     return ScreeningDecision(allowed=True, text=original_text)
@@ -321,6 +358,7 @@ def screen_user_prompt(prompt: str) -> ScreeningDecision:
     if target is None:
         if _is_model_armor_fail_closed():
             logger.error("MODEL_ARMOR_TEMPLATE_ID is unset with MODEL_ARMOR_FAIL_CLOSED=true; failing closed.")
+            record_guardrail_action("missing_model_armor_config", "blocked", stage="input")
             emit_audit_event(
                 "security.prompt_blocked",
                 severity="ERROR",
@@ -333,6 +371,7 @@ def screen_user_prompt(prompt: str) -> ScreeningDecision:
                 allowed=False,
                 text=PROMPT_BLOCKED_MESSAGE,
                 blocked_reason="missing_model_armor_config",
+                triggered_filters=(("missing_model_armor_config", "blocked", ()),),
             )
         if is_cloud_run():
             logger.warning("MODEL_ARMOR_TEMPLATE_ID is unset in Cloud Run; skipping Model Armor prompt check.")
@@ -346,11 +385,16 @@ def screen_user_prompt(prompt: str) -> ScreeningDecision:
             user_prompt_data=modelarmor_v1.DataItem(text=prompt),
         )
         response = client.sanitize_user_prompt(request=request)
+        mark_model_armor_active(True)
         decision = _inspect_sanitization_result(
             sanitization_result=response.sanitization_result,
             original_text=prompt,
             block_message_for_pi=PROMPT_BLOCKED_MESSAGE,
         )
+        for flt, act, details in decision.triggered_filters:
+            record_guardrail_action(flt, act, stage="input", details=list(details))
+        if decision.redacted:
+            mark_pii_filtered(True)
         if not decision.allowed:
             logger.warning(
                 f"Model Armor blocked user prompt (reason={decision.blocked_reason})."
@@ -366,6 +410,7 @@ def screen_user_prompt(prompt: str) -> ScreeningDecision:
         return decision
     except Exception as e:
         logger.error(f"Model Armor prompt screening failed: {e}")
+        record_guardrail_action("model_armor_error", "blocked", stage="input")
         emit_audit_event(
             "security.prompt_screening_error",
             severity="ERROR",
@@ -378,6 +423,7 @@ def screen_user_prompt(prompt: str) -> ScreeningDecision:
             allowed=False,
             text=INTERNAL_ERROR_MESSAGE,
             blocked_reason="model_armor_error",
+            triggered_filters=(("model_armor_error", "blocked", ()),),
         )
 
 
@@ -394,6 +440,7 @@ def sanitize_model_output(
     if target is None:
         if _is_model_armor_fail_closed():
             logger.error("MODEL_ARMOR_TEMPLATE_ID is unset with MODEL_ARMOR_FAIL_CLOSED=true; failing closed.")
+            record_guardrail_action("missing_model_armor_config", "blocked", stage="output")
             emit_audit_event(
                 "security.output_blocked",
                 severity="ERROR",
@@ -405,6 +452,7 @@ def sanitize_model_output(
                 allowed=False,
                 text=SAFETY_REFUSAL_MESSAGE,
                 blocked_reason="missing_model_armor_config",
+                triggered_filters=(("missing_model_armor_config", "blocked", ()),),
             )
         if is_cloud_run():
             logger.warning("MODEL_ARMOR_TEMPLATE_ID is unset in Cloud Run; skipping Model Armor output check.")
@@ -422,11 +470,14 @@ def sanitize_model_output(
 
         request = modelarmor_v1.SanitizeModelResponseRequest(**request_kwargs)
         response = client.sanitize_model_response(request=request)
+        mark_model_armor_active(True)
         decision = _inspect_sanitization_result(
             sanitization_result=response.sanitization_result,
             original_text=output_text,
             block_message_for_pi=SAFETY_REFUSAL_MESSAGE,
         )
+        for flt, act, details in decision.triggered_filters:
+            record_guardrail_action(flt, act, stage="output", details=list(details))
         if not decision.allowed:
             logger.warning(
                 f"Model Armor blocked model response (reason={decision.blocked_reason})."
@@ -450,6 +501,7 @@ def sanitize_model_output(
         return decision
     except Exception as e:
         logger.error(f"Model Armor output sanitization failed: {e}")
+        record_guardrail_action("model_armor_error", "blocked", stage="output")
         emit_audit_event(
             "security.output_screening_error",
             severity="ERROR",
@@ -461,6 +513,7 @@ def sanitize_model_output(
             allowed=False,
             text=INTERNAL_ERROR_MESSAGE,
             blocked_reason="model_armor_error",
+            triggered_filters=(("model_armor_error", "blocked", ()),),
         )
 
 
@@ -534,6 +587,7 @@ def sanitize_chunk_text(chunk_text: str) -> str:
             model_response_data=modelarmor_v1.DataItem(text=chunk_text),
         )
         response = client.sanitize_model_response(request=request)
+        mark_model_armor_active(True)
         redacted_text = _extract_sdp_deidentified_text(
             sanitization_result=response.sanitization_result,
             original_text=chunk_text,
@@ -541,6 +595,7 @@ def sanitize_chunk_text(chunk_text: str) -> str:
         if redacted_text != chunk_text:
             logger.info("Model Armor + Cloud DLP masked sensitive infoTypes in retrieved document chunk.")
             mark_pii_filtered(True)
+            record_guardrail_action("sdp", "redacted", stage="retrieval")
             emit_audit_event(
                 "security.chunk_dlp_masked",
                 severity="INFO",

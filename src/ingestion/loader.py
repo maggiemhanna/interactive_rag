@@ -19,7 +19,7 @@ from src.core.config import (
 )
 from src.core.logger import setup_logging
 from src.core.security import validate_collection_name, validate_embedding_model
-from src.core.storage import archive_upload, get_bucket_name
+from src.core.storage import archive_upload, get_bucket_name, get_upload_user_dir
 
 logger = setup_logging(name="ingestion.loader")
 
@@ -132,8 +132,7 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
     max_upload_bytes = max_upload_mb * 1024 * 1024
     max_chunks = get_max_chunks_per_ingest()
 
-    upload_tmp_root = os.path.abspath(os.getenv("UPLOAD_TMP_ROOT", "/tmp/uploads"))
-    user_upload_dir = os.path.join(upload_tmp_root, uid)
+    user_upload_dir = get_upload_user_dir(uid)
     request_upload_dir: Optional[str] = None
 
     try:
@@ -232,16 +231,16 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
         else:
             try:
                 body = await request.json()
-                raw_server_paths, collection_name, embedding_model = _parse_json_body(
-                    body, collection_name, embedding_model
-                )
+                raw_server_paths, raw_col, raw_emb = _parse_json_body(body)
+            except HTTPException:
+                raise
             except Exception:
                 raise HTTPException(
                     status_code=400,
                     detail="Unsupported Content-Type. Please send application/json or multipart/form-data.",
                 )
             collection_name, embedding_model = _validate_ingest_params(
-                collection_name, embedding_model
+                raw_col, raw_emb
             )
 
         # Security guard: never allow arbitrary container filesystem reads in Cloud Run

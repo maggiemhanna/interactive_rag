@@ -6,7 +6,7 @@ import sys
 import threading
 import uuid
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -23,6 +23,19 @@ DEFAULT_AUDIT_LOG_NAME = "interactiverag-audit"
 REQUEST_ID_PATTERN = re.compile(r"^[a-zA-Z0-9._:-]{1,128}$")
 TRACE_ID_PATTERN = re.compile(r"^[a-fA-F0-9]{16,64}$")
 
+GUARDRAIL_FILTER_LABELS: Dict[str, str] = {
+    "pi_and_jailbreak": "Prompt Injection / Jailbreak",
+    "malicious_uri": "Malicious URI",
+    "rai": "RAI Safety",
+    "sdp": "PII / Sensitive Data",
+    "csam": "CSAM Safety",
+    "gemini_safety": "Gemini Safety",
+    "model_armor_policy": "Model Armor Policy",
+    "missing_model_armor_config": "Model Armor Config",
+    "model_armor_error": "Model Armor Screening",
+    "invalid_query_text": "Query Validation",
+}
+
 
 @dataclass
 class AuditRequestState:
@@ -35,6 +48,10 @@ class AuditRequestState:
     method: str = ""
     path: str = ""
     pii_filtered: bool = False
+    model_armor_active: bool = False
+    retrieved_chunks_count: int = 0
+    guardrail_actions: List[Dict[str, Any]] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
 _audit_state_var: ContextVar[Optional[AuditRequestState]] = ContextVar(
@@ -115,13 +132,104 @@ def mark_pii_filtered(filtered: bool = True) -> None:
     """Records that Sensitive Data Protection / Model Armor redacted sensitive content during this request."""
     state = _audit_state_var.get()
     if state is not None and filtered:
-        state.pii_filtered = True
+        with state._lock:
+            state.pii_filtered = True
 
 
 def was_pii_filtered() -> bool:
     """Returns True if any chunk or model output had PII masked during the active request."""
     state = _audit_state_var.get()
     return bool(state.pii_filtered) if state is not None else False
+
+
+def mark_model_armor_active(active: bool = True) -> None:
+    """Records that Google Cloud Model Armor actively screened this request."""
+    state = _audit_state_var.get()
+    if state is not None and active:
+        with state._lock:
+            state.model_armor_active = True
+
+
+def was_model_armor_active() -> bool:
+    """Returns True when Cloud Model Armor screened prompt, retrieval, or output during this request."""
+    state = _audit_state_var.get()
+    return bool(state.model_armor_active) if state is not None else False
+
+
+def record_guardrail_action(
+    filter_name: str,
+    action: str,
+    stage: str,
+    label: Optional[str] = None,
+    details: Optional[List[str]] = None,
+) -> None:
+    """Records a Model Armor or Gemini safety guardrail action (`blocked` or `redacted`) on the active request."""
+    state = _audit_state_var.get()
+    if state is None:
+        return
+
+    clean_filter = (filter_name or "model_armor_policy").strip()
+    clean_action = (action or "blocked").strip()
+    clean_stage = (stage or "output").strip()
+    resolved_label = label or GUARDRAIL_FILTER_LABELS.get(clean_filter, clean_filter)
+    normalized_details = [str(d).strip() for d in (details or []) if str(d).strip()]
+
+    with state._lock:
+        if clean_filter == "sdp" and clean_action == "redacted":
+            state.pii_filtered = True
+
+        for existing in state.guardrail_actions:
+            if (
+                existing["filter"] == clean_filter
+                and existing["action"] == clean_action
+                and existing["stage"] == clean_stage
+            ):
+                for item in normalized_details:
+                    if item not in existing["details"]:
+                        existing["details"].append(item)
+                return
+
+        state.guardrail_actions.append(
+            {
+                "filter": clean_filter,
+                "label": resolved_label,
+                "action": clean_action,
+                "stage": clean_stage,
+                "details": normalized_details,
+            }
+        )
+
+
+def get_guardrail_actions() -> List[Dict[str, Any]]:
+    """Returns a copy of all guardrail actions triggered during the active request."""
+    state = _audit_state_var.get()
+    if state is None:
+        return []
+    with state._lock:
+        return [
+            {
+                "filter": item["filter"],
+                "label": item["label"],
+                "action": item["action"],
+                "stage": item["stage"],
+                "details": list(item["details"]),
+            }
+            for item in state.guardrail_actions
+        ]
+
+
+def record_retrieved_chunks(count: int) -> None:
+    """Accumulates the number of vectorstore passages retrieved during the active request."""
+    state = _audit_state_var.get()
+    if state is not None and count > 0:
+        with state._lock:
+            state.retrieved_chunks_count += int(count)
+
+
+def get_retrieved_chunks_count() -> int:
+    """Returns the total number of passages retrieved during the active request."""
+    state = _audit_state_var.get()
+    return int(state.retrieved_chunks_count) if state is not None else 0
 
 
 def get_audit_log_name() -> str:

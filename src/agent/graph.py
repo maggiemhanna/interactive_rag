@@ -7,8 +7,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
+from src.agent.memory import MEMORY_SAVER
 from src.agent.schemas import AgentState
-from src.core.audit import emit_audit_event
+from src.core.audit import emit_audit_event, record_guardrail_action
 from src.core.logger import setup_logging
 from src.core.security import (
     SAFETY_REFUSAL_MESSAGE,
@@ -22,10 +23,6 @@ from src.core.security import (
 )
 
 logger = setup_logging(name="agent.graph")
-
-# Module-scoped checkpointer persists multi-turn conversation history across warm requests;
-# every HTTP request namespaces thread_id as f"{uid}:{request.thread_id}".
-MEMORY_SAVER = InMemorySaver()
 
 SYSTEM_PROMPT = (
     "You are an expert AI assistant specializing in grounded document analysis and retrieval.\n\n"
@@ -95,6 +92,7 @@ def build_agent(
             cleaned_query = validate_query_text(raw_query)
         except ValueError as exc:
             logger.warning(f"input_guard rejected invalid query: {exc}")
+            record_guardrail_action("invalid_query_text", "blocked", stage="input")
             emit_audit_event(
                 "security.prompt_blocked",
                 severity="WARNING",
@@ -129,6 +127,7 @@ def build_agent(
             logger.warning(
                 "Gemini blocked model response via safety_settings; returning polite refusal fallback."
             )
+            record_guardrail_action("gemini_safety", "blocked", stage="model")
             emit_audit_event(
                 "security.gemini_safety_blocked",
                 severity="WARNING",

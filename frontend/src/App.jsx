@@ -34,7 +34,8 @@ import {
   CornerDownLeft,
   Square,
   History,
-  ArrowLeft
+  ArrowLeft,
+  Shield
 } from 'lucide-react';
 import {
   API_BASE,
@@ -42,6 +43,11 @@ import {
   subscribeToAuthChanges,
   logoutUser,
 } from './firebase';
+import {
+  fetchUserDataInventory,
+  eraseAllUserData,
+  formatStorageBytes,
+} from './api';
 import AuthGate from './AuthGate';
 
 const QUERY_STOPWORDS = new Set([
@@ -1194,6 +1200,223 @@ function parseTurnSteps(turn, turnNumber) {
   };
 }
 
+const RAI_CATEGORY_LABELS = {
+  HATE_SPEECH: 'Hate Speech',
+  HARASSMENT: 'Harassment',
+  SEXUALLY_EXPLICIT: 'Sexually Explicit',
+  DANGEROUS: 'Dangerous Content',
+  DANGEROUS_CONTENT: 'Dangerous Content',
+};
+
+function formatRaiCategory(code) {
+  const key = String(code || '').trim().toUpperCase();
+  if (RAI_CATEGORY_LABELS[key]) return RAI_CATEGORY_LABELS[key];
+  return key
+    .toLowerCase()
+    .split('_')
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+function summarizeGuardrailPills(compliance) {
+  if (!compliance) return [];
+  const rawActions = Array.isArray(compliance.guardrail_actions)
+    ? compliance.guardrail_actions
+    : [];
+
+  const grouped = new Map();
+  for (const item of rawActions) {
+    if (!item || !item.filter || !item.action) continue;
+    const key = `${item.filter}:${item.action}`;
+    if (!grouped.has(key)) {
+      grouped.set(key, {
+        filter: item.filter,
+        label: item.label || item.filter,
+        action: item.action,
+        stages: item.stage ? [item.stage] : [],
+        details: Array.isArray(item.details) ? [...item.details] : [],
+      });
+    } else {
+      const existing = grouped.get(key);
+      if (item.stage && !existing.stages.includes(item.stage)) {
+        existing.stages.push(item.stage);
+      }
+      if (Array.isArray(item.details)) {
+        for (const d of item.details) {
+          if (d && !existing.details.includes(d)) existing.details.push(d);
+        }
+      }
+    }
+  }
+
+  // Backward compatibility if an older cached turn only stored boolean pii_filtered
+  if (grouped.size === 0 && compliance.pii_filtered) {
+    grouped.set('sdp:redacted', {
+      filter: 'sdp',
+      label: 'PII / Sensitive Data',
+      action: 'redacted',
+      stages: ['output'],
+      details: [],
+    });
+  }
+
+  const pills = [];
+  for (const [key, entry] of grouped.entries()) {
+    const stageNote = entry.stages.length > 0 ? ` (${entry.stages.join(', ')})` : '';
+    if (entry.action === 'redacted') {
+      pills.push({
+        key,
+        variant: 'pii-redacted',
+        text: 'PII redacted',
+        title: `Cloud Model Armor SDP + Cloud DLP masked sensitive data${stageNote}`,
+      });
+      continue;
+    }
+
+    let text = `${entry.label} blocked`;
+    if (entry.filter === 'pi_and_jailbreak') {
+      text = 'Prompt Injection / Jailbreak blocked';
+    } else if (entry.filter === 'malicious_uri') {
+      text = 'Malicious URI blocked';
+    } else if (entry.filter === 'rai') {
+      const raiDetails = entry.details.map(formatRaiCategory).filter(Boolean);
+      text =
+        raiDetails.length > 0
+          ? `RAI blocked (${raiDetails.join(', ')})`
+          : 'RAI Safety blocked';
+    } else if (entry.filter === 'sdp') {
+      text = 'Sensitive Data blocked';
+    } else if (entry.filter === 'csam') {
+      text = 'CSAM Safety blocked';
+    } else if (entry.filter === 'gemini_safety') {
+      text = 'Gemini Safety blocked';
+    } else if (entry.filter === 'invalid_query_text') {
+      text = 'Query validation blocked';
+    }
+
+    const provider =
+      entry.filter === 'gemini_safety'
+        ? 'Vertex AI Gemini safety settings'
+        : entry.filter === 'invalid_query_text'
+          ? 'Input validation policy'
+          : 'Google Cloud Model Armor';
+
+    pills.push({
+      key,
+      variant: 'guardrail-blocked',
+      text,
+      title: `Blocked by ${provider}${stageNote}`,
+    });
+  }
+
+  return pills;
+}
+
+function AgentComplianceFooter({ turn, groundingEvents = [] }) {
+  if (!turn?.answer) return null;
+  const compliance = turn.compliance || null;
+  if (!compliance && turn.status === 'streaming') return null;
+
+  const guardrailPills = summarizeGuardrailPills(compliance);
+  const wasBlocked =
+    compliance?.ai_generated === false ||
+    guardrailPills.some((p) => p.variant === 'guardrail-blocked');
+
+  let isGrounded = false;
+  let citationCount = 0;
+  if (compliance && typeof compliance.grounded === 'boolean') {
+    isGrounded = compliance.grounded;
+    citationCount = Number(compliance.citation_count || 0);
+  } else {
+    const fallbackCitations = collectAllCitations(turn.answer);
+    const fallbackChunks = extractRetrievedChunksFromEvents(groundingEvents);
+    citationCount = fallbackCitations.reduce(
+      (sum, item) => sum + Math.max(Array.isArray(item.pages) ? item.pages.length : 0, 1),
+      0
+    );
+    isGrounded = !wasBlocked && citationCount > 0 && fallbackChunks.length > 0;
+  }
+
+  const groundingTitle = isGrounded
+    ? 'Answer is grounded in retrieved document passages with inline page citations'
+    : wasBlocked
+      ? 'Blocked by safety/security guardrails before grounded output'
+      : 'Response does not contain inline citations to retrieved document passages';
+
+  return (
+    <div
+      className="agent-compliance-footer"
+      title={
+        compliance?.request_id
+          ? `EU AI Act Art. 50 Transparency · Request ID: ${compliance.request_id}`
+          : 'EU AI Act Art. 50 Transparency'
+      }
+    >
+      {compliance && (
+        <span className="agent-compliance-pill">
+          <Shield size={12} />
+          <span>{wasBlocked ? 'Guardrail refusal' : 'AI-generated'}</span>
+          {compliance.model && (
+            <>
+              <span className="agent-compliance-sep">·</span>
+              <span>{compliance.model}</span>
+            </>
+          )}
+          {compliance.region && (
+            <>
+              <span className="agent-compliance-sep">·</span>
+              <span>{compliance.region}</span>
+            </>
+          )}
+        </span>
+      )}
+
+      {isGrounded ? (
+        <span className="agent-compliance-pill grounded" title={groundingTitle}>
+          <CheckCircle2 size={12} />
+          <span>
+            Grounded
+            {citationCount > 0
+              ? ` · ${citationCount} ${citationCount === 1 ? 'citation' : 'citations'}`
+              : ''}
+          </span>
+        </span>
+      ) : (
+        <span className="agent-compliance-pill ungrounded" title={groundingTitle}>
+          <AlertCircle size={12} />
+          <span>Not grounded</span>
+        </span>
+      )}
+
+      {guardrailPills.map((pill) => (
+        <span
+          key={pill.key}
+          className={`agent-compliance-pill ${pill.variant}`}
+          title={pill.title}
+        >
+          {pill.variant === 'guardrail-blocked' ? (
+            <AlertTriangle size={12} />
+          ) : (
+            <Shield size={12} />
+          )}
+          <span>{pill.text}</span>
+        </span>
+      ))}
+
+      {compliance?.model_armor_active && guardrailPills.length === 0 && (
+        <span
+          className="agent-compliance-pill armor-verified"
+          title="Passed Google Cloud Model Armor checks: Prompt Injection/Jailbreak, Malicious URI, RAI Safety, and PII/SDP"
+        >
+          <Shield size={12} />
+          <span>Model Armor verified</span>
+        </span>
+      )}
+    </div>
+  );
+}
+
 function TurnStepsTimelineCard({
   turn,
   turnIndex,
@@ -1471,6 +1694,13 @@ function TurnStepsTimelineCard({
                         compact
                       />
                     </div>
+                  )}
+
+                  {turn.answer && (
+                    <AgentComplianceFooter
+                      turn={turn}
+                      groundingEvents={groundingEvents}
+                    />
                   )}
                 </div>
               </>
@@ -1844,6 +2074,12 @@ function ConversationTurnCard({
               viewMode={viewMode}
               queryTerms={extractQueryTerms(turn.query)}
             />
+            {turn.answer && (
+              <AgentComplianceFooter
+                turn={turn}
+                groundingEvents={groundingEvents}
+              />
+            )}
             {turn.status === 'error' && turn.error && (
               <div className="agent-turn-error-box" style={{ marginTop: '0.85rem' }}>
                 <div className="agent-turn-error-msg">
@@ -1865,6 +2101,244 @@ function ConversationTurnCard({
             )}
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+function PrivacyDataModal({
+  isOpen,
+  onClose,
+  inventory,
+  loading,
+  erasing,
+  error,
+  confirmErase,
+  setConfirmErase,
+  onRefresh,
+  onConfirmErase,
+}) {
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape' && !erasing) {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, erasing, onClose]);
+
+  if (!isOpen) return null;
+
+  const collections = Array.isArray(inventory?.collections) ? inventory.collections : [];
+  const uploadedPdfs = Array.isArray(inventory?.uploaded_pdfs) ? inventory.uploaded_pdfs : [];
+
+  return (
+    <div
+      className="privacy-modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="privacy-modal-title"
+      onClick={() => {
+        if (!erasing) onClose();
+      }}
+    >
+      <div className="privacy-modal-card" onClick={(e) => e.stopPropagation()}>
+        <div className="privacy-modal-header">
+          <div className="privacy-modal-title-wrap">
+            <div className="privacy-modal-icon">
+              <Shield size={20} />
+            </div>
+            <div>
+              <h2 id="privacy-modal-title" className="privacy-modal-title">
+                My Data &amp; Privacy
+              </h2>
+              <p className="privacy-modal-subtitle">
+                GDPR Art. 15 Personal Data Inventory &amp; Art. 17 Right to Erasure
+              </p>
+            </div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+            <button
+              type="button"
+              className="refresh-btn"
+              onClick={onRefresh}
+              disabled={loading || erasing}
+              title="Refresh data inventory"
+            >
+              <RefreshCw size={15} className={loading ? 'spinner' : ''} />
+            </button>
+            <button
+              type="button"
+              className="refresh-btn"
+              onClick={onClose}
+              disabled={erasing}
+              aria-label="Close My Data & Privacy"
+            >
+              <X size={17} />
+            </button>
+          </div>
+        </div>
+
+        <div className="privacy-modal-body">
+          {error && (
+            <div className="alert alert-error" style={{ marginBottom: '1rem' }}>
+              <AlertCircle size={18} style={{ flexShrink: 0 }} />
+              <span>{error}</span>
+            </div>
+          )}
+
+          {loading && !inventory ? (
+            <div className="privacy-loading-box">
+              <RefreshCw size={18} className="spinner" color="var(--primary)" />
+              <span>Loading your stored data inventory…</span>
+            </div>
+          ) : inventory ? (
+            <>
+              <div className="privacy-stats-grid">
+                <div className="privacy-stat-tile">
+                  <span className="privacy-stat-label">Data Region</span>
+                  <span className="privacy-stat-value">{inventory.region || '—'}</span>
+                </div>
+                <div className="privacy-stat-tile">
+                  <span className="privacy-stat-label">Collections</span>
+                  <span className="privacy-stat-value">
+                    {inventory.collection_count ?? 0}{' '}
+                    <span className="privacy-stat-sub">
+                      ({inventory.total_passages ?? 0} passages)
+                    </span>
+                  </span>
+                </div>
+                <div className="privacy-stat-tile">
+                  <span className="privacy-stat-label">Archived PDFs</span>
+                  <span className="privacy-stat-value">{inventory.uploaded_pdf_count ?? 0}</span>
+                </div>
+                <div className="privacy-stat-tile">
+                  <span className="privacy-stat-label">Stored Volume</span>
+                  <span className="privacy-stat-value">
+                    {formatStorageBytes(inventory.total_bytes)}
+                  </span>
+                </div>
+              </div>
+
+              <div className="privacy-meta-strip">
+                <span>
+                  Storage: <strong>{inventory.storage_backend === 'gcs' ? 'Regional Cloud Storage' : 'Local Disk'}</strong>
+                </span>
+                {inventory.storage_backend === 'gcs' && (
+                  <span>
+                    GCS Objects: <strong>{inventory.gcs_live_object_count ?? 0} live</strong> ·{' '}
+                    <strong>{inventory.gcs_noncurrent_version_count ?? 0} versioned</strong>
+                  </span>
+                )}
+                <span>
+                  Active Chat Memory: <strong>{inventory.memory_thread_count ?? 0} thread(s)</strong>
+                </span>
+              </div>
+
+              <div className="privacy-section">
+                <h3 className="privacy-section-title">Indexed Vector Collections</h3>
+                {collections.length === 0 ? (
+                  <p className="privacy-empty-note">No vector collections stored.</p>
+                ) : (
+                  <div className="privacy-list">
+                    {collections.map((col) => (
+                      <div key={col.name} className="privacy-list-row">
+                        <span className="privacy-list-name">
+                          <Layers size={14} color="var(--primary)" />
+                          <span>{col.name}</span>
+                        </span>
+                        <span className="collection-badge">
+                          {col.count ?? 0} {col.count === 1 ? 'passage' : 'passages'}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {inventory.storage_backend === 'gcs' && (
+                <div className="privacy-section">
+                  <h3 className="privacy-section-title">Archived Uploaded PDFs</h3>
+                  {uploadedPdfs.length === 0 ? (
+                    <p className="privacy-empty-note">No archived PDF uploads stored.</p>
+                  ) : (
+                    <div className="privacy-list">
+                      {uploadedPdfs.map((pdf) => (
+                        <div key={pdf.blob_name} className="privacy-list-row">
+                          <span className="privacy-list-name" title={pdf.blob_name}>
+                            <FileText size={14} color="var(--accent-cyan)" />
+                            <span>{pdf.filename}</span>
+                          </span>
+                          <span className="collection-badge">
+                            {formatStorageBytes(pdf.size_bytes)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          ) : null}
+
+          <div className="privacy-danger-zone">
+            <div className="privacy-danger-header">
+              <div>
+                <h3 className="privacy-danger-title">Erase All My Data (GDPR Art. 17)</h3>
+                <p className="privacy-danger-desc">
+                  Permanently deletes all vector collections, archived PDFs (including all live and
+                  noncurrent Cloud Storage object versions), temporary caches, and active AI
+                  conversation memory for your account.
+                </p>
+              </div>
+              {!confirmErase && (
+                <button
+                  type="button"
+                  className="privacy-erase-trigger-btn"
+                  onClick={() => setConfirmErase(true)}
+                  disabled={loading || erasing}
+                >
+                  <Trash2 size={14} />
+                  <span>Erase All Data</span>
+                </button>
+              )}
+            </div>
+
+            {confirmErase && (
+              <div className="privacy-confirm-box">
+                <div className="privacy-confirm-warning">
+                  <AlertTriangle size={17} style={{ flexShrink: 0 }} />
+                  <span>
+                    This action is irreversible. Permanently erase all stored collections, PDFs, and
+                    conversation history?
+                  </span>
+                </div>
+                <div className="privacy-confirm-actions">
+                  <button
+                    type="button"
+                    className="tab-btn"
+                    style={{ padding: '0.4rem 0.85rem', fontSize: '0.82rem' }}
+                    onClick={() => setConfirmErase(false)}
+                    disabled={erasing}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="privacy-erase-confirm-btn"
+                    onClick={onConfirmErase}
+                    disabled={erasing}
+                  >
+                    {erasing ? <RefreshCw size={14} className="spinner" /> : <Trash2 size={14} />}
+                    <span>{erasing ? 'Erasing…' : 'Permanently Erase Everything'}</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -1917,6 +2391,14 @@ export default function App() {
   const [focusedStepTurnId, setFocusedStepTurnId] = useState('latest');
   const [agentLoading, setAgentLoading] = useState(false);
 
+  // Compliance & Privacy (GDPR Art. 15 / Art. 17) modal state
+  const [privacyOpen, setPrivacyOpen] = useState(false);
+  const [privacyInventory, setPrivacyInventory] = useState(null);
+  const [privacyLoading, setPrivacyLoading] = useState(false);
+  const [privacyErasing, setPrivacyErasing] = useState(false);
+  const [privacyConfirmErase, setPrivacyConfirmErase] = useState(false);
+  const [privacyError, setPrivacyError] = useState(null);
+
   const fileInputRef = useRef(null);
   const agentInputRef = useRef(null);
   const conversationEndRef = useRef(null);
@@ -1953,6 +2435,12 @@ export default function App() {
     setAgentViewMode('chat');
     setFocusedStepTurnId('latest');
     setAgentLoading(false);
+    setPrivacyOpen(false);
+    setPrivacyInventory(null);
+    setPrivacyLoading(false);
+    setPrivacyErasing(false);
+    setPrivacyConfirmErase(false);
+    setPrivacyError(null);
     setNotification(null);
   };
 
@@ -2496,6 +2984,7 @@ export default function App() {
       query: trimmedQuestion,
       answer: '',
       events: [],
+      compliance: null,
       endpointMode: agentEndpointMode,
       status: 'streaming',
       error: null,
@@ -2586,6 +3075,7 @@ export default function App() {
         let buffer = '';
         let streamDone = false;
         let latestAnswer = '';
+        let latestCompliance = null;
         let streamError = null;
         const accumulatedEvents = [];
 
@@ -2601,6 +3091,14 @@ export default function App() {
             if (parsed.event === 'error' && parsed.error) {
               streamError = parsed.error;
             }
+            if (parsed.event === 'compliance' && parsed.compliance) {
+              latestCompliance = parsed.compliance;
+              updateTurnInThread(targetThreadId, turnId, (trn) => ({
+                ...trn,
+                compliance: latestCompliance,
+              }));
+              return false;
+            }
             if (parsed.message) {
               accumulatedEvents.push(parsed.message);
               const msgType = (parsed.message.type || '').toLowerCase();
@@ -2614,6 +3112,7 @@ export default function App() {
                 ...trn,
                 events: [...accumulatedEvents],
                 answer: latestAnswer,
+                compliance: latestCompliance || trn.compliance || null,
               }));
             }
           } catch (e) {
@@ -2648,6 +3147,7 @@ export default function App() {
           ...trn,
           events: [...accumulatedEvents],
           answer: latestAnswer,
+          compliance: latestCompliance || trn.compliance || null,
           status: streamError && !latestAnswer ? 'error' : 'done',
           error: streamError && !latestAnswer ? streamError : null,
         }));
@@ -2659,6 +3159,7 @@ export default function App() {
           ...trn,
           events: msgs,
           answer: ans,
+          compliance: data.compliance || null,
           status: 'done',
           error: null,
         }));
@@ -2724,6 +3225,60 @@ export default function App() {
     }, 1800);
   };
 
+  const loadPrivacyInventory = async () => {
+    setPrivacyLoading(true);
+    setPrivacyError(null);
+    try {
+      const inv = await fetchUserDataInventory(authFetch);
+      setPrivacyInventory(inv);
+    } catch (err) {
+      setPrivacyError(err.message || 'Could not load your personal data inventory.');
+    } finally {
+      setPrivacyLoading(false);
+    }
+  };
+
+  const openPrivacyModal = () => {
+    setPrivacyOpen(true);
+    setPrivacyConfirmErase(false);
+    setPrivacyError(null);
+    loadPrivacyInventory();
+  };
+
+  const closePrivacyModal = () => {
+    if (privacyErasing) return;
+    setPrivacyOpen(false);
+    setPrivacyConfirmErase(false);
+    setPrivacyError(null);
+  };
+
+  const handleEraseMyData = async () => {
+    if (privacyErasing) return;
+    setPrivacyErasing(true);
+    setPrivacyError(null);
+    try {
+      const result = await eraseAllUserData(authFetch);
+      const uidToClear = currentUser?.uid;
+      if (uidToClear && typeof window !== 'undefined') {
+        window.sessionStorage.removeItem(getThreadStorageKey(uidToClear));
+      }
+      resetTenantState();
+      if (uidToClear) {
+        restoredUidRef.current = uidToClear;
+      }
+      setNotification({
+        type: 'success',
+        message:
+          result?.message ||
+          'All personal data, collections, archived PDFs, and conversation history have been permanently erased.',
+      });
+    } catch (err) {
+      setPrivacyError(err.message || 'Failed to erase personal data. Please try again.');
+    } finally {
+      setPrivacyErasing(false);
+    }
+  };
+
   if (authInitializing) {
     return (
       <div className="auth-screen">
@@ -2768,6 +3323,16 @@ export default function App() {
               <RefreshCw size={14} className={apiStatus === 'checking' ? 'spinner' : ''} />
             </button>
           </div>
+
+          <button
+            type="button"
+            className="privacy-header-btn"
+            onClick={openPrivacyModal}
+            title="Inspect or erase your stored personal data (GDPR Art. 15 & Art. 17)"
+          >
+            <Shield size={14} />
+            <span>My Data &amp; Privacy</span>
+          </button>
 
           <div className="user-pill">
             {currentUser.photoURL ? (
@@ -3855,6 +4420,19 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      <PrivacyDataModal
+        isOpen={privacyOpen}
+        onClose={closePrivacyModal}
+        inventory={privacyInventory}
+        loading={privacyLoading}
+        erasing={privacyErasing}
+        error={privacyError}
+        confirmErase={privacyConfirmErase}
+        setConfirmErase={setPrivacyConfirmErase}
+        onRefresh={loadPrivacyInventory}
+        onConfirmErase={handleEraseMyData}
+      />
     </div>
   );
 }

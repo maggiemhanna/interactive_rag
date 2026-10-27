@@ -6,6 +6,7 @@ from langchain_core.documents import Document
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
+from src.core.audit import record_retrieved_chunks
 from src.core.chroma import get_vectorstore, require_collection
 from src.core.security import (
     sanitize_retrieved_documents,
@@ -125,6 +126,7 @@ def get_retriever_tool(
     def _retrieve(query: str) -> str:
         docs = retriever.invoke(query)
         safe_docs = sanitize_retrieved_documents(docs)
+        record_retrieved_chunks(len(safe_docs))
         return format_retrieved_chunks(safe_docs)
 
     return StructuredTool.from_function(

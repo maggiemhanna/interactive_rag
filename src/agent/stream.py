@@ -8,7 +8,7 @@ from langgraph.errors import GraphRecursionError
 
 from src.agent.display import print_event, print_header
 from src.agent.graph import build_agent
-from src.agent.schemas import AgentRequest
+from src.agent.schemas import AgentRequest, build_compliance_metadata
 from src.agent.tools import get_retriever_tool
 from src.core.audit import emit_audit_event, hash_query
 from src.core.auth import is_cloud_run
@@ -188,7 +188,8 @@ def stream_sse(
     """Generator yielding Server-Sent Events (SSE) payloads while pinning user Chroma cache."""
     query_digest = hash_query(request.query)
     query_len = len(request.query)
-    answer_chars = 0
+    final_answer = ""
+    streamed_messages = []
     try:
         with user_read_lock(uid) as stream_persist_dir:
             for evt in stream_events(
@@ -201,13 +202,28 @@ def stream_sse(
                 verbose_console=False,
             ):
                 msg = evt["message"]
+                streamed_messages.append(msg)
                 if msg.get("type") == "ai" and msg.get("content"):
-                    answer_chars = len(str(msg["content"]))
+                    final_answer = str(msg["content"])
                 data = {
                     "event": evt["event"],
                     "message": msg,
                 }
                 yield f"data: {json.dumps(data)}\n\n"
+
+        compliance_meta = build_compliance_metadata(
+            model_name=request.model_name,
+            answer=final_answer,
+            messages=streamed_messages,
+            scoped_thread_id=scoped_thread_id,
+        ).model_dump()
+        compliance_frame = {
+            "event": "compliance",
+            "compliance": compliance_meta,
+            "message": {"type": "compliance", "content": ""},
+        }
+        yield f"data: {json.dumps(compliance_frame)}\n\n"
+
         emit_audit_event(
             "agent.query",
             uid=uid,
@@ -217,7 +233,11 @@ def stream_sse(
             stream=True,
             query_sha256=query_digest,
             query_chars=query_len,
-            answer_chars=answer_chars,
+            answer_chars=len(final_answer),
+            grounded=compliance_meta["grounded"],
+            citation_count=compliance_meta["citation_count"],
+            pii_filtered=compliance_meta["pii_filtered"],
+            guardrail_actions=[a["filter"] + ":" + a["action"] for a in compliance_meta["guardrail_actions"]],
         )
         yield "data: [DONE]\n\n"
     except Exception:

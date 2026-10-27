@@ -548,3 +548,224 @@ def archive_upload(uid: str, local_file_path: str, original_filename: str) -> Op
     gcs_uri = f"gs://{bucket_name}/{blob_name}"
     logger.info(f"Archived uploaded PDF for uid='{safe_uid}' to '{gcs_uri}'.")
     return gcs_uri
+
+
+_ARCHIVE_PREFIX_RE = re.compile(r"^\d{8}T\d{6}Z_[0-9a-f]{6}_")
+
+
+def get_upload_user_dir(uid: str) -> str:
+    """Returns the validated, isolated temporary PDF upload directory for a specific user."""
+    safe_uid = validate_uid(uid)
+    upload_root = os.path.abspath(os.getenv("UPLOAD_TMP_ROOT", "/tmp/uploads"))
+    user_upload_dir = os.path.abspath(os.path.join(upload_root, safe_uid))
+    if (
+        os.path.commonpath([upload_root, user_upload_dir]) != upload_root
+        or user_upload_dir == upload_root
+    ):
+        raise ValueError(f"Unsafe resolved upload directory for uid={safe_uid!r}")
+    return user_upload_dir
+
+
+def _list_bucket_blobs(bucket: Any, prefix: str, versions: bool = False) -> List[Any]:
+    """Lists blobs under `prefix`, optionally enumerating all live and noncurrent versions."""
+    if not versions:
+        return list(bucket.list_blobs(prefix=prefix))
+    try:
+        return list(bucket.list_blobs(prefix=prefix, versions=True))
+    except TypeError:
+        return list(bucket.list_blobs(prefix=prefix))
+
+
+def _delete_blob_revision(bucket: Any, blob: Any) -> None:
+    """Permanently deletes a specific GCS blob generation (or live blob on unversioned doubles)."""
+    generation = getattr(blob, "generation", None)
+    with contextlib.suppress(gcs_exceptions.NotFound):
+        if hasattr(bucket, "delete_blob"):
+            bucket.delete_blob(blob.name, generation=generation)
+        else:
+            blob.delete()
+
+
+def get_user_data_inventory(uid: str) -> Dict[str, Any]:
+    """Builds a GDPR Art. 15 personal data inventory for `uid` across ChromaDB and GCS."""
+    from src.core.chroma import list_collections
+    from src.core.security import validate_gcp_region
+
+    safe_uid = validate_uid(uid)
+    region = validate_gcp_region()
+    bucket_name = get_bucket_name()
+
+    with user_read_lock(safe_uid) as persist_directory:
+        col_payload = list_collections(persist_directory)
+        raw_details = col_payload.get("details", []) if isinstance(col_payload, dict) else []
+        collections = [
+            {"name": str(item.get("name", "")), "count": int(item.get("count", 0) or 0)}
+            for item in raw_details
+            if isinstance(item, dict) and item.get("name")
+        ]
+        total_passages = sum(item["count"] for item in collections)
+        local_chroma_bytes = _directory_size_bytes(persist_directory)
+
+    local_uploads_bytes = _directory_size_bytes(get_upload_user_dir(safe_uid))
+    local_cache_bytes = local_chroma_bytes + local_uploads_bytes
+
+    uploaded_pdfs: List[Dict[str, Any]] = []
+    gcs_live_count = 0
+    gcs_noncurrent_count = 0
+    gcs_total_bytes = 0
+
+    if bucket_name:
+        bucket = _get_bucket()
+        user_prefix = f"users/{safe_uid}/"
+        uploads_prefix = f"users/{safe_uid}/uploads/"
+        locks_prefix = f"users/{safe_uid}/locks/"
+
+        for blob in _list_bucket_blobs(bucket, prefix=user_prefix, versions=True):
+            blob_name = getattr(blob, "name", "")
+            if not blob_name or blob_name.endswith("/") or blob_name.startswith(locks_prefix):
+                continue
+
+            size_bytes = int(getattr(blob, "size", 0) or 0)
+            is_noncurrent = getattr(blob, "time_deleted", None) is not None
+            gcs_total_bytes += size_bytes
+
+            if is_noncurrent:
+                gcs_noncurrent_count += 1
+                continue
+
+            gcs_live_count += 1
+            if blob_name.startswith(uploads_prefix):
+                raw_base = blob_name[len(uploads_prefix) :]
+                display_name = _ARCHIVE_PREFIX_RE.sub("", raw_base) or raw_base
+                updated = getattr(blob, "updated", None)
+                updated_iso = (
+                    updated.isoformat() if hasattr(updated, "isoformat") else None
+                )
+                uploaded_pdfs.append(
+                    {
+                        "filename": display_name,
+                        "blob_name": blob_name,
+                        "size_bytes": size_bytes,
+                        "updated_at": updated_iso,
+                    }
+                )
+
+    uploaded_pdfs.sort(key=lambda item: (item["filename"].lower(), item["blob_name"]))
+    total_bytes = gcs_total_bytes if bucket_name else local_cache_bytes
+
+    return {
+        "uid": safe_uid,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "region": region,
+        "storage_backend": "gcs" if bucket_name else "local",
+        "gcs_bucket": bucket_name or None,
+        "collection_count": len(collections),
+        "total_passages": total_passages,
+        "collections": collections,
+        "uploaded_pdf_count": len(uploaded_pdfs),
+        "uploaded_pdfs": uploaded_pdfs,
+        "gcs_live_object_count": gcs_live_count,
+        "gcs_noncurrent_version_count": gcs_noncurrent_count,
+        "gcs_total_bytes": gcs_total_bytes,
+        "local_cache_bytes": local_cache_bytes,
+        "total_bytes": total_bytes,
+    }
+
+
+def purge_all_user_data(uid: str) -> Dict[str, Any]:
+    """Executes GDPR Art. 17 hard erasure of all stored data for `uid`.
+
+    Permanently deletes:
+    1. Every live and noncurrent GCS object generation under `users/{uid}/` (`versions=True`).
+    2. Local `/tmp/chroma_db/{uid}` (or local working Chroma directory) after releasing Chroma client handles.
+    3. Local `/tmp/uploads/{uid}` temporary upload directory.
+    """
+    safe_uid = validate_uid(uid)
+    user_thread_lock = _get_user_thread_lock(safe_uid)
+
+    def _wipe_local_user_dirs() -> tuple[bool, bool]:
+        user_dir = get_user_dir(safe_uid)
+        upload_dir = get_upload_user_dir(safe_uid)
+
+        release_client_cache(user_dir)
+        had_chroma = os.path.exists(user_dir)
+        if had_chroma:
+            shutil.rmtree(user_dir, ignore_errors=True)
+
+        had_uploads = os.path.exists(upload_dir)
+        if had_uploads:
+            shutil.rmtree(upload_dir, ignore_errors=True)
+
+        with _state_lock:
+            _user_last_used.pop(safe_uid, None)
+        return had_chroma, had_uploads
+
+    with user_thread_lock, _track_active_user(safe_uid):
+        bucket_name = get_bucket_name()
+        if not bucket_name:
+            had_chroma, had_uploads = _wipe_local_user_dirs()
+            logger.info(
+                f"Purged local user data for uid='{safe_uid}' "
+                f"(deleted_local_chroma={had_chroma}, deleted_local_uploads={had_uploads})."
+            )
+            return {
+                "uid": safe_uid,
+                "storage_backend": "local",
+                "deleted_gcs_live_objects": 0,
+                "deleted_gcs_noncurrent_versions": 0,
+                "deleted_local_chroma": had_chroma,
+                "deleted_local_uploads": had_uploads,
+            }
+
+        bucket = _get_bucket()
+        user_prefix = f"users/{safe_uid}/"
+        locks_prefix = f"users/{safe_uid}/locks/"
+        lock_name = _user_lock_gcs_blob_name(safe_uid)
+        lock_blob = _acquire_gcs_write_lock(bucket, safe_uid)
+        active_lock_gen = getattr(lock_blob, "generation", None)
+
+        deleted_live = 0
+        deleted_noncurrent = 0
+        had_chroma = False
+        had_uploads = False
+
+        try:
+            had_chroma, had_uploads = _wipe_local_user_dirs()
+
+            for blob in _list_bucket_blobs(bucket, prefix=user_prefix, versions=True):
+                blob_name = getattr(blob, "name", "")
+                blob_gen = getattr(blob, "generation", None)
+                is_noncurrent = getattr(blob, "time_deleted", None) is not None
+
+                if (
+                    blob_name == lock_name
+                    and not is_noncurrent
+                    and blob_gen == active_lock_gen
+                ):
+                    continue
+
+                _delete_blob_revision(bucket, blob)
+                if not blob_name.startswith(locks_prefix):
+                    if is_noncurrent:
+                        deleted_noncurrent += 1
+                    else:
+                        deleted_live += 1
+        finally:
+            _release_gcs_write_lock(lock_blob, safe_uid)
+            for lock_ver in _list_bucket_blobs(bucket, prefix=locks_prefix, versions=True):
+                _delete_blob_revision(bucket, lock_ver)
+
+        logger.info(
+            f"Purged all GCS + local data for uid='{safe_uid}' "
+            f"(live_objects={deleted_live}, noncurrent_versions={deleted_noncurrent}, "
+            f"local_chroma={had_chroma}, local_uploads={had_uploads})."
+        )
+        return {
+            "uid": safe_uid,
+            "storage_backend": "gcs",
+            "deleted_gcs_live_objects": deleted_live,
+            "deleted_gcs_noncurrent_versions": deleted_noncurrent,
+            "deleted_local_chroma": had_chroma,
+            "deleted_local_uploads": had_uploads,
+        }
+

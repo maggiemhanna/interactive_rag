@@ -1,14 +1,18 @@
+from typing import Callable, List, Optional
+
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import src.core.config  # noqa: F401 - ensures .env files are loaded
-from src.core.audit import AuditCorrelationMiddleware, emit_audit_event
+from src.core.audit import AuditCorrelationMiddleware, emit_audit_event, get_request_id
 from src.core.auth import get_allowed_origins, get_current_user
 from src.core.chroma import list_collections, remove_collection
 from src.core.logger import setup_logging
 from src.core.security import INTERNAL_ERROR_MESSAGE, validate_collection_name
 from src.core.storage import (
     LockTimeoutError,
+    get_user_data_inventory,
+    purge_all_user_data,
     user_read_lock,
     user_write_lock,
 )
@@ -104,8 +108,104 @@ def delete_collection(collection_name: str, uid: str = Depends(get_current_user)
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_MESSAGE)
 
 
-def create_app(title: str, service_name: str) -> FastAPI:
-    """Creates a FastAPI service configured with CORS, correlation middleware, /health probe, and shared /collections routes."""
+def _build_compliance_router(
+    memory_inventory_fn: Optional[Callable[[str], List[str]]] = None,
+    on_user_purge: Optional[Callable[[str], int]] = None,
+) -> APIRouter:
+    router = APIRouter()
+
+    @router.get("/compliance/my-data")
+    def export_my_data_inventory(uid: str = Depends(get_current_user)):
+        """GDPR Art. 15 (Right of Access) — returns per-user inventory of collections, uploaded PDFs, byte counts, and memory threads."""
+        try:
+            inventory = get_user_data_inventory(uid)
+            memory_threads = memory_inventory_fn(uid) if memory_inventory_fn else []
+            inventory["memory_thread_count"] = len(memory_threads)
+            inventory["request_id"] = get_request_id()
+
+            emit_audit_event(
+                "dsar.export_inventory",
+                uid=uid,
+                collection_count=inventory["collection_count"],
+                total_passages=inventory["total_passages"],
+                uploaded_pdf_count=inventory["uploaded_pdf_count"],
+                gcs_live_object_count=inventory["gcs_live_object_count"],
+                gcs_noncurrent_version_count=inventory["gcs_noncurrent_version_count"],
+                total_bytes=inventory["total_bytes"],
+                memory_thread_count=len(memory_threads),
+            )
+            return inventory
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception(f"Error building DSAR data inventory for uid='{uid}'")
+            emit_audit_event(
+                "dsar.export_inventory",
+                severity="ERROR",
+                status="error",
+                uid=uid,
+            )
+            raise HTTPException(status_code=500, detail=INTERNAL_ERROR_MESSAGE)
+
+    @router.delete("/compliance/my-data")
+    def erase_my_data(uid: str = Depends(get_current_user)):
+        """GDPR Art. 17 (Right to Erasure) — permanently deletes all live & noncurrent GCS versions, local caches, and conversation memory."""
+        try:
+            purge_result = purge_all_user_data(uid)
+            deleted_memory_threads = on_user_purge(uid) if on_user_purge else 0
+            request_id = get_request_id()
+
+            emit_audit_event(
+                "dsar.erase_user_data",
+                uid=uid,
+                storage_backend=purge_result["storage_backend"],
+                deleted_gcs_live_objects=purge_result["deleted_gcs_live_objects"],
+                deleted_gcs_noncurrent_versions=purge_result["deleted_gcs_noncurrent_versions"],
+                deleted_local_chroma=purge_result["deleted_local_chroma"],
+                deleted_local_uploads=purge_result["deleted_local_uploads"],
+                deleted_memory_threads=deleted_memory_threads,
+            )
+            return {
+                "status": "success",
+                "message": (
+                    "All personal data, vector collections, archived PDFs, and conversation "
+                    "history have been permanently erased."
+                ),
+                "request_id": request_id,
+                **purge_result,
+                "deleted_memory_threads": deleted_memory_threads,
+            }
+        except LockTimeoutError as e:
+            emit_audit_event(
+                "dsar.erase_user_data",
+                severity="WARNING",
+                status="lock_timeout",
+                uid=uid,
+            )
+            raise HTTPException(status_code=409, detail=str(e))
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception(f"Error erasing DSAR user data for uid='{uid}'")
+            emit_audit_event(
+                "dsar.erase_user_data",
+                severity="ERROR",
+                status="error",
+                uid=uid,
+            )
+            raise HTTPException(status_code=500, detail=INTERNAL_ERROR_MESSAGE)
+
+    return router
+
+
+def create_app(
+    title: str,
+    service_name: str,
+    *,
+    memory_inventory_fn: Optional[Callable[[str], List[str]]] = None,
+    on_user_purge: Optional[Callable[[str], int]] = None,
+) -> FastAPI:
+    """Creates a FastAPI service configured with CORS, correlation middleware, /health probe, /collections, and /compliance/my-data DSAR routes."""
     app = FastAPI(title=title)
 
     allowed_origins = get_allowed_origins()
@@ -125,5 +225,12 @@ def create_app(title: str, service_name: str) -> FastAPI:
         return {"status": "ok", "service": service_name}
 
     app.include_router(collections_router)
+    app.include_router(
+        _build_compliance_router(
+            memory_inventory_fn=memory_inventory_fn,
+            on_user_purge=on_user_purge,
+        )
+    )
     return app
+
 
