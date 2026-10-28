@@ -1,264 +1,280 @@
-# Compliance & Governance Plan (Audit Logging, Data Residency, Regulatory Requirements & Policy Enforcement)
+# Compliance & Governance Plan (Data Residency, Audit Logging, Regulatory Requirements & Policy Enforcement)
 
-This document is the step-by-step blueprint for upgrading **InteractiveRAG** with a fourth defense-in-depth layer—**Compliance & Governance**—across four pillars:
+This document outlines the architecture and implementation plan for the fourth defense-in-depth layer of **InteractiveRAG**: **Compliance & Governance**.
 
-1. **Data Residency** — Guarantee that uploaded PDFs, embeddings, and AI model calls never leave approved geographic regions. An Organization Policy Admin locks allowed regions on project `interactive-rag` in Google Cloud (`constraints/gcp.resourceLocations`, so developers and CI cannot override it), while Terraform and Python pin all storage, compute, and Vertex AI traffic to a single regional variable (`GOOGLE_CLOUD_LOCATION = var.region`, never `"global"`).
-2. **Audit Logging** — Record a complete, privacy-safe trail of **who** did **what** and **when** without ever logging raw user questions (hashing prompts instead of storing plaintext PII), published directly to **GCP Cloud Logging (Logs Explorer)** under a dedicated `interactiverag-audit` log stream. Shared request/trace IDs (`X-Request-Id` and `X-Cloud-Trace-Context`) let you filter one request in GCP Cloud Logging to see its Load Balancer HTTP log, app security/DSAR events, and GCP `DATA_READ` / `DATA_WRITE` calls together, while archiving a copy in a regional compliance audit bucket.
-3. **Regulatory Requirements** — Give users full control over their personal data and clear AI transparency for **GDPR** and the **EU AI Act**. Users get self-service APIs and a **"My Data & Privacy"** UI modal to inspect everything stored for their account (`GET /compliance/my-data`, GDPR Art. 15) or permanently erase all live/archived GCS files, vector caches, and chat history in one click (`DELETE /compliance/my-data`, GDPR Art. 17), plus AI provenance badges on every reply (EU AI Act Art. 50).
-4. **Policy Enforcement** — Automatically block unsafe traffic, per-user abuse, accidental production service deletion, and misconfigured deployments. Production AI screening runs **fail-closed** (`MODEL_ARMOR_FAIL_CLOSED="true"`, returning `HTTP 503` if Model Armor/DLP is unreachable rather than letting unscreened prompts or PII pass), per-user rate limits (`HTTP 429`) and collection caps (`HTTP 403`) prevent resource abuse, Cloud Run `deletion_protection` is enabled **in `prod` only** (`var.environment == "prod"`), and `make policy-check` runs automatically before `make plan` / `make deploy` to abort immediately if the GCP Organization location policy is missing, `region` is unapproved, or `"global"` routing reappears.
+While earlier security layers protect authentication, network boundaries, and AI prompts/outputs, this layer ensures that the platform handles user data responsibly, transparently, and within strict geographic and operational rules. It is organized around four pillars:
+
+1. **Data Residency** — Ensures that all uploaded documents, vector embeddings, application logs, and AI model requests stay within approved single-region boundaries. The platform adheres to the Google Cloud Organization's location policy and pins every storage, compute, and AI service to a single configured region rather than global or multi-regional endpoints.
+2. **Audit Logging** — Maintains a complete, privacy-safe record of system activity—capturing **who** performed **what** action and **when**—without ever logging raw user questions or personal data. Every request is tagged with a shared correlation ID so administrators can trace a single user action across the Load Balancer, backend services, security filters, and underlying cloud storage/AI calls in Google Cloud Logging.
+3. **Regulatory Requirements (GDPR & EU AI Act)** — Gives users direct control over their personal data and clear visibility into how AI responses are produced:
+   - **Right of Access (GDPR Art. 15):** Users can view a complete inventory of their stored collections, uploaded PDF files, storage footprint, and active chat sessions.
+   - **Right to Erasure (GDPR Art. 17):** Users can permanently erase all of their data—including current and archived file versions in Cloud Storage, vector indexes, and conversation history—in a single action.
+   - **AI Transparency (EU AI Act Art. 50):** Every assistant reply includes clear provenance metadata and visual badges indicating that the response is AI-generated, which model and region produced it, whether it is grounded in cited source documents, and which safety or privacy filters ran.
+4. **Policy Enforcement** — Protects system reliability, fairness, and compliance through automated guardrails:
+   - **Fail-Closed Security Screening:** In production, if safety or privacy screening services are unreachable, requests are safely rejected rather than allowing unscreened content through.
+   - **Per-User Rate Limits & Quotas:** Sliding-window request rate limits and per-user collection caps prevent abuse and runaway cloud costs.
+   - **Deployment & Infrastructure Guardrails:** Production services are protected against accidental deletion, and automated pre-deploy checks block any deployment that violates regional policies or security settings.
 
 ---
 
 ## 1. Target Architecture (Before vs. After)
 
 ### Before
-- **Global AI routing & split location variables:** `infra/cloud_run.tf` and `src/core/config.py` hardcode `GOOGLE_CLOUD_LOCATION="global"`, `src/core/config.py` splits location across `DEFAULT_LOCATION` and `GOOGLE_CLOUD_LOCATION`, `GoogleGenerativeAIEmbeddings` omits `location`, and no GCP Organization Policy restricts resource regions.
-- **Unstructured, PII-bearing logs & no data-access audit trail:** `src/agent/app.py`, `src/ingestion/service.py`, and `src/agent/stream.py` log raw `request.query` strings in plaintext before DLP runs; there is no `X-Request-Id` / Cloud Trace correlation, no GCP `DATA_READ`/`DATA_WRITE` audit config, and no Load Balancer access logging.
-- **Incomplete erasure & missing AI transparency:** Deleting collections leaves behind archived PDFs under `gs://<bucket>/users/{uid}/uploads/`, noncurrent GCS object versions, and LangGraph `MEMORY_SAVER` threads; responses carry no structured AI provenance metadata.
-- **Fail-open screening & uncapped per-user usage:** Model Armor transient API errors fail open in production, authenticated users face no per-minute request rate limits or collection-count caps, and deployments do not verify regional compliance against the Organization Policy.
+- **Data Residency:** AI model calls and embeddings could route through global or multi-regional endpoints by default, and deployments did not verify whether the target region complied with the organization's allowed locations.
+- **Audit Logging:** Application logs were unstructured and recorded raw user questions in plain text before privacy filtering ran. There was no shared request ID to connect logs across services, no data-access audit logging on cloud storage or AI services, and no dedicated long-term audit log archive.
+- **Regulatory Requirements:** Deleting a document collection left behind archived PDF copies, older file versions in Cloud Storage, and in-memory chat history. Assistant replies provided no structured disclosure of AI generation, grounding status, or safety filtering.
+- **Policy Enforcement:** Temporary outages in the safety screening service caused requests to fail open in production. Authenticated users had no per-minute request limits or caps on the number of collections they could create, and production services lacked deletion protection and automated pre-deploy compliance checks.
 
 ### After
-- Regional boundaries are governed by the **Google Cloud Organization Administrator** (`constraints/gcp.resourceLocations`) where neither application developers nor the CI deployer service account can weaken them, while Terraform, FastAPI, LangGraph, Cloud Logging, and the React dashboard enforce end-to-end auditability, GDPR self-service rights, EU AI Act transparency, and runtime policy guardrails.
-
-```mermaid
-flowchart TB
-    OrgAdmin["GCP Organization Admin\nSets constraints/gcp.resourceLocations\n(Separation of Duties — Outside Repo/CI)"]
-    Browser["User's Browser (React Dashboard)\n- AI Transparency Badge (EU AI Act Art. 50)\n- 'My Data & Privacy' DSAR Modal (GDPR Art. 15 & 17)"]
-    LB["Global External HTTPS Load Balancer\n- Backend HTTP Access Logs Enabled"]
-
-    subgraph GovernancePrecheck["CI / Deploy Governance Gate (make policy-check)"]
-        OrgCheck["Verify Effective Org Policy\nAsserts var.region is allowed by\ngcp.resourceLocations & non-global"]
-    end
-
-    subgraph SharedCore["Shared Governance Middleware & Routes (src/core/app_factory.py & src/core/compliance/)"]
-        TraceMW["Correlation & Audit Middleware (audit.py, context.py)\n- X-Request-Id + X-Cloud-Trace-Context\n- Structured JSON Audit Events (PII-Scrubbed)"]
-        PolicyEnf["Runtime Policy Enforcer (residency.py, policy.py)\n- Per-User Rate Limits (429 + Retry-After)\n- MAX_COLLECTIONS_PER_USER Quota (403)\n- Concrete Regional GOOGLE_CLOUD_LOCATION Check"]
-        DSAR["Self-Service DSAR Endpoints (dsar.py, routes.py)\n- GET /compliance/my-data (Art. 15)\n- DELETE /compliance/my-data (Art. 17 Full Purge)"]
-    end
-
-    subgraph RegionalCloud["Pinned GCP Region (GOOGLE_CLOUD_LOCATION = var.region)"]
-        Vertex["Regional Vertex AI Endpoint\nChatGoogleGenerativeAI + Embeddings\n(location = GOOGLE_CLOUD_LOCATION)"]
-        Armor["Regional Model Armor + Cloud DLP\nMODEL_ARMOR_FAIL_CLOSED = true"]
-        GCS["Regional GCS Bucket\n- Live + Noncurrent Purge on DSAR"]
-        AuditSink["Regional Cloud Logging Audit Bucket\n- DATA_READ / DATA_WRITE Audit Logs\n- App Compliance Audit Sink (365d Retention)"]
-    end
-
-    OrgAdmin -.->|"Enforces Allowed Regions\nat GCP Control Plane"| RegionalCloud
-    OrgAdmin -.->|"Read-Only Effective Check"| OrgCheck
-    Browser -->|"HTTPS"| LB
-    LB --> TraceMW
-    TraceMW --> PolicyEnf
-    PolicyEnf --> DSAR
-    PolicyEnf -->|"Fail-Closed Screen"| Armor
-    PolicyEnf -->|"Regional Inference & Embeddings"| Vertex
-    DSAR <-->|"Inventory / Purge All Versions"| GCS
-    TraceMW -->|"jsonPayload.audit = true"| AuditSink
-    RegionalCloud -->|"Cloud Audit Logs"| AuditSink
-```
+- **Data Residency:** Every storage bucket, backend service, security filter, embedding model, and generative AI call is locked to a single concrete cloud region that adheres to the Google Cloud Organization's resource location policy. Multi-regional and global routing are rejected both at deployment time and at runtime.
+- **Audit Logging:** All user actions, security blocks, and data-access events are written as structured JSON records to a dedicated audit stream in Google Cloud Logging and archived in a regional compliance log bucket. User questions are replaced with one-way cryptographic hashes so personal data never leaks into logs, and a shared request/trace ID links every layer of a request together.
+- **Regulatory Requirements:** Users have a self-service **"My Data & Privacy"** interface and API to inspect their complete data footprint (GDPR Art. 15) or permanently wipe all live and historical storage objects, vector databases, and chat threads (GDPR Art. 17). Every AI reply displays transparency, source-grounding, and safety verification badges (EU AI Act Art. 50).
+- **Policy Enforcement:** Production safety screening operates strictly fail-closed, per-user rate limits and collection quotas prevent resource abuse, production Cloud Run services are guarded against accidental deletion, and pre-deploy checks automatically verify regional and security compliance before any infrastructure change is applied.
 
 ---
 
 ## 2. Scope Boundaries (What We Implement vs. Exclude)
 
-| Governance Pillar | In Scope (Implemented in This Plan) | Out of Scope (Intentionally Excluded) |
+To keep the governance layer practical, maintainable, and aligned with cloud security best practices, the table below summarizes what is implemented in this architecture and what is intentionally left out of scope.
+
+| Governance Pillar | In Scope (Implemented) | Out of Scope (Intentionally Excluded) |
 | :--- | :--- | :--- |
-| **1. Data Residency** | • **GCP Organization Policy** (`constraints/gcp.resourceLocations`) set by the Org Policy Admin and scoped to project `interactive-rag` (or Org/Folder) so sibling projects are unaffected<br>• Pre-deploy adherence gate (`make check-region-policy` wired into `make plan`, `make deploy`, and `make policy-check`) verifying `REGION` (`var.region`) against the live effective GCP Organization Policy<br>• Single unified **`GOOGLE_CLOUD_LOCATION`** variable across Terraform & Python (`DEFAULT_LOCATION` removed; `MODEL_ARMOR_LOCATION` defaults to `GOOGLE_CLOUD_LOCATION`)<br>• Explicit regional `location` bound on both `ChatGoogleGenerativeAI` and `GoogleGenerativeAIEmbeddings`, rejecting `"global"` and multi-regions (`"us"`, `"eu"`) | • **Repo-defined or `.env` region allowlist variables** *(any contributor could edit them; governed strictly by GCP Organization Policy instead)*<br>• **Granting `roles/orgpolicy.policyAdmin` to `interactive-rag-deployer`** *(deployer SA can only read effective policy, never modify it)*<br>• **Customer-Managed Encryption Keys (Regional Cloud KMS / CMEK)**<br>• **`STRICT_DATA_RESIDENCY` toggle** *(regional residency is always enforced)* |
-| **2. Audit Logging** | • Structured JSON `emit_audit_event()` (`src/core/compliance/audit.py`) shipped directly to GCP Cloud Logging (`interactiverag-audit`) with `X-Request-Id` & `X-Cloud-Trace-Context` correlation via `contextvars` (`src/core/compliance/context.py`)<br>• Scrubbing plaintext `request.query` from logs in favor of `query_sha256` + `query_chars`<br>• Audit coverage across auth failures, `/ingest`, `/query`, `/agent`, `/collections`, DSAR calls, rate/quota blocks, and Model Armor / DLP events<br>• GCP `DATA_READ` / `DATA_WRITE` Cloud Audit Logs (`storage`, `aiplatform`, `dlp`, `modelarmor`), Load Balancer HTTP access logs, and a regional Cloud Logging audit bucket + sink | — |
-| **3. Regulatory Requirements** | • **GDPR Art. 15 (`GET /compliance/my-data`):** Per-user inventory of collections, uploaded PDFs, and byte counts (`src/core/compliance/dsar.py`)<br>• **GDPR Art. 17 (`DELETE /compliance/my-data`):** Hard erasure of live **and** noncurrent GCS object versions under `users/{uid}/`, `/tmp/chroma_db/{uid}`, `/tmp/uploads/{uid}`, and LangGraph `MEMORY_SAVER` `{uid}:*` threads (`src/agent/memory.py`)<br>• **EU AI Act Art. 50:** `compliance` provenance metadata (`src/core/compliance/provenance.py`) on `/agent` (JSON + SSE) + React UI AI disclosure, grounding, and Model Armor badges & **"My Data & Privacy"** modal | • **Automatic GCS object expiration (`data_retention_days` lifecycle TTL)**<br>• **Configurable ingest-time Cloud DLP (`INGEST_DLP_MODE=redact\|block\|off`)** before computing embeddings or writing SQLite snapshots |
-| **4. Policy Enforcement** | • Fail-closed Model Armor enforcement (`MODEL_ARMOR_FAIL_CLOSED="true"` in Cloud Run $\rightarrow$ `HTTP 503` on upstream screening outage)<br>• Per-user sliding-window request rate limits (`RATE_LIMIT_INGEST_PER_MINUTE`, `RATE_LIMIT_QUERY_PER_MINUTE` $\rightarrow$ `HTTP 429` + `Retry-After`)<br>• Per-user collection count quota (`MAX_COLLECTIONS_PER_USER` $\rightarrow$ `HTTP 403` on new collections over cap; appends to existing collections allowed)<br>• Cloud Run `deletion_protection` **in `prod` only** (`var.environment == "prod"`), Terraform `precondition` blocks, and pre-deploy `make policy-check` | • **Firebase `AUTH_CHECK_REVOKED=true`** (`check_revoked=False` stays unchanged)<br>• **Per-user cumulative chunk quotas**<br>• **Email-domain allowlists or RBAC custom-claim policies in FastAPI** |
+| **1. Data Residency** | • Adherence to the Google Cloud Organization resource location policy<br>• Automated pre-deploy verification confirming the target region is permitted by the live Organization Policy<br>• Single unified regional configuration across infrastructure and backend services, explicitly rejecting `"global"` and multi-regions (`"us"`, `"eu"`, `"asia"`)<br>• Explicit regional endpoint binding for all generative AI, embedding, storage, and safety screening calls | • Customer-Managed Encryption Keys (Cloud KMS / CMEK); standard Google-managed regional encryption is used |
+| **2. Audit Logging** | • Structured JSON audit events published directly to Google Cloud Logging with end-to-end request and trace ID correlation<br>• Privacy-safe query logging using SHA-256 hashes and character counts instead of raw user prompts<br>• Comprehensive audit trail covering authentication failures, document uploads, searches, chat queries, collection management, privacy requests, quota blocks, and AI safety events<br>• Cloud Audit Logs (`ADMIN_READ`, `DATA_READ`, `DATA_WRITE`) for Storage, Vertex AI, DLP, and Model Armor, plus Load Balancer access logs<br>• Dedicated regional Cloud Logging audit bucket with 365-day retention | — |
+| **3. Regulatory Requirements** | • **GDPR Art. 15 (Right of Access):** Self-service API and UI modal summarizing a user's collections, uploaded PDFs, archived versions, storage bytes, and active chat threads<br>• **GDPR Art. 17 (Right to Erasure):** Complete, irreversible deletion of all live and archived Cloud Storage object versions, local vector/upload caches, and conversation memory for the user<br>• **Automated Storage Hygiene:** Cloud Storage lifecycle rules that automatically prune archived object versions after 7 days (keeping at most 3 noncurrent versions)<br>• **EU AI Act Art. 50 (Transparency):** Structured compliance metadata on both standard and streaming responses, paired with UI badges for AI disclosure, citation grounding, and safety filter actions | • Automatic time-based expiration of active user collections (users manage and delete active collections on demand)<br>• Ingest-time PII redaction before embedding (PII screening is enforced at query, retrieval, and response time) |
+| **4. Policy Enforcement** | • Fail-closed AI safety and privacy screening in production (returning `HTTP 503` if screening services are unreachable)<br>• Per-user sliding-window rate limits for document uploads and queries (`HTTP 429` with `Retry-After`)<br>• Per-request upload ceilings (file size, file count, and chunk count limits) and per-user collection count quotas (`HTTP 403` when creating new collections past the limit)<br>• Accidental deletion protection enabled on production Cloud Run services<br>• Automated pre-deploy policy gate (`make policy-check`) blocking non-compliant configurations | • Role-based access control (RBAC) custom claims or email-domain allowlists in the backend |
 
 ---
 
 ## 3. Key Design Decisions (In Plain English)
 
-### 3.1 Data Residency via GCP Organization Policy + Strict Code Adherence
-- **Separation of Duties (Project-Scoped Org Policy, Zero Repo Region Lists):** Defining allowed regions inside Terraform variables or `.env` files would allow anyone with repo or deploy access to add an unapproved region. Instead, **zero** region-allowlist variables exist in this repository. An Organization Policy Administrator (`roles/orgpolicy.policyAdmin`, a role that Google Cloud **only** permits granting at the Organization node `maggiemhanna.altostrat.com`) attaches **`constraints/gcp.resourceLocations`** directly to project **`interactive-rag`**. That isolates the restriction to `interactive-rag` so no other projects in the organization break, while preserving strict separation of duties—neither Project Owners, repo contributors, nor `interactive-rag-deployer` can modify or weaken that Organization Policy.
-- **One Location Variable Everywhere (`GOOGLE_CLOUD_LOCATION`):** We remove `DEFAULT_LOCATION` from `src/core/config.py` and `src/agent/graph.py` and standardize the entire stack on **`GOOGLE_CLOUD_LOCATION`**:
-  - In `infra/cloud_run.tf`, both `ingestion_api` and `agent_api` set `GOOGLE_CLOUD_LOCATION = var.region` (eliminating `"global"`).
-  - In `src/core/config.py`, `GOOGLE_CLOUD_LOCATION` defaults to `"us-central1"`, and `MODEL_ARMOR_LOCATION` defaults to `GOOGLE_CLOUD_LOCATION`.
-- **Concrete Single-Region Validation & Explicit Vertex AI Binding:** Even with an Organization Policy active, SDKs that omit `location` or pass `"global"` will either fail at runtime with opaque GCP permission errors or route to multi-regional endpoints if the Org Policy uses a broad group like `in:us-locations`. We therefore:
-  1. Validate in `infra/variables.tf` and `src/core/compliance/residency.py` (`validate_gcp_region()`) that the configured location matches concrete GCP single-region syntax (`^[a-z]+-[a-z]+[0-9]+$`, e.g., `us-central1` or `europe-west1`)—explicitly rejecting `"global"`, `"us"`, `"eu"`, or `"asia"`.
-  2. Pass `location=validate_gcp_region(...)` explicitly into both `GoogleGenerativeAIEmbeddings` (`src/core/storage/chroma.py`) and `ChatGoogleGenerativeAI` (`src/agent/graph.py`) so Vertex AI requests always hit the regional endpoint governed by `constraints/gcp.resourceLocations`.
-  3. Enforce a read-only pre-deploy verification gate (`make check-region-policy`, wired into `make plan`, `make deploy`, and `make policy-check`) that runs `scripts/check_region_policy.py` against `gcloud resource-manager org-policies describe gcp.resourceLocations --project=$(PROJECT_ID) --effective` to confirm an active Organization location policy exists and permits `$(REGION)`.
+### 3.1 Data Residency via Organization Policy Adherence & Single-Region Pinning
+- **Adhering to Organization-Level Location Rules:** Allowed geographic regions are governed at the Google Cloud Organization level (`constraints/gcp.resourceLocations`), outside of application code. Before any infrastructure plan or deployment runs, an automated read-only check queries the effective Organization Policy on the target project and aborts immediately if no location restriction policy is active or if the target deployment region is not on the approved list.
+- **Strict Single-Region Enforcement:** Some cloud SDKs default to `"global"` or multi-regional endpoints (such as `"us"` or `"eu"`) when a region is not explicitly provided. To prevent data or AI requests from leaving the chosen region:
+  1. Both Terraform and the Python backend validate that the configured location is a concrete single region (for example, `us-central1` or `europe-west1`) and reject `"global"` or multi-region values.
+  2. Every Vertex AI client (both chat models and embedding models), Model Armor client, and Cloud Storage bucket is explicitly bound to that single region.
 
-### 3.2 Structured, PII-Safe Audit Logging & Live GCP Cloud Logging Visibility
-- **Direct Visibility in GCP Cloud Logging (Logs Explorer):** `emit_audit_event()` in `src/core/compliance/audit.py` uses `google-cloud-logging` to write structured JSON entries directly to a dedicated **`interactiverag-audit`** log stream (`projects/<project>/logs/interactiverag-audit`, with automatic stdout JSON fallback in offline unit tests). Whether you test locally against GCP or via Cloud Run, every audit event appears immediately in **GCP Console → Logging → Logs Explorer**.
-- **Correlating Every Layer (`X-Request-Id` + `X-Cloud-Trace-Context`):** `AuditCorrelationMiddleware` in `src/core/compliance/audit.py` (wired into both services via `create_app()` in `src/core/app_factory.py`) reads or generates `X-Request-Id` (echoing it on every HTTP response header) and parses Cloud Run's `X-Cloud-Trace-Context` header into `logging.googleapis.com/trace` (`projects/<project>/traces/<trace_id>`). Python `contextvars` in `src/core/compliance/context.py` propagate both IDs automatically into every `emit_audit_event()` call—so filtering by one `request_id` or trace in **Logs Explorer** displays the Load Balancer request, app security/DSAR events, and GCP `DATA_READ`/`DATA_WRITE` calls together.
-- **Zero Raw User Prompts in Logs:** Plaintext `request.query` logging in `src/agent/app.py`, `src/ingestion/service.py`, and `src/agent/stream.py` is replaced with deterministic `query_sha256` (`hash_query` in `src/core/compliance/audit.py`) and `query_chars`, preventing sensitive PII inside user questions from leaking into Cloud Logging before DLP runs.
-- **Dedicated Regional Cloud Logging Audit Bucket:** `infra/compliance.tf` enables GCP `DATA_READ` and `DATA_WRITE` Cloud Audit Logs on Cloud Storage, Vertex AI, Cloud DLP, and Model Armor, enables HTTP access logs on Load Balancer backend services (`infra/load_balancer.tf`), and copies both GCP audit logs and `interactiverag-audit` events into a dedicated regional Cloud Logging bucket (`location = var.region`, default `365`-day retention) while keeping `_Default` intact so **Logs Explorer** works out of the box.
+### 3.2 Privacy-Safe Audit Logging & End-to-End Traceability
+- **Immediate Visibility in Google Cloud Logging:** The backend writes structured JSON audit records directly to a dedicated `interactiverag-audit` log stream in Google Cloud Logging (with an automatic console fallback for local offline testing). Every event is immediately searchable in **Logs Explorer**.
+- **Connecting Every Step of a Request:** A correlation middleware assigns or forwards a unique request ID (`X-Request-Id`) and links it with Google Cloud's trace context (`X-Cloud-Trace-Context`). Filtering by a single request ID or trace in Logs Explorer shows the entire lifecycle of a request: the Load Balancer entry, application events, AI safety checks, and underlying Google Cloud `DATA_READ` / `DATA_WRITE` audit logs.
+- **Protecting User Privacy in Logs:** User prompts can accidentally contain sensitive personal information. Instead of writing raw query text to logs, the application logs a deterministic SHA-256 hash (`query_sha256`) and character length (`query_chars`). Administrators can still correlate repeated queries and investigate incidents without exposing raw user content in log storage.
+- **Long-Term Regional Audit Archive:** Terraform enables data-access audit logs for Cloud Storage, Vertex AI, Cloud DLP, and Model Armor, enables HTTP access logging on the Load Balancer, and routes copies of all audit and access logs into a dedicated regional Cloud Logging bucket with configurable long-term retention (365 days by default).
 
-### 3.3 Regulatory Requirements (GDPR Art. 15 & 17 DSAR + EU AI Act Art. 50)
-- **Complete Right-to-Erasure (`DELETE /compliance/my-data`):** Because `infra/storage.tf` enables GCS object versioning and `src/core/storage/gcs_sync.py` archives uploaded PDFs under `users/{uid}/uploads/`, deleting a single ChromaDB collection is not sufficient for GDPR Art. 17 erasure. `purge_all_user_data(uid)` in `src/core/compliance/dsar.py` enumerates `bucket.list_blobs(prefix=f"users/{uid}/", versions=True)` to permanently delete **every live and noncurrent object generation**, wipes `/tmp/chroma_db/{uid}` and `/tmp/uploads/{uid}`, and invokes `purge_user_memory_threads(uid)` (`src/agent/memory.py`) to clear all `{uid}:*` conversation checkpoints from `MEMORY_SAVER`.
-- **EU AI Act Art. 50 Transparency:** `build_compliance_metadata()` in `src/core/compliance/provenance.py` attaches a structured `compliance` provenance block (`ai_generated`, `model`, `region`, `grounding_enforced`, `grounded`, `citation_count`, `retrieved_passages`, `pii_filtered`, `model_armor_active`, `filters_checked`, `guardrail_actions`, `request_id`) to both JSON responses (`src/agent/app.py`) and final SSE payloads (`src/agent/stream.py`), surfaced in the React chat UI alongside a self-service **"My Data & Privacy"** modal for viewing and erasing stored personal data.
+### 3.3 Regulatory Compliance (GDPR Self-Service Rights & EU AI Act Transparency)
+- **True Right to Erasure Across Versioned Storage:** Because Cloud Storage object versioning is enabled to protect against accidental corruption, simply deleting a collection leaves behind historical file versions and archived PDF uploads. When a user triggers **Right to Erasure** (`DELETE /compliance/my-data`), the platform enumerates and permanently deletes **every live and archived object version** under the user's storage prefix, wipes their local vector database and temporary upload directories, and clears all of their conversation threads from agent memory—without affecting any other user's data.
+- **Clear AI Provenance & Safety Disclosure:** To satisfy **EU AI Act Article 50** transparency obligations, every agent response (both standard JSON and streaming SSE) includes a structured `compliance` metadata summary. The web interface uses this metadata to display clear badges on every assistant message showing:
+  - Whether the reply was generated by AI or stopped by a safety guardrail, along with the exact model and region used.
+  - Whether the answer is grounded in cited document passages.
+  - Which Cloud Model Armor and Cloud DLP protections ran (for example, verifying the response is clean, or noting that sensitive PII was redacted or an unsafe prompt was blocked).
+  - A **"My Data & Privacy"** modal where users can inspect their stored data inventory or erase all of their data at any time.
 
-### 3.4 Fail-Closed Security, Per-User Quotas & Deployment Guardrails
-- **Fail-Closed Model Armor (`MODEL_ARMOR_FAIL_CLOSED`):** When `MODEL_ARMOR_FAIL_CLOSED="true"` (injected by `infra/cloud_run.tf`), any unexpected exception or timeout calling Model Armor / Cloud DLP in `src/core/ai_security/armor.py` raises a dedicated screening-unavailable error mapped to `HTTP 503 Service Unavailable` (with an audit log entry) so unscreened prompts or unredacted PII never slip through during transient cloud outages. Local offline development (`MODEL_ARMOR_TEMPLATE_ID=""` or `MODEL_ARMOR_FAIL_CLOSED="false"`) continues to work seamlessly.
-- **Per-User Rate Limits & Collection Count Cap:** Lightweight thread-safe per-UID sliding-window rate limiters in `src/core/compliance/policy.py` enforce `RATE_LIMIT_INGEST_PER_MINUTE` (default `10`) and `RATE_LIMIT_QUERY_PER_MINUTE` (default `30`), returning `HTTP 429` with `Retry-After`. During ingestion, `enforce_collection_quota(uid, collection_name)` checks existing user collections and returns `HTTP 403` if creating a **new** collection would exceed `MAX_COLLECTIONS_PER_USER` (default `20`), while always permitting uploads/appends to an already-existing collection.
-- **Cloud Run `deletion_protection` in `prod` Only:** In `infra/cloud_run.tf`, setting `deletion_protection = var.environment == "prod"` blocks accidental `terraform destroy` or `gcloud run services delete` calls against live `prod` Cloud Run services (while still allowing normal revision deployments, and keeping `dev`/`staging` environments freely destroyable).
-- **Pre-Deploy `make policy-check` Gate:** Runs automatically before `make plan` and `make deploy` (and on demand) to stop immediately if the live GCP `gcp.resourceLocations` Organization Policy is missing, `REGION` violates allowed locations, `"global"` routing is reintroduced in code/Terraform, or `terraform validate` fails.
+### 3.4 Fail-Closed Security, Abuse Prevention & Deployment Guardrails
+- **Fail-Closed Screening in Production:** In local development, the app can run without cloud security templates for convenience. In production, fail-closed mode is strictly enforced: if Cloud Model Armor or Cloud DLP is misconfigured, unreachable, or times out during prompt screening, chunk retrieval masking, or response filtering, the backend immediately stops processing, logs a high-severity audit event, and returns `HTTP 503 Service Unavailable` so unscreened content is never exposed.
+- **Fair-Use Rate Limits & Quotas:** Each authenticated user is protected by independent, in-memory sliding-window rate limiters for document uploads (default `10/minute`) and queries (default `30/minute`), returning `HTTP 429 Too Many Requests` with a `Retry-After` header when exceeded. Users are also capped at a maximum number of collections (default `20`), returning `HTTP 403 Forbidden` if they attempt to create a new collection above the cap while still allowing uploads into their existing collections.
+- **Production Deletion Protection & Pre-Deploy Gate:** Terraform enables deletion protection on Cloud Run services only when deploying to the `prod` environment, preventing accidental service destruction while keeping development environments easy to tear down. Before any `make plan` or `make deploy` command executes, `make policy-check` automatically verifies live Organization Policy compliance, static single-region and fail-closed settings, and Terraform validity.
 
 ---
 
 ## 4. Step-by-Step Implementation Phases
 
-### Prerequisite (Manual GCP Organization Governance Step — Completed Before Phase 1 Deploy)
-- [x] Configure **`constraints/gcp.resourceLocations`** (*Google Cloud Platform - Resource Location Restriction*) in GCP Console scoped to project **`interactive-rag`** (by an Org Policy Admin on `maggiemhanna.altostrat.com`) allowing your approved location value group(s) (`in:us-central1-locations`, `in:us-west1-locations`, `in:us-west2-locations`, `in:us-west3-locations`).
+### Prerequisite: Organization Location Policy
+**Goal:** Establish a cloud-level boundary so resources can only be created in approved single regions.
+- [x] Configure the **Google Cloud Resource Location Restriction** policy (`constraints/gcp.resourceLocations`) in Google Cloud Console on the target project (or parent folder/organization) to allow only your approved single-region location groups.
 
-### Phase 1: Data Residency & Unified `GOOGLE_CLOUD_LOCATION` Adherence
-- [x] **Terraform Regional Validation & Cloud Run Pinning:**
-  - Update `infra/variables.tf`: Add a validation rule on `var.region` enforcing concrete single-region syntax (`^[a-z]+-[a-z]+[0-9]+$`) so `"global"` and multi-regions (`"us"`, `"eu"`, `"asia"`) are rejected at plan time (approved regions come solely from the GCP Organization Policy, with no region-list variable in Terraform).
-  - Update `infra/cloud_run.tf`: Change `GOOGLE_CLOUD_LOCATION` from `"global"` to `var.region` on both `google_cloud_run_v2_service.ingestion_api` and `google_cloud_run_v2_service.agent_api`.
-  - Update `infra/storage.tf`, `infra/ai_security.tf`, and `infra/network.tf` with lightweight `lifecycle { precondition { ... } }` assertions confirming concrete regional locality.
-- [x] **Makefile Organization Policy Adherence Gate:**
-  - Add `check-region-policy` target to `Makefile` (wired as a prerequisite of `plan`, `deploy`, and `policy-check`) executing `scripts/check_region_policy.py` against `gcloud resource-manager org-policies describe gcp.resourceLocations --project="$(PROJECT_ID)" --effective --format=json` to verify:
-    1. An active `allowedValues` Organization Policy is enforced (not unrestricted `allValues: ALLOW`).
-    2. `$(REGION)` matches the effective Organization Policy's `allowedValues` and is not denied.
-- [x] **Python Single-Location Unification (`GOOGLE_CLOUD_LOCATION`) & Vertex AI Client Pinning:**
-  - Update `src/core/config.py` (and local `.env` defaults): Remove `DEFAULT_LOCATION`; standardize on `GOOGLE_CLOUD_LOCATION` (default `"us-central1"`) and default `MODEL_ARMOR_LOCATION` to `GOOGLE_CLOUD_LOCATION`.
-  - Create `src/core/compliance/residency.py`: Add `validate_gcp_region(location)` enforcing concrete single-region format (`^[a-z]+-[a-z]+[0-9]+$`) and rejecting `"global"` or multi-regions.
-  - Update `src/core/storage/chroma.py` (`get_embeddings`) and `src/agent/graph.py` (`build_agent`): Pass `location=validate_gcp_region(...)` explicitly into `GoogleGenerativeAIEmbeddings` and `ChatGoogleGenerativeAI` (removing `DEFAULT_LOCATION`).
-- [x] **Pause for Phase 1 Review** (run unit tests + `make check-region-policy`).
+---
 
-### Phase 2: Audit Logging & End-to-End Trace Correlation in GCP Cloud Logging
-- [x] **Application Audit Logger (`interactiverag-audit`) & Correlation Middleware:**
-  - Add `google-cloud-logging` to `requirements.txt` and create `src/core/compliance/context.py` + `src/core/compliance/audit.py` with `contextvars`-backed request context (`request_id`, `trace_id`, `service_name`), `hash_query(text)`, `AuditCorrelationMiddleware`, and `emit_audit_event(...)` publishing structured entries directly to GCP Cloud Logging (`projects/<project>/logs/interactiverag-audit`, with clean stdout JSON fallback when offline/in unit tests).
-  - Wire `AuditCorrelationMiddleware` into `create_app()` (`src/core/app_factory.py`) reading/generating `X-Request-Id`, extracting `X-Cloud-Trace-Context`, echoing `X-Request-Id` in response headers, and recording request lifecycle metadata.
-  - Scrub raw `request.query` from logs in `src/agent/app.py`, `src/ingestion/service.py`, and `src/agent/stream.py`, replacing plaintext queries with `query_sha256` and `query_chars`.
-  - Emit structured audit events on authentication failures (`src/core/auth.py`), collection list/delete (`src/core/storage/routes.py`), ingestion & similarity search (`src/ingestion/app.py`), agent queries & SSE streams (`src/agent/app.py`, `src/agent/stream.py`), and Model Armor / DLP blocks or redactions (`src/core/ai_security/armor.py`, `src/agent/graph.py`).
-- [x] **GCP Cloud Audit Logs, Load Balancer Logs & Regional Audit Sink (Terraform):**
-  - Update `Makefile` (`TF_DEPLOYER_ROLES` + `bootstrap`), `infra/apis.tf`, and `infra/iam.tf` to enable `logging.googleapis.com`, grant `roles/logging.configWriter` to `TF_DEPLOYER_SA`, and grant `roles/logging.logWriter` to `backend_sa`.
-  - Create `infra/compliance.tf`:
-    - Provision `google_project_iam_audit_config` enabling `ADMIN_READ`, `DATA_READ`, and `DATA_WRITE` logs for `storage.googleapis.com`, `aiplatform.googleapis.com`, `dlp.googleapis.com`, and `modelarmor.googleapis.com`.
-    - Provision `google_logging_project_bucket_config.compliance_audit` (`location = var.region`, `retention_days = var.audit_log_retention_days`, optional `locked = var.audit_log_bucket_locked`).
-    - Provision `google_logging_project_sink.compliance_audit_sink` copying Cloud Audit Logs, Load Balancer HTTP logs, and `interactiverag-audit` events into the same-project regional audit bucket without excluding them from `_Default` (so **Logs Explorer** displays them immediately; same-project log bucket sinks require no external `writer_identity` IAM grant).
-  - Update `infra/load_balancer.tf`: Enable `log_config` (`enable = true`, `sample_rate = var.lb_log_sample_rate`) on `ingestion_backend` and `agent_backend`.
-  - Update `infra/variables.tf`, `infra/terraform.tfvars.example`, `infra/cloud_run.tf` (`GOOGLE_CLOUD_PROJECT = var.project_id`), and `infra/outputs.tf`.
+### Phase 1: Data Residency & Regional Pinning
+**Goal:** Ensure that every infrastructure resource and AI model call is locked to a single concrete region and verified against the Organization Policy before deployment.
 
-### Phase 3: Regulatory Requirements (GDPR DSAR & EU AI Act Transparency)
-- [x] **Storage Inventory & Complete User Purge (GDPR Art. 15 & Art. 17):**
-  - Create `src/core/compliance/dsar.py`: Add `get_user_data_inventory(uid)` (listing collections, archived uploaded PDFs, object counts, and total bytes) and `purge_all_user_data(uid)` (deleting all live **and** noncurrent GCS object versions under `users/{uid}/` via `list_blobs(..., versions=True)`, plus `/tmp/chroma_db/{uid}` and `/tmp/uploads/{uid}`).
-  - Create `src/agent/memory.py`: Add `purge_user_memory_threads(uid)` and `list_user_memory_threads(uid)` managing `{uid}:*` threads and writes in `MEMORY_SAVER`.
-  - Create `src/core/compliance/routes.py` (`build_compliance_router`) & wire via `src/core/app_factory.py` + `src/agent/app.py`: Expose `GET /compliance/my-data` (GDPR Art. 15) and `DELETE /compliance/my-data` (GDPR Art. 17, invoking `purge_all_user_data(uid)` + optional service-specific memory cleanup hook, and emitting `dsar.export_inventory` / `dsar.erase_user_data` audit events).
-- [x] **EU AI Act Art. 50 Provenance Metadata, Grounding Status & Cloud Model Armor UI Badges:**
-  - Create `src/core/compliance/provenance.py` and update `src/agent/schemas.py`, `src/agent/app.py`, and `src/agent/stream.py`: Include `compliance` metadata (`ai_generated`, `model`, `region`, `grounding_enforced`, `grounded`, `citation_count`, `retrieved_passages`, `pii_filtered`, `model_armor_active`, `filters_checked`, `guardrail_actions`, `request_id`) in `AgentResponse` and final SSE metadata frames.
-  - Update `frontend/src/api.js` and `frontend/src/App.jsx`: Display AI provenance (`AI-generated` vs. `Guardrail refusal`), explicit grounding status (`Grounded · N citations` vs. `Not grounded`), all Cloud Model Armor filter actions (`Prompt Injection / Jailbreak blocked`, `Malicious URI blocked`, `RAI blocked (...)`, `PII redacted`, `Gemini Safety blocked`, or `Model Armor verified` when clean), and a **"My Data & Privacy"** modal (`GET/DELETE /compliance/my-data`).
+- [x] **Infrastructure Regional Validation (`infra/`):**
+  - **`infra/variables.tf`:** Add a validation rule on `var.region` requiring concrete single-region syntax (e.g., `us-central1`, `europe-west1`) so `"global"` and multi-regions (`"us"`, `"eu"`, `"asia"`) are rejected during `terraform plan`.
+  - **`infra/cloud_run.tf`:** Pin both `ingestion-api` and `agent-api` container environments to `var.region`.
+  - **`infra/storage.tf`, `infra/ai_security.tf`, `infra/network.tf`:** Add Terraform `precondition` checks confirming all storage buckets, Model Armor templates, and Private Service Connect endpoints use a concrete single region.
+- [x] **Automated Organization Policy Gate (`Makefile` & `scripts/`):**
+  - **`scripts/check_region_policy.py` & `Makefile` (`check-region-policy`):** Query the project's effective `gcp.resourceLocations` Organization Policy via `gcloud` before `plan` and `deploy` to confirm that an active allowlist policy exists and that the configured `REGION` is permitted.
+- [x] **Backend Regional Binding (`src/`):**
+  - **`src/core/config.py` & `src/core/compliance/residency.py`:** Centralize regional configuration with `validate_gcp_region()`, rejecting `"global"` or multi-regional strings at runtime.
+  - **`src/core/storage/chroma.py` & `src/agent/graph.py`:** Explicitly pass the validated region into `GoogleGenerativeAIEmbeddings` and `ChatGoogleGenerativeAI` so all Vertex AI embedding and chat calls route strictly to the regional endpoint.
+  - **`src/core/ai_security/armor.py`:** Validate that Model Armor template targets and regional endpoints never resolve to `"global"`.
 
-### Phase 4: Policy Enforcement (Fail-Closed Screening, Rate Limits, Collection Quotas & Pre-Deploy Checks)
-- [x] **Fail-Closed Model Armor Enforcement:**
-  - Update `src/core/config.py` and `src/core/ai_security/armor.py`: Add `MODEL_ARMOR_FAIL_CLOSED` (default `"false"` locally, set to `"true"` in `infra/cloud_run.tf`). Raise `SecurityScreeningUnavailableError` on upstream Model Armor / DLP errors when fail-closed is active, returning `HTTP 503` in `src/agent/app.py` / `src/agent/stream.py` / `src/ingestion/app.py` with an audit event.
-- [x] **Per-User Rate Limits & Collection Count Quota:**
-  - Create `src/core/compliance/policy.py`:
-    - Sliding-window per-UID rate limiters enforcing `RATE_LIMIT_INGEST_PER_MINUTE` (default `10`) and `RATE_LIMIT_QUERY_PER_MINUTE` (default `30`), raising `HTTP 429` with `Retry-After` header and emitting `policy.rate_limit_exceeded` audit events.
-    - `enforce_collection_quota(uid, collection_name)` enforcing `MAX_COLLECTIONS_PER_USER` (default `20`) when creating a **new** collection (raising `HTTP 403` and emitting `policy.collection_quota_exceeded`), while allowing appends to existing collections.
-  - Wire rate limits and collection quotas into `src/ingestion/app.py`, `src/agent/app.py`, `infra/variables.tf`, `infra/terraform.tfvars.example`, and `infra/cloud_run.tf`.
-- [x] **Infrastructure Guardrails (`prod` Deletion Protection & `make policy-check`):**
-  - Update `infra/cloud_run.tf`: Set `deletion_protection = var.environment == "prod"` on `ingestion_api`, `agent_api`, and `frontend` so live `prod` services cannot be accidentally deleted while non-prod environments stay tear-down friendly.
-  - Add `policy-check` target to `Makefile` (run automatically before `make plan` and `make deploy`) combining `check-region-policy` (live GCP Organization Policy check), static verification that no Cloud Run / Python config defaults to `"global"` or disables fail-closed screening, and `make validate`.
+---
+
+### Phase 2: Privacy-Safe Audit Logging & Trace Correlation
+**Goal:** Create an end-to-end, PII-free audit trail across the Load Balancer, backend microservices, and Google Cloud services that is immediately searchable in Cloud Logging and archived regionally.
+
+- [x] **Request Correlation & Structured Audit Logger (`src/core/compliance/`):**
+  - **`src/core/compliance/context.py`:** Manage per-request context (`request_id`, `trace_id`, `service_name`) using Python `contextvars` so correlation IDs automatically propagate across async handlers and worker threads.
+  - **`src/core/compliance/audit.py`:**
+    - Implement `AuditCorrelationMiddleware` (wired into both services via `src/core/app_factory.py`) to read or generate `X-Request-Id`, extract Cloud Run's `X-Cloud-Trace-Context`, and echo `X-Request-Id` on every HTTP response.
+    - Implement `emit_audit_event()` to publish structured JSON audit records to the `interactiverag-audit` stream in Google Cloud Logging (with stdout JSON fallback when running offline).
+    - Implement `hash_query()` to automatically replace any raw user query text with `query_sha256` and `query_chars`.
+- [x] **Application-Wide Audit Coverage & PII Scrubbing (`src/`):**
+  - Remove plaintext user query logging from `src/agent/app.py`, `src/agent/stream.py`, and `src/ingestion/service.py`.
+  - Emit structured audit events for authentication failures (`src/core/auth.py`), collection listing and deletion (`src/core/storage/routes.py`), document ingestion and vector search (`src/ingestion/app.py`), agent chat and streaming (`src/agent/app.py`, `src/agent/stream.py`), and Model Armor / DLP blocks or redactions (`src/core/ai_security/armor.py`, `src/agent/graph.py`).
+- [x] **Cloud Audit Logs, Load Balancer Logs & Regional Audit Bucket (`infra/`):**
+  - **`infra/apis.tf`, `infra/iam.tf`, `Makefile`:** Enable `logging.googleapis.com`, grant `roles/logging.configWriter` to the Terraform deployer service account, and grant `roles/logging.logWriter` to the backend runtime service account.
+  - **`infra/compliance.tf`:**
+    - Enable `ADMIN_READ`, `DATA_READ`, and `DATA_WRITE` Cloud Audit Logs for Cloud Storage, Vertex AI, Cloud DLP, and Model Armor.
+    - Provision a regional Cloud Logging bucket (`google_logging_project_bucket_config.compliance_audit`) pinned to `var.region` with configurable retention (`var.audit_log_retention_days`, default 365 days).
+    - Provision a project log sink (`google_logging_project_sink.compliance_audit_sink`) that copies `interactiverag-audit` events, Cloud Audit Logs, and Load Balancer HTTP logs into the regional compliance bucket while keeping them visible in Logs Explorer.
+  - **`infra/load_balancer.tf`:** Enable HTTP access logging on both `ingestion_backend` and `agent_backend`.
+
+---
+
+### Phase 3: Regulatory Requirements (GDPR Self-Service & EU AI Act Transparency)
+**Goal:** Empower users to inspect or permanently erase all of their stored personal data (GDPR Art. 15 & 17) and provide clear AI transparency and grounding indicators on every response (EU AI Act Art. 50).
+
+- [x] **GDPR Data Inventory & Complete Versioned Erasure (`src/`):**
+  - **`src/core/compliance/dsar.py`:**
+    - Implement `get_user_data_inventory(uid)` to return a user's collections, passage counts, uploaded PDF filenames, live and archived Cloud Storage object counts, and total storage bytes.
+    - Implement `purge_all_user_data(uid)` to permanently delete **all live and noncurrent Cloud Storage object versions** under `users/{uid}/` (`versions=True`), plus local `/tmp/chroma_db/{uid}` and `/tmp/uploads/{uid}` directories.
+  - **`src/agent/memory.py`:** Implement `list_user_memory_threads(uid)` and `purge_user_memory_threads(uid)` to count and wipe all `{uid}:*` conversation checkpoints from in-memory chat storage.
+  - **`src/core/compliance/routes.py` & `src/core/app_factory.py`:** Expose `GET /compliance/my-data` (Art. 15 inventory) and `DELETE /compliance/my-data` (Art. 17 complete erasure) on both backend services, emitting `dsar.export_inventory` and `dsar.erase_user_data` audit events.
+- [x] **EU AI Act Provenance Metadata & Frontend Privacy Controls (`src/` & `frontend/`):**
+  - **`src/core/compliance/provenance.py`, `src/agent/schemas.py`, `src/agent/app.py`, `src/agent/stream.py`:** Build and attach a structured `compliance` metadata object (`ai_generated`, `model`, `region`, `grounding_enforced`, `grounded`, `citation_count`, `retrieved_passages`, `pii_filtered`, `model_armor_active`, `filters_checked`, `guardrail_actions`, `request_id`) to all `/agent` JSON responses and `/agent/stream` SSE completion events.
+  - **`frontend/src/api.js` & `frontend/src/App.jsx`:**
+    - Render transparency badges on every assistant message showing AI generation status, model and region, citation grounding status, and any Model Armor / DLP safety actions taken.
+    - Add the **"My Data & Privacy"** self-service modal allowing authenticated users to inspect their stored data footprint and trigger complete account data erasure.
+
+---
+
+### Phase 4: Policy Enforcement (Fail-Closed Screening, Quotas & Deployment Guardrails)
+**Goal:** Enforce fail-closed behavior when safety services are unavailable in production, protect multi-tenant resources with per-user rate limits and quotas, and prevent misconfigured deployments.
+
+- [x] **Fail-Closed Security Screening (`src/core/ai_security/` & `src/`):**
+  - **`src/core/config.py` & `src/core/ai_security/armor.py`:** Add `MODEL_ARMOR_FAIL_CLOSED` (enabled in Cloud Run deployments). When active, any missing template or upstream error calling Model Armor or Cloud DLP raises `SecurityScreeningUnavailableError` and emits an audit event.
+  - **`src/agent/app.py`, `src/agent/stream.py`, `src/ingestion/app.py`:** Catch `SecurityScreeningUnavailableError` and return `HTTP 503 Service Unavailable` (or an SSE error frame with `http_status: 503`) so unscreened prompts, chunks, or responses never pass through.
+- [x] **Per-User Rate Limits & Collection Quotas (`src/core/compliance/policy.py`):**
+  - Implement thread-safe per-user sliding-window rate limiters for ingestion (`RATE_LIMIT_INGEST_PER_MINUTE`, default `10`) and queries (`RATE_LIMIT_QUERY_PER_MINUTE`, default `30`), returning `HTTP 429` with a `Retry-After` header and emitting `policy.rate_limit_exceeded` audit events.
+  - Implement `enforce_collection_quota(uid, collection_name)` to cap the number of collections a user can own (`MAX_COLLECTIONS_PER_USER`, default `20`), returning `HTTP 403` and emitting `policy.collection_quota_exceeded` when creating a new collection over the limit while allowing uploads into existing collections.
+  - Enforce rate limits and quotas in `src/ingestion/upload_parser.py`, `src/ingestion/app.py`, and `src/agent/app.py` **before** archiving uploaded PDFs to Cloud Storage.
+- [x] **Infrastructure Protection & Pre-Deploy Policy Gate (`infra/`, `scripts/`, `Makefile`):**
+  - **`infra/cloud_run.tf`:** Set `deletion_protection = var.environment == "prod"` on `ingestion_api`, `agent_api`, and `frontend`.
+  - **`scripts/check_static_policies.py` & `Makefile` (`policy-check`):** Automatically verify before `make plan` and `make deploy` that the live Organization Policy allows `REGION`, no Python or Terraform config uses `"global"` or multi-regions, fail-closed screening is enabled, production deletion protection is configured, and `terraform validate` succeeds.
+
+---
 
 ### Phase 5: Automated Compliance Test Suite & Documentation
-- [ ] Create `tests/compliance.py` (`unittest`) covering:
-  - Unified `GOOGLE_CLOUD_LOCATION` regional validation (rejecting `"global"`, `"us"`, `"eu"`) and explicit `location` binding on `GoogleGenerativeAIEmbeddings` and `ChatGoogleGenerativeAI`.
-  - `X-Request-Id` / `X-Cloud-Trace-Context` propagation, structured audit event emission, and zero plaintext query leakage in logs.
-  - `GET /compliance/my-data` inventory accuracy and `DELETE /compliance/my-data` complete purge across live + noncurrent GCS blobs, Chroma cache, uploads dir, and `MEMORY_SAVER` `{uid}:*` threads.
-  - EU AI Act `compliance` metadata in both JSON and SSE `/agent` responses.
-  - `MODEL_ARMOR_FAIL_CLOSED="true"` `HTTP 503` fail-closed behavior vs. local fail-open fallback.
-  - Per-user rate limits (`HTTP 429` + `Retry-After`) and `MAX_COLLECTIONS_PER_USER` (`HTTP 403` on new collection vs. `200` on existing collection append).
-- [ ] Update `README.md` with the 4th security & governance architecture pillar, `docs/COMPLIANCE_GOVERNANCE_PLAN.md` link, DSAR endpoints, and `make policy-check` usage.
+**Goal:** Continuously verify all compliance, residency, privacy, and policy guardrails offline before code reaches production.
+
+- [x] **`tests/compliance.py`:** Comprehensive offline `unittest` suite covering:
+  - Phase 1: Single-region validation, rejection of `"global"` and multi-regions, explicit regional binding on Vertex AI clients, Organization Policy evaluation, and single-source-of-truth model allowlists.
+  - Phase 2: End-to-end `X-Request-Id` and `X-Cloud-Trace-Context` correlation across REST and SSE, Cloud Logging publication with graceful fallback, and zero plaintext query leakage across all loggers.
+  - Phase 3: GDPR Art. 15 inventory and Art. 17 complete erasure across live and noncurrent Cloud Storage object versions, local caches, and conversation memory with strict multi-tenant isolation, plus EU AI Act Art. 50 provenance metadata across all guardrail states.
+  - Phase 4: Fail-closed `HTTP 503` screening across prompt, chunk, and output stages (REST and SSE), per-user sliding-window rate limits (`HTTP 429` + `Retry-After`), per-user collection quotas (`HTTP 403` on new collections vs. `HTTP 200` on existing collection appends), and static repository policy checks.
+- [x] **`README.md` & `docs/COMPLIANCE_GOVERNANCE_PLAN.md`:** Document the Compliance & Governance architecture, self-service DSAR endpoints, and verification workflows.
 
 ---
 
-## 5. Files to Create / Modify
+## 5. Compliance & Governance Verification Playbook
 
-| File | Action | Purpose |
-| :--- | :--- | :--- |
-| `docs/COMPLIANCE_GOVERNANCE_PLAN.md` | **Create** | Architectural & phased implementation blueprint for Compliance & Governance |
-| `requirements.txt` | Modify | Add `google-cloud-logging` client for publishing structured audit events directly to GCP Cloud Logging |
-| `Makefile` | Modify | Add `check-region-policy` & `policy-check` pre-deploy checks verifying live GCP `gcp.resourceLocations` Org Policy; enable `logging.googleapis.com` & `roles/logging.configWriter` |
-| `infra/apis.tf` | Modify | Track `logging.googleapis.com` in Terraform |
-| `infra/iam.tf` | Modify | Grant `backend_sa` `roles/logging.logWriter` for direct `interactiverag-audit` Cloud Logging writes |
-| `infra/compliance.tf` | **Create** | Provision `DATA_READ`/`DATA_WRITE` Cloud Audit Logs, regional Cloud Logging audit bucket, and project audit log sink |
-| `infra/variables.tf` | Modify | Validate concrete single-region `var.region`; add audit log retention, LB log sample rate, `model_armor_fail_closed`, rate-limit, and collection-quota variables |
-| `infra/terraform.tfvars.example` | Modify | Document governance, audit log, rate-limit, and quota settings |
-| `infra/cloud_run.tf` | Modify | Pin `GOOGLE_CLOUD_LOCATION = var.region`, inject `MODEL_ARMOR_FAIL_CLOSED="true"`, rate/quota env vars, and enable `deletion_protection` in `prod` only |
-| `infra/storage.tf` | Modify | Add regional precondition assertion on the ChromaDB persistence bucket |
-| `infra/ai_security.tf` | Modify | Add regional precondition assertion on Model Armor template |
-| `infra/network.tf` | Modify | Add regional precondition assertion on Model Armor PSC endpoint |
-| `infra/load_balancer.tf` | Modify | Enable HTTP access `log_config` on `ingestion_backend` and `agent_backend` |
-| `infra/outputs.tf` | Modify | Export regional audit log bucket ID, audit sink writer identity, and pinned `GOOGLE_CLOUD_LOCATION` |
-| `src/core/config.py` | Modify | Unify on `GOOGLE_CLOUD_LOCATION` (drop `DEFAULT_LOCATION`), add `MODEL_ARMOR_FAIL_CLOSED`, `RATE_LIMIT_*`, and `MAX_COLLECTIONS_PER_USER` |
-| `src/core/ai_security/` | **Create** | Modular AI security package (`armor.py`, `safety.py`, `guardrails.py`) including fail-closed `SecurityScreeningUnavailableError` handling |
-| `src/core/storage/` | **Create** | Modular multi-tenant persistence package (`paths.py`, `gcs_sync.py`, `locks.py`, `chroma.py`, `routes.py`) with regional Vertex AI embeddings |
-| `src/core/compliance/` | **Create** | Modular compliance & governance package (`residency.py`, `context.py`, `audit.py`, `provenance.py`, `dsar.py`, `routes.py`, and Phase 4 `policy.py`) |
-| `src/core/app_factory.py` | **Create** | Shared FastAPI factory wiring CORS, `AuditCorrelationMiddleware`, `/collections`, and `/compliance/my-data` |
-| `src/core/auth.py` | Modify | Emit structured audit events on authentication failures (`check_revoked=False` preserved) |
-| `src/ingestion/app.py` | Modify | Enforce ingest/query rate limits & collection quota; emit structured audit events |
-| `src/ingestion/service.py` | Modify | Scrub raw query text from similarity-search logs |
-| `src/agent/memory.py` | **Create** | Tenant-namespaced `MEMORY_SAVER` checkpoints and `purge_user_memory_threads(uid)` for GDPR Art. 17 erasure |
-| `src/agent/schemas.py` | Modify | Attach `ComplianceMetadata` model to `AgentResponse` |
-| `src/agent/graph.py` | Modify | Pin `validate_gcp_region()` on `ChatGoogleGenerativeAI` and screen input/output via `src.core.ai_security` |
-| `src/agent/app.py` | Modify | Scrub raw query logs, enforce query rate limit, handle fail-closed `503`, attach `compliance` metadata, and register memory purge hook |
-| `src/agent/stream.py` | Modify | Scrub raw query logs, handle fail-closed `503` SSE frames, and emit `compliance` metadata in SSE output |
-| `frontend/src/api.js` | Modify | Add `fetchMyDataInventory()` and `deleteMyData()` API helpers |
-| `frontend/src/App.jsx` | Modify | Render AI provenance badge on assistant replies and **"My Data & Privacy"** self-service DSAR modal |
-| `tests/compliance.py` | **Create** | Offline `unittest` suite covering residency, audit logging, GDPR DSAR, EU AI Act metadata, fail-closed screening, rate limits, and collection quotas |
-| `README.md` | Modify | Document Compliance & Governance architecture, DSAR APIs, Organization Policy setup, and `make policy-check` |
+### 1. Pre-Deploy Organization Policy & Static Governance Checks
+Verify that the target Google Cloud project has an active resource location policy, that your configured region is permitted, and that all Terraform and Python policy invariants pass:
 
----
-
-## 6. Compliance & Governance Verification Playbook
-
-### 1. Verify Effective GCP Organization Policy & Repo Adherence
 ```bash
-# Inspect live GCP Organization Policy inherited by interactive-rag
+# 1. Inspect the live effective GCP Organization Policy on your project
 gcloud resource-manager org-policies describe gcp.resourceLocations \
-  --project=interactive-rag --effective
+  --project="${PROJECT_ID}" --effective
 
-# Run automated pre-deploy compliance & residency checks
-make policy-check
+# 2. Run the live Organization Policy adherence check
+make check-region-policy PROJECT_ID="${PROJECT_ID}" REGION="${REGION}"
+
+# 3. Run offline static policy checks (single-region pinning, fail-closed Model Armor, prod deletion protection)
+make check-static-policy
+
+# 4. Run the full pre-deploy governance gate (runs automatically before `make plan` and `make deploy`)
+make policy-check PROJECT_ID="${PROJECT_ID}" REGION="${REGION}"
 ```
 
-### 2. Run Complete Offline Unit Test Suite
+### 2. Run the Automated Offline Test Suite
+Run the compliance test suite (or the full repository test suite) completely offline without requiring live cloud credentials:
+
 ```bash
+# Run the dedicated Compliance & Governance test suite
+.venv/bin/python -m unittest tests.compliance -v
+
+# Run all security, multi-tenancy, storage, and compliance test suites together
 .venv/bin/python -m unittest tests.auth tests.storage tests.multi_tenant_api tests.ai_security tests.compliance -v
 ```
 
 ### 3. Live API Verification Commands
+
 ```bash
-# 1. Trace Correlation & EU AI Act Provenance Metadata
+# 1. End-to-End Trace Correlation & EU AI Act Art. 50 Provenance Metadata (JSON)
 curl -i -X POST "${AGENT_URL}/agent" \
   -H "Authorization: Bearer ${ID_TOKEN}" \
   -H "X-Request-Id: req-audit-demo-001" \
   -H "Content-Type: application/json" \
-  -d '{"query": "Summarize key findings.", "collection_name": "stock_market_vs"}'
-# Expect: X-Request-Id echoed in response header + JSON "compliance": {"ai_generated": true, "region": "us-central1", ...}
+  -d '{"query": "Summarize key findings.", "collection_name": "financial_reports", "stream": false}'
+# Expect:
+# - HTTP response header: X-Request-Id: req-audit-demo-001
+# - JSON body includes "compliance": {
+#     "ai_generated": true, "model": "gemini-2.5-flash", "region": "us-central1",
+#     "grounding_enforced": true, "grounded": true, "citation_count": ...,
+#     "pii_filtered": false, "model_armor_active": true,
+#     "filters_checked": ["pi_and_jailbreak", "malicious_uri", "rai", "sdp"],
+#     "guardrail_actions": [], "request_id": "req-audit-demo-001"
+#   }
 
-# 2. GDPR Art. 15 — Self-Service Data Inventory
+# 2. Streaming SSE Provenance Metadata
+curl -N -X POST "${AGENT_URL}/agent/stream" \
+  -H "Authorization: Bearer ${ID_TOKEN}" \
+  -H "X-Request-Id: req-audit-stream-001" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Summarize key findings.", "collection_name": "financial_reports"}'
+# Expect: Final SSE frame before [DONE] with {"event": "compliance", "compliance": {...}}
+
+# 3. GDPR Art. 15 — Self-Service Data Inventory (Right of Access)
 curl -s "${AGENT_URL}/compliance/my-data" \
-  -H "Authorization: Bearer ${ID_TOKEN}" | jq .
+  -H "Authorization: Bearer ${ID_TOKEN}" \
+  -H "X-Request-Id: req-dsar-inventory-001" | jq .
+# Expect: JSON inventory of collections, total_passages, uploaded_pdfs,
+#         gcs_live_object_count, gcs_noncurrent_version_count, total_bytes, and memory_thread_count.
 
-# 3. GDPR Art. 17 — Right to Erasure (Purges Live + Archived GCS Versions, Chroma Cache & Chat Memory)
+# 4. GDPR Art. 17 — Complete Right to Erasure
 curl -s -X DELETE "${AGENT_URL}/compliance/my-data" \
-  -H "Authorization: Bearer ${ID_TOKEN}" | jq .
+  -H "Authorization: Bearer ${ID_TOKEN}" \
+  -H "X-Request-Id: req-dsar-erase-001" | jq .
+# Expect: {"status": "success", "deleted_gcs_live_objects": ..., "deleted_gcs_noncurrent_versions": ..., "deleted_memory_threads": ...}
+# Re-running GET /compliance/my-data afterwards returns 0 collections, 0 files, 0 bytes, and 0 memory threads.
 
-# 4. Policy Enforcement — Rate Limit (HTTP 429 + Retry-After) & Collection Quota (HTTP 403)
+# 5. Policy Enforcement — Per-User Rate Limiting (HTTP 429 + Retry-After)
+# Sending more than RATE_LIMIT_QUERY_PER_MINUTE (default 30) queries within 60 seconds returns:
+# HTTP/2 429 Too Many Requests with header `Retry-After: <seconds>`
+
+# 6. Policy Enforcement — Per-User Collection Quota (HTTP 403)
+# Attempting to create a new collection once MAX_COLLECTIONS_PER_USER (default 20) is reached returns:
+# HTTP/2 403 Forbidden (while uploading additional PDFs into an existing collection continues to succeed with HTTP 200).
 ```
 
-### 4. Inspect Audit Results in GCP Cloud Logging (Logs Explorer)
-Open **GCP Console → Logging → Logs Explorer** (project `interactive-rag`) and paste any of these filters:
+### 4. Inspect Audit Records in Google Cloud Logging (Logs Explorer & CLI)
+Open **Google Cloud Console → Logging → Logs Explorer** for your project and use these filters:
 
 ```text
-# 1. View all structured InteractiveRAG compliance audit events (queries, uploads, DLP redactions, DSAR, quotas)
-logName="projects/interactive-rag/logs/interactiverag-audit"
+# 1. View all structured InteractiveRAG application audit events
+#    (ingest, query, agent chat, collection delete, DSAR inventory/erasure, rate/quota blocks, Model Armor/DLP events)
+logName="projects/${PROJECT_ID}/logs/interactiverag-audit"
 
-# 2. Trace a single request end-to-end by X-Request-Id (shows hashed query_sha256, zero plaintext PII)
+# 2. Trace a single request end-to-end across all services by X-Request-Id
+#    (verifies user questions are hashed as query_sha256 with zero plaintext PII)
 jsonPayload.request_id="req-audit-demo-001"
 
-# 3. View GCP service DATA_READ / DATA_WRITE Cloud Audit Logs (GCS, Vertex AI, Cloud DLP, Model Armor)
-logName="projects/interactive-rag/logs/cloudaudit.googleapis.com%2Fdata_access"
+# 3. View only security blocks, PII redactions, or policy quota rejections
+logName="projects/${PROJECT_ID}/logs/interactiverag-audit" AND (jsonPayload.event_type:"security." OR jsonPayload.event_type:"policy." OR jsonPayload.event_type="auth.failure")
+
+# 4. View GDPR Art. 15 & Art. 17 self-service DSAR audit events
+logName="projects/${PROJECT_ID}/logs/interactiverag-audit" AND jsonPayload.event_type:"dsar."
+
+# 5. View Google Cloud DATA_READ / DATA_WRITE Audit Logs (Cloud Storage, Vertex AI, Cloud DLP, Model Armor)
+logName="projects/${PROJECT_ID}/logs/cloudaudit.googleapis.com%2Fdata_access"
+
+# 6. View Global External HTTPS Load Balancer access logs
+resource.type="http_load_balancer"
 ```
 
-Or query live from your terminal:
+Or query the audit stream directly from your terminal:
+
 ```bash
-gcloud logging read 'logName="projects/interactive-rag/logs/interactiverag-audit"' \
-  --project=interactive-rag --limit=10 --format=json
+gcloud logging read "logName=\"projects/${PROJECT_ID}/logs/interactiverag-audit\"" \
+  --project="${PROJECT_ID}" --limit=10 --format=json
 ```

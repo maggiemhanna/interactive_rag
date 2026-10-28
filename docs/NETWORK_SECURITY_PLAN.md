@@ -1,193 +1,177 @@
-# Network Security & Load Balancer Plan (VPC, Segmentation & Private Endpoints)
+# Network Security & Load Balancer Plan (Private VPC, Network Segmentation & Private Endpoints)
 
-This document is the step-by-step blueprint for upgrading **InteractiveRAG** on **Google Cloud Platform (GCP)** with:
-1. **VPC Design** — A private virtual network with no public internet exit for backend containers.
-2. **Network Segmentation + Load Balancer** — One public HTTPS front door (**Global External Application Load Balancer**), locking down direct internet access to all Cloud Run `*.run.app` URLs and separating backend workloads into dedicated subnets.
-3. **Private Endpoints** — Private Google Access + Private Cloud DNS tunnels so all traffic to **Cloud Storage (PDFs & ChromaDB)**, **Vertex AI (Gemini & Embeddings)**, and **Firebase Auth** stays strictly on Google's private internal network.
+This document outlines the architecture and implementation plan for the second defense-in-depth layer of **InteractiveRAG**: **Network Security & Load Balancing**.
+
+While the first layer establishes authentication and multi-tenant storage isolation, this layer locks down the network perimeter so backend services cannot be reached directly from the public internet and cannot make outbound connections to external websites. It is organized around three pillars:
+
+1. **Private Virtual Network (Zero Outbound Internet)** — Places backend services inside a custom Virtual Private Cloud (VPC) with no route to the open internet. Even if an attacker or a malicious document attempted to trick a backend container into sending data to an outside server, the network itself blocks the connection.
+2. **Network Segmentation & Single HTTPS Front Door** — Replaces direct internet access to individual containers with a single **Global External Application Load Balancer**. The Load Balancer acts as the only public entry point over HTTPS, while backend workloads are isolated in separate private subnets according to their role.
+3. **Private Google Endpoints** — Routes all communication between the backend services and Google Cloud APIs (Cloud Storage, Vertex AI, Identity Platform, Cloud Logging, Cloud DLP, and Model Armor) exclusively through private internal Google tunnels and private DNS rather than the public internet.
 
 ---
 
 ## 1. Target Architecture (Before vs. After)
 
 ### Before
-- All 3 Cloud Run apps (`frontend`, `ingestion-api`, `agent-api`) sit directly on the public internet (`INGRESS_TRAFFIC_ALL`).
-- Backend containers have unrestricted outbound internet access over Google's default shared network.
+- **Multiple Public Service Endpoints:** The frontend, document ingestion service, and AI agent service were each directly reachable on the public internet through their own individual service URLs, requiring cross-origin (CORS) requests between separate domains.
+- **Unrestricted Outbound Internet Access:** Backend containers used the default shared cloud network with full outbound internet connectivity.
+- **No Workload Network Isolation:** Document parsing/ingestion and AI agent execution shared the same network boundary without subnet separation.
 
 ### After
-- **Only the Google Load Balancer is reachable from the public internet.**
-- Direct visits to any `*.run.app` URL from the internet are blocked (`403 Forbidden`).
-- `ingestion-api` and `agent-api` sit in separate private rooms (subnets) with **zero outbound internet access**, reaching Google Storage, Gemini, and Firebase exclusively through a private internal tunnel.
+- **Single HTTPS Entry Point:** Only the Global External HTTPS Load Balancer is reachable from the internet. It serves the web interface and routes API traffic internally by URL path, while direct internet requests to any individual Cloud Run service URL are automatically blocked at Google's network edge.
+- **Zero Outbound Internet:** Backend services route all outbound traffic into a custom private VPC that has its default internet route removed, completely preventing data exfiltration to external hosts.
+- **Segmented Subnets & Private Internal Tunnels:** The Document Ingestion service and the Agent service run in separate private subnets and reach Google Cloud storage, AI models, authentication keys, and security screening services strictly over Google's private internal network using Private Google Access and Regional Private Service Connect.
 
-```mermaid
-flowchart TB
-    Browser["User's Browser"]
-    Auth["GCP Identity Platform / Firebase Auth"]
+---
 
-    LB["Global External HTTPS Load Balancer\nSingle Public IP + Managed SSL Certificate\n(https://<IP-with-dashes>.sslip.io)"]
+## 2. Scope Boundaries (What We Implement vs. Exclude)
 
-    subgraph LockedCloudRun["Cloud Run (INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER)"]
-        FE["frontend\n(Static React SPA + Nginx)"]
-        Ingest["ingestion-api (src/ingestion/app.py)\nDirect VPC Egress: ALL_TRAFFIC"]
-        Agent["agent-api (src/agent/app.py)\nDirect VPC Egress: ALL_TRAFFIC"]
-    end
+To achieve strong network isolation without adding unnecessary fixed infrastructure costs (such as always-on NAT gateways or proxy VMs), the table below summarizes what is implemented in this architecture and what is intentionally left out of scope.
 
-    subgraph CustomVPC["Private Custom VPC (No Public Internet Route)"]
-        SubIngest["Room 1: ingestion-subnet (10.10.1.0/26)\nPrivate Google Access = ON"]
-        SubAgent["Room 2: agent-subnet (10.10.2.0/26)\nPrivate Google Access = ON"]
-        PrivDNS["Private Cloud DNS (*.googleapis.com)\nRoutes to 199.36.153.8/30"]
-    end
+| Network Pillar | In Scope (Implemented) | Out of Scope (Intentionally Excluded) |
+| :--- | :--- | :--- |
+| **1. Private VPC Design** | • Custom VPC network with automatic subnet creation disabled and the default public internet route deleted<br>• Serverless **Direct VPC Egress** routing all outbound backend traffic through the private VPC ($0/month idle cost, no connector VMs)<br>• Third-party outbound telemetry disabled on backend containers | • Cloud NAT gateways or outbound internet proxy servers (backends never need to call external non-Google websites) |
+| **2. Network Segmentation & Load Balancing** | • **Global External Application Load Balancer** with a reserved static IP, automatic HTTP-to-HTTPS redirect, and a Google-managed SSL certificate<br>• Path-based routing (`/api/ingest/*`, `/api/agent/*`, and `/*`) uniting the frontend and APIs under a single HTTPS origin<br>• Cloud Run ingress locked strictly to internal and Load Balancer traffic<br>• Separate private subnets isolating the PDF ingestion workload from the AI agent workload | • Paying for a custom registered domain name by default (uses a free wildcard DNS hostname tied to the Load Balancer IP, though custom domains remain supported) |
+| **3. Private Endpoints** | • **Private Google Access** route and **Private Cloud DNS** zone routing `*.googleapis.com` traffic over Google's private internal VIPs<br>• Dedicated **Regional Private Service Connect (PSC)** endpoint and private DNS zone for regional Model Armor screening traffic | • Site-to-site VPN or Cloud Interconnect to on-premises data centers |
 
-    subgraph GooglePrivateBackbone["Google Private Backbone (Private Endpoints)"]
-        GCS["Cloud Storage Bucket\n(User PDFs & ChromaDB)"]
-        Vertex["Vertex AI\n(gemini-2.5-flash & gemini-embedding-001)"]
-        JWKS["Google / Firebase Public Keys\n(JWT Verification)"]
-    end
+---
 
-    Browser <-->|"1. Sign In (JWT)"| Auth
-    Browser -->|"2. All App Traffic (HTTPS)"| LB
+## 3. Key Design Decisions (In Plain English)
 
-    LB -->|"/* (Website)"| FE
-    LB -->|"/api/ingest/* -> /*"| Ingest
-    LB -->|"/api/agent/* -> /*"| Agent
+### 3.1 A Private Network With No Internet Exit
+- **Eliminating Outbound Data Exfiltration:** By creating a custom VPC and removing its default route to the internet, backend containers have no path to external IP addresses. Attach points use Cloud Run's serverless Direct VPC Egress with all traffic routed into the VPC, which scales automatically and incurs no idle virtual machine charges.
+- **Disabling External Telemetry:** Backend containers also disable anonymous third-party library telemetry so services never waste time attempting outbound analytics connections that the private network will drop.
 
-    Ingest --> SubIngest
-    Agent --> SubAgent
-    SubIngest --> PrivDNS
-    SubAgent --> PrivDNS
+### 3.2 Public Front Lobby vs. Private Back Rooms (Load Balancer & Segmentation)
+- **One Public Front Door:** A Global External Application Load Balancer receives all incoming HTTPS traffic from users' browsers and forwards requests internally based on the URL path:
+  - Requests to `/api/ingest/*` are stripped of the `/api/ingest` prefix and routed to the Ingestion service.
+  - Requests to `/api/agent/*` are stripped of the `/api/agent` prefix and routed to the Agent service.
+  - All other requests (`/*`) are routed to the Frontend web application.
+- **Same-Origin Simplicity:** Because the website and both backend APIs share the exact same HTTPS domain through the Load Balancer, the browser communicates with `/api/ingest` and `/api/agent` on the same origin, simplifying security configuration and CORS handling.
+- **Blocking Direct Container Access:** All three Cloud Run services are configured to accept traffic only from the internal Load Balancer. Anyone attempting to visit a service's underlying `*.run.app` URL directly from the internet is immediately rejected by Google's front-end edge before the request ever reaches the container.
+- **Separate Internal Subnets:** The Ingestion service (which parses untrusted user-uploaded PDFs) runs in its own dedicated private subnet, isolated from the Agent service subnet and the Private Service Connect subnet.
 
-    PrivDNS -->|"Private Tunnel (199.36.153.8/30)"| GCS
-    PrivDNS -->|"Private Tunnel (199.36.153.8/30)"| Vertex
-    PrivDNS -->|"Private Tunnel (199.36.153.8/30)"| JWKS
+### 3.3 Private Underground Tunnels to Google Cloud Services
+- **Private Google Access for Global & Regional Google APIs:** Both backend subnets enable Private Google Access with a single internal route to Google's private virtual IP range (`199.36.153.8/30`). A Private Cloud DNS zone for `googleapis.com` maps Google API calls (Cloud Storage, Vertex AI, Cloud Logging, Cloud DLP, and Firebase public signing keys) onto that private internal pathway without touching the public internet.
+- **Regional Private Service Connect for Model Armor:** Because regional `*.rep.googleapis.com` endpoints use Private Service Connect rather than the standard `private.googleapis.com` VIP range, the VPC also provisions a dedicated Private Service Connect subnet, a regional endpoint (`modelarmor.<region>.rep.googleapis.com`), and a private DNS zone so AI safety screening traffic stays 100% inside the private network.
+
+### 3.4 Automatic Free HTTPS Certificate Without Buying a Domain
+- **Zero-Cost Managed TLS:** Google-managed SSL certificates and browser authentication flows require a valid HTTPS domain name rather than a raw IP address. Terraform automatically constructs an `<IP-with-dashes>.sslip.io` hostname from the Load Balancer's reserved static IP. Because `sslip.io` automatically resolves that hostname back to the Load Balancer IP, Google Cloud can provision and renew a trusted HTTPS certificate automatically with zero manual DNS setup.
+
+---
+
+## 4. Step-by-Step Implementation Phases
+
+### Phase 1: Networking APIs, IAM Roles & Variables (`Makefile` & `infra/`)
+**Goal:** Enable the Google Cloud networking, DNS, and Private Service Connect APIs and grant the deployment service account permission to manage network resources.
+
+- [x] **Enable APIs & Deployer Permissions (`Makefile` & `infra/apis.tf`):**
+  - Enable `compute.googleapis.com`, `dns.googleapis.com`, and `networkconnectivity.googleapis.com`.
+  - Grant `roles/compute.networkAdmin`, `roles/compute.loadBalancerAdmin`, `roles/compute.securityAdmin`, `roles/dns.admin`, and `roles/networkconnectivity.regionalEndpointAdmin` to the Terraform deployer service account.
+- [x] **Network Subnet Variables (`infra/variables.tf` & `infra/terraform.tfvars.example`):**
+  - Define configurable private IPv4 CIDR ranges for `ingestion_subnet_cidr` (`10.10.1.0/26`), `agent_subnet_cidr` (`10.10.2.0/26`), and `psc_subnet_cidr` (`10.10.3.0/28`).
+
+---
+
+### Phase 2: Private VPC, Segmented Subnets & Private Endpoints (`infra/network.tf`)
+**Goal:** Provision the zero-internet VPC, isolated workload subnets, Private Google Access route, Regional Private Service Connect endpoint, and private DNS zones.
+
+- [x] **Custom Zero-Internet VPC & Workload Subnets (`infra/network.tf`):**
+  - Provision `google_compute_network.main` with `auto_create_subnetworks = false` and `delete_default_routes_on_create = true` to remove default public internet egress.
+  - Provision `ingestion-subnet` (`10.10.1.0/26`) and `agent-subnet` (`10.10.2.0/26`) in `var.region` with `private_ip_google_access = true`.
+- [x] **Private Google Access Route & Private Cloud DNS (`infra/network.tf`):**
+  - Create a static VPC route (`google_compute_route.private_googleapis`) directing `199.36.153.8/30` to Google's internal gateway.
+  - Create a private Cloud DNS zone for `googleapis.com.` mapping `private.googleapis.com.` to `199.36.153.8–11` and wildcard `*.googleapis.com.` via CNAME.
+- [x] **Regional Private Service Connect for Model Armor (`infra/network.tf`):**
+  - Provision `psc-subnet` (`10.10.3.0/28`), a regional PSC endpoint (`google_network_connectivity_regional_endpoint.model_armor_psc`) targeting `modelarmor.${var.region}.rep.googleapis.com`, and a private DNS zone resolving `modelarmor.${var.region}.rep.googleapis.com.` to the internal PSC IP address.
+
+---
+
+### Phase 3: Global External HTTPS Load Balancer (`infra/load_balancer.tf`)
+**Goal:** Expose the entire application through a single HTTPS Load Balancer with path-based routing, managed TLS, HTTP-to-HTTPS redirection, and access logging.
+
+- [x] **Static IP & Managed SSL Certificate (`infra/load_balancer.tf`):**
+  - Reserve a global static IPv4 address (`google_compute_global_address.lb_ip`).
+  - Derive the `sslip.io` domain name and provision a Google-managed SSL certificate (`google_compute_managed_ssl_certificate.lb_cert`).
+- [x] **Serverless NEGs, Backend Services & URL Map (`infra/load_balancer.tf`):**
+  - Create Serverless Network Endpoint Groups (`google_compute_region_network_endpoint_group`) for `frontend`, `ingestion_api`, and `agent_api`.
+  - Create Backend Services (`EXTERNAL_MANAGED`) with HTTP access logging enabled (`log_config`) on the backend API services.
+  - Configure the HTTPS URL Map (`google_compute_url_map.https_router`) to rewrite `/api/ingest/*` $\rightarrow$ `/` on `ingestion_backend`, `/api/agent/*` $\rightarrow$ `/` on `agent_backend`, and route all other paths (`/*`) to `frontend_backend`.
+  - Configure port `443` HTTPS forwarding and port `80` HTTP-to-HTTPS (`301`) redirect rules.
+
+---
+
+### Phase 4: Cloud Run Lockdown & Same-Origin Wiring (`infra/cloud_run.tf`, `infra/auth.tf`, `infra/outputs.tf`)
+**Goal:** Block direct internet access to Cloud Run containers, attach backend services to their private subnets, and connect the frontend and authentication domain to the Load Balancer URL.
+
+- [x] **Lock Down Cloud Run Ingress & Egress (`infra/cloud_run.tf`):**
+  - Set `ingress = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"` on `frontend`, `ingestion_api`, and `agent_api`.
+  - Attach `vpc_access` (`egress = "ALL_TRAFFIC"`) connecting `ingestion_api` to `ingestion-subnet` and `agent_api` to `agent-subnet`.
+  - Set `ANONYMIZED_TELEMETRY = "FALSE"` on both backend services.
+  - Configure `frontend` with same-origin relative API paths (`INGESTION_API_URL = "/api/ingest"`, `AGENT_API_URL = "/api/agent"`) and include the Load Balancer `https://` URL in `ALLOWED_ORIGINS`.
+- [x] **Authorize Load Balancer Domain & Export Outputs (`infra/auth.tf` & `infra/outputs.tf`):**
+  - Add the Load Balancer `sslip.io` domain to Identity Platform `authorized_domains`.
+  - Export `load_balancer_url`, `load_balancer_ip`, and `model_armor_psc_endpoint_ip` in Terraform outputs.
+
+---
+
+## 5. Network Security & Connectivity Verification Playbook
+
+First, retrieve your deployed Load Balancer URL and Cloud Run service URLs:
+
+```bash
+make outputs PROJECT_ID="${PROJECT_ID}" REGION="${REGION}"
 ```
 
----
+### 1. Verify Direct Cloud Run URLs Are Blocked from the Internet
+Attempting to call any underlying `*.run.app` service URL directly from outside the Load Balancer must be rejected at Google's network edge:
 
-## 2. Key Design Decisions (In Plain English)
+```bash
+curl -i "${INGESTION_RUN_APP_URL}/health"
+curl -i "${AGENT_RUN_APP_URL}/health"
+curl -i "${FRONTEND_RUN_APP_URL}/healthz"
+# Expect on all 3: HTTP/2 404 or 403 rejection from Google Front End (request never reaches the container)
+```
 
-### 2.1 Private Building With No Internet Exit (VPC Design)
-- We create a custom VPC (`auto_create_subnetworks = false`) and remove the default route to the open internet (`delete_default_routes_on_create = true`).
-- We attach `ingestion-api` and `agent-api` to this VPC using **Cloud Run Direct VPC Egress (`ALL_TRAFFIC`)**, which costs **$0/month** when idle (no connector VMs required).
-- Even if a malicious uploaded PDF tried to trick the server into sending files to an outside website, the connection fails because there is no route to the public internet.
-- We also set `ANONYMIZED_TELEMETRY=FALSE` on backend containers so ChromaDB never wastes time trying to send anonymous usage pings to external internet analytics servers.
+### 2. Verify HTTPS Load Balancer Routing & HTTP-to-HTTPS Redirect
+Confirm that the single public Load Balancer front door serves the frontend and routes `/api/ingest/*` and `/api/agent/*` internally over HTTPS:
 
-### 2.2 Public Lobby vs. Private Back Rooms (Network Segmentation + Load Balancer)
-- **Single Front Door**: A **Global External Application Load Balancer (`EXTERNAL_MANAGED`)** receives all user traffic over HTTPS and routes it by URL path:
-  - `/api/ingest/*` $\rightarrow$ strips `/api/ingest` and forwards internally to `ingestion-api`.
-  - `/api/agent/*` $\rightarrow$ strips `/api/agent` and forwards internally to `agent-api`.
-  - Everything else (`/*`) $\rightarrow$ forwards internally to `frontend`.
-- **Same-Origin Simplicity**: Because the Website (`frontend`), PDF Uploader (`/api/ingest`), and AI Chat (`/api/agent`) now share the **exact same HTTPS domain**, `frontend` simply receives `INGESTION_API_URL="/api/ingest"` and `AGENT_API_URL="/api/agent"`. Existing code in `frontend/src/firebase.js` already supports relative paths—**no React code changes required**.
-- **Separate Internal Rooms**: `ingestion-api` (which parses untrusted user PDFs) lives in `ingestion-subnet` (`10.10.1.0/26`), isolated from `agent-api` in `agent-subnet` (`10.10.2.0/26`). (`/26` provides 64 internal IPs per subnet, matching Cloud Run Direct VPC Egress scaling requirements.)
+```bash
+# 1. Verify port 80 HTTP requests redirect (301) to HTTPS
+curl -i "http://${LB_DOMAIN}/"
+# Expect: HTTP/1.1 301 Moved Permanently -> Location: https://${LB_DOMAIN}/
 
-### 2.3 Private Underground Tunnel to Google (Private Endpoints)
-- Both subnets enable **Private Google Access** (`private_ip_google_access = true`) with a dedicated VPC route only to Google's private VIP range (`199.36.153.8/30` — `private.googleapis.com`).
-- A **Private Cloud DNS** zone for `googleapis.com.` maps `*.googleapis.com` to `199.36.153.8–11`.
-- Why `private.googleapis.com` is chosen: In addition to **Cloud Storage** (`storage.googleapis.com`) and **Vertex AI** (`*-aiplatform.googleapis.com`), Firebase Admin's `verify_id_token()` fetches public signing keys from `www.googleapis.com`, which works seamlessly over `private.googleapis.com` without internet access.
+# 2. Verify all three services respond with HTTP 200 OK through the HTTPS Load Balancer
+curl -i "${LB_URL}/healthz"
+curl -i "${LB_URL}/api/ingest/health"
+curl -i "${LB_URL}/api/agent/health"
+# Expect on all 3: HTTP/2 200 OK
+```
 
-### 2.4 Free Automatic HTTPS Certificate (`sslip.io` — No Custom Domain Needed)
-- Google-managed SSL certificates and Firebase Login both require an HTTPS hostname (not a raw IP address).
-- Terraform automatically builds `<LB_IP_WITH_DASHES>.sslip.io` (e.g., `34-120-10-25.sslip.io`) directly from the Load Balancer's reserved static IP. `sslip.io` is a free public wildcard DNS service that automatically resolves that hostname back to your Load Balancer IP, allowing Google Cloud to automatically issue and renew a trusted HTTPS certificate at zero cost.
+### 3. Verify Unauthenticated API Calls Still Require Authentication
+Confirm that routing through the Load Balancer preserves zero-trust authentication on all protected endpoints:
 
----
+```bash
+curl -i "${LB_URL}/api/ingest/collections"
+curl -i -X POST "${LB_URL}/api/agent/agent" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Test", "collection_name": "docs"}'
+# Expect on both: HTTP/2 401 Unauthorized
+```
 
-## 3. Step-by-Step Implementation Phases
+### 4. Verify Private Internal Tunnels to Storage, Vertex AI & Model Armor
+Verify that the isolated backend containers (which have zero outbound internet access) can privately reach Cloud Storage, Vertex AI, Identity Platform keys, Cloud Logging, and the Regional Model Armor Private Service Connect endpoint:
 
-### Phase 1: Enable Networking APIs & Deployer Permissions
-- [x] Add `compute.googleapis.com` and `dns.googleapis.com` to `infra/apis.tf` and the `bootstrap` target in `Makefile`.
-- [x] Add networking & DNS IAM roles (`roles/compute.networkAdmin`, `roles/compute.loadBalancerAdmin`, `roles/compute.securityAdmin`, `roles/dns.admin`) to `TF_DEPLOYER_ROLES` in `Makefile` so automated Terraform deploys can manage VPC, DNS, and Load Balancer resources.
-- [x] Add `ingestion_subnet_cidr` and `agent_subnet_cidr` variables to `infra/variables.tf` and `infra/terraform.tfvars.example`.
+```bash
+# 1. Upload a PDF through the Load Balancer (exercises Private Google Access to Cloud Storage + Vertex AI Embeddings)
+curl -s -X POST "${LB_URL}/api/ingest/ingest" \
+  -H "Authorization: Bearer ${ID_TOKEN}" \
+  -F "collection_name=network_test" \
+  -F "files=@sample.pdf;type=application/pdf" | jq .
 
-### Phase 2: Build the Private VPC & Segmented Subnets (Concepts 1 & 2)
-- [x] Create `infra/network.tf`:
-  - Provision custom VPC `google_compute_network.main` with `auto_create_subnetworks = false` and `delete_default_routes_on_create = true` (eliminating outbound public internet access).
-  - Provision `ingestion-subnet` (`10.10.1.0/26`) in `var.region` with `private_ip_google_access = true`.
-  - Provision `agent-subnet` (`10.10.2.0/26`) in `var.region` with `private_ip_google_access = true`.
-
-### Phase 3: Configure Private Endpoints & Private Cloud DNS (Concept 3)
-- [x] In `infra/network.tf`:
-  - Add a static VPC route (`google_compute_route.private_googleapis`) sending `199.36.153.8/30` to `default-internet-gateway` (Google's internal next-hop for Private Google Access).
-  - Create a private Cloud DNS zone (`google_dns_managed_zone.googleapis`, `dns_name = "googleapis.com."`, `visibility = "private"`) bound to `google_compute_network.main`.
-  - Add DNS `A` record `private.googleapis.com.` $\rightarrow$ `["199.36.153.8", "199.36.153.9", "199.36.153.10", "199.36.153.11"]`.
-  - Add DNS `CNAME` record `*.googleapis.com.` $\rightarrow$ `private.googleapis.com.`.
-
-### Phase 4: Provision the Global External HTTPS Load Balancer (Concept 2)
-- [x] Create `infra/load_balancer.tf`:
-  - Reserve a global static IPv4 address (`google_compute_global_address.lb_ip`).
-  - Derive the automatic Load Balancer hostname `"${replace(google_compute_global_address.lb_ip.address, ".", "-")}.sslip.io"`.
-  - Create a Google-managed SSL certificate (`google_compute_managed_ssl_certificate.lb_cert`) for that `sslip.io` hostname.
-  - Create 3 Serverless Network Endpoint Groups (`google_compute_region_network_endpoint_group`) pointing to `frontend`, `ingestion_api`, and `agent_api`.
-  - Create 3 Backend Services (`google_compute_backend_service` with `load_balancing_scheme = "EXTERNAL_MANAGED"`).
-  - Create the HTTPS URL Map (`google_compute_url_map.https_router`) routing:
-    - `/api/ingest/*` $\rightarrow$ `ingestion` backend service (rewriting prefix `/api/ingest/` to `/`).
-    - `/api/agent/*` $\rightarrow$ `agent` backend service (rewriting prefix `/api/agent/` to `/`).
-    - Default (`/*`) $\rightarrow$ `frontend` backend service.
-  - Attach `google_compute_target_https_proxy` + port `443` `google_compute_global_forwarding_rule`.
-  - Add an HTTP (`80`) URL map + `google_compute_target_http_proxy` + port `80` forwarding rule that automatically 301-redirects `http://` visitors to `https://`.
-
-### Phase 5: Lock Down Cloud Run & Wire Frontend / Auth
-- [x] Update `infra/cloud_run.tf`:
-  - Change `ingress` on `frontend`, `ingestion_api`, and `agent_api` from `"INGRESS_TRAFFIC_ALL"` to `"INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"`.
-  - Attach `vpc_access` (`egress = "ALL_TRAFFIC"`) to `ingestion_api` (`ingestion-subnet`) and `agent_api` (`agent-subnet`).
-  - Add `ANONYMIZED_TELEMETRY = "FALSE"` to `ingestion_api` and `agent_api` environment variables.
-  - Set `frontend` environment variables to same-origin Load Balancer paths: `INGESTION_API_URL = "/api/ingest"` and `AGENT_API_URL = "/api/agent"`.
-  - Update `ALLOWED_ORIGINS` to include the Load Balancer `https://` URL.
-- [x] Update `infra/auth.tf`:
-  - Add the Load Balancer `sslip.io` domain to Identity Platform `authorized_domains` so Firebase Sign-In works immediately on the new domain.
-- [x] Update `infra/outputs.tf`:
-  - Output `load_balancer_ip` and `load_balancer_url` (`https://<IP-with-dashes>.sslip.io`) as the primary entry point.
-
-### Phase 6: Deploy & Verify End-to-End
-- [x] Run `make bootstrap` to enable `compute` & `dns` APIs and update deployer IAM roles.
-- [x] Run `make plan IMAGE_TAG=latest` and `make deploy IMAGE_TAG=latest` to provision the VPC, Private Endpoints, Load Balancer, and locked-down Cloud Run revisions using the existing container images.
-- [ ] *(If using Google Sign-In OAuth)* Add the new `https://136-81-158-54.sslip.io` URL under **APIs & Services $\rightarrow$ Credentials $\rightarrow$ OAuth 2.0 Web Client $\rightarrow$ Authorized JavaScript origins** in the GCP Console.
-- [ ] Wait ~10–15 minutes on first creation for the Google-managed SSL certificate status to reach `ACTIVE` (`gcloud compute ssl-certificates list --project=interactive-rag`), then execute the verification playbook below.
-
----
-
-## 4. Files to Create / Modify
-
-| File | Action | Purpose |
-| :--- | :--- | :--- |
-| `Makefile` | Modify | Enable `compute` & `dns` APIs; add network/LB/DNS roles to deployer SA |
-| `infra/apis.tf` | Modify | Track `compute.googleapis.com` and `dns.googleapis.com` in Terraform |
-| `infra/variables.tf` | Modify | Add `ingestion_subnet_cidr` and `agent_subnet_cidr` |
-| `infra/terraform.tfvars.example` | Modify | Document subnet CIDR settings |
-| `infra/network.tf` | **Create** | Custom VPC (no internet route), segmented subnets, Private Google Access route, and Private Cloud DNS (`*.googleapis.com`) |
-| `infra/load_balancer.tf` | **Create** | Static IP, `sslip.io` Managed SSL cert, 3 Serverless NEGs, 3 Backend Services, `/api/ingest/*` & `/api/agent/*` URL rewrites, HTTPS + HTTP-redirect proxies |
-| `infra/cloud_run.tf` | Modify | Lock `ingress` to Load Balancer only, attach Direct VPC Egress (`ALL_TRAFFIC`), wire `/api/ingest` & `/api/agent`, disable Chroma telemetry |
-| `infra/auth.tf` | Modify | Authorize the Load Balancer `sslip.io` domain in Identity Platform |
-| `infra/outputs.tf` | Modify | Expose `load_balancer_url` and `load_balancer_ip` |
-
----
-
-## 5. Security & Connectivity Verification Playbook
-
-First, inspect the deployed URLs via `make outputs` (or `gcloud run services list --project=interactive-rag`).
-
-1. **Verify Direct Cloud Run URLs Are Blocked (Network Segmentation)**
-   ```bash
-   # Fetching raw *.run.app URLs directly from the internet must now be rejected by Google Front End:
-   curl -i "https://interactive-rag-ingestion-prod-nzrnyir2mq-uc.a.run.app/health"
-   curl -i "https://interactive-rag-agent-prod-nzrnyir2mq-uc.a.run.app/health"
-   curl -i "https://interactive-rag-frontend-prod-nzrnyir2mq-uc.a.run.app/healthz"
-   # Expected on all 3: HTTP/2 404 (or 403) Google Front End rejection (never reaches Cloud Run)
-   ```
-
-2. **Verify SSL Certificate Status & Single Public Front Door**
-   ```bash
-   LB_URL="https://136-81-158-54.sslip.io"
-   curl -i "${LB_URL}/healthz"
-   curl -i "${LB_URL}/api/ingest/health"
-   curl -i "${LB_URL}/api/agent/health"
-   # Expected on all 3: HTTP/2 200 OK
-   ```
-
-3. **Verify Unauthenticated API Calls Still Require Login**
-   ```bash
-   curl -i "${LB_URL}/api/ingest/collections"
-   # Expected: HTTP/2 401 Unauthorized
-   ```
-
-4. **Verify Private Tunnel to Storage & Vertex AI (End-to-End UI Check)**
-   - Open `${LB_URL}` in your browser and sign in.
-   - Upload a PDF into a collection (proves `ingestion-api` reaches **Cloud Storage** and **Vertex AI Embeddings** privately over `199.36.153.8/30` with zero internet access).
-   - Ask a question in **Agentic RAG Chat** (proves `agent-api` verifies Firebase JWT keys, syncs ChromaDB from **Cloud Storage**, and streams **Gemini** responses through the Load Balancer).
+# 2. Query the Agent through the Load Balancer (exercises Regional PSC to Model Armor + Private Google Access to Vertex AI Gemini & Cloud Storage)
+curl -s -X POST "${LB_URL}/api/agent/agent" \
+  -H "Authorization: Bearer ${ID_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Summarize this document.", "collection_name": "network_test", "stream": false}' | jq .
+```

@@ -15,10 +15,6 @@ min_instance_count   = 0
 max_instance_count   = 5
 bucket_force_destroy = false
 
-# Identity Platform / Firebase Web Config (auto-populated from Identity Platform if left empty)
-firebase_api_key = ""
-firebase_app_id  = ""
-
 # Google OAuth Sign-In (credentials loaded dynamically from GCP Secret Manager)
 enable_google_oauth                = true
 google_oauth_client_id_secret_name = "google_oauth_client_id"

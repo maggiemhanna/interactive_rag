@@ -81,19 +81,6 @@ variable "extra_allowed_origins" {
   default     = ["http://localhost:3000"]
 }
 
-variable "firebase_api_key" {
-  description = "Identity Platform / Firebase Web API Key injected into frontend /env-config.js."
-  type        = string
-  default     = ""
-  sensitive   = true
-}
-
-variable "firebase_app_id" {
-  description = "Optional Firebase Web App ID injected into frontend /env-config.js."
-  type        = string
-  default     = ""
-}
-
 variable "enable_google_oauth" {
   description = "Enable Google OAuth Sign-In provider in Identity Platform (loads credentials from GCP Secret Manager)."
   type        = bool
