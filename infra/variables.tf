@@ -1,9 +1,17 @@
+# ==============================================================================
+# 1. Core Project, Single-Region Residency & Deployment Identity
+# ==============================================================================
+
 variable "project_id" {
   description = "GCP Project ID where InteractiveRAG will be deployed."
   type        = string
   default     = "interactive-rag"
 }
 
+# Enforces concrete single-region syntax (e.g., `us-central1`, `europe-west1`) so `"global"`
+# and multi-regions (`"us"`, `"eu"`, `"asia"`) are rejected at `terraform plan` time.
+# Note: Pre-deploy `make check-region-policy` additionally verifies that this region is
+# permitted by the project's effective `constraints/gcp.resourceLocations` Organization Policy.
 variable "region" {
   description = "Concrete single GCP region for Cloud Run, Artifact Registry, GCS, and Vertex AI (must satisfy project gcp.resourceLocations Organization Policy)."
   type        = string
@@ -21,6 +29,8 @@ variable "app_name" {
   default     = "interactive-rag"
 }
 
+# Controls environment naming (`dev`, `staging`, `prod`) and gates Cloud Run
+# `deletion_protection = var.environment == "prod"` in `cloud_run.tf`.
 variable "environment" {
   description = "Deployment environment label (e.g., dev, staging, prod)."
   type        = string
@@ -33,12 +43,18 @@ variable "image_tag" {
   default     = "latest"
 }
 
+# ==============================================================================
+# 2. Cloud Run Sizing, Autoscaling & Storage Lifecycle Settings
+# ==============================================================================
+
 variable "backend_cpu" {
   description = "CPU limit for ingestion-api and agent-api Cloud Run containers."
   type        = string
   default     = "2"
 }
 
+# Note: In Cloud Run Gen2, `/tmp` is an in-memory `tmpfs` filesystem that shares
+# this container memory limit when syncing per-user ChromaDB vector stores.
 variable "backend_memory" {
   description = "Memory limit for backend containers (shared with /tmp tmpfs ChromaDB cache)."
   type        = string
@@ -75,6 +91,10 @@ variable "bucket_force_destroy" {
   default     = false
 }
 
+# ==============================================================================
+# 3. Authentication, CORS & Secret Manager References
+# ==============================================================================
+
 variable "extra_allowed_origins" {
   description = "Additional CORS origins allowed to call the backend APIs (e.g., http://localhost:3000 or custom domains)."
   type        = list(string)
@@ -87,6 +107,8 @@ variable "enable_google_oauth" {
   default     = false
 }
 
+# Stores ONLY the Secret Manager resource names (never the secret values themselves);
+# `auth.tf` fetches the actual OAuth credentials from GCP Secret Manager at apply time.
 variable "google_oauth_client_id_secret_name" {
   description = "Name of the GCP Secret Manager secret holding the Google OAuth 2.0 Web Client ID."
   type        = string
@@ -99,6 +121,12 @@ variable "google_oauth_client_secret_name" {
   default     = "google_oauth_client_secret"
 }
 
+# ==============================================================================
+# 4. Private VPC Subnets (Direct VPC Egress & Regional Private Service Connect)
+# ==============================================================================
+
+# Cloud Run Direct VPC Egress recommends at least a `/26` (64 IPs) subnet per service
+# to support rapid container scaling.
 variable "ingestion_subnet_cidr" {
   description = "Private CIDR range for the ingestion-api Cloud Run Direct VPC Egress subnet (minimum /26 recommended)."
   type        = string
@@ -131,6 +159,10 @@ variable "psc_subnet_cidr" {
     error_message = "psc_subnet_cidr must be a valid IPv4 CIDR block (e.g., 10.10.3.0/28)."
   }
 }
+
+# ==============================================================================
+# 5. AI-Specific Security (Model Allowlists, Safety Thresholds & Upload Ceilings)
+# ==============================================================================
 
 variable "allowed_llm_models" {
   description = "Comma-separated allowlist of approved regional Vertex AI generative LLM models."
@@ -210,6 +242,10 @@ variable "agent_recursion_limit" {
   default     = 6
 }
 
+# ==============================================================================
+# 6. Compliance, Audit Logging & Runtime Policy Enforcement
+# ==============================================================================
+
 variable "audit_log_retention_days" {
   description = "Retention period in days for the regional Cloud Logging compliance audit bucket (1 to 3650 days)."
   type        = number
@@ -276,4 +312,3 @@ variable "max_collections_per_user" {
     error_message = "max_collections_per_user must be a positive integer (>= 1)."
   }
 }
-

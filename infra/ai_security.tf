@@ -1,4 +1,23 @@
-# 1. Provision the Google-managed Model Armor Service Agent and authorize it to read & run Cloud DLP templates
+# ==============================================================================
+# AI-Specific Security — Cloud DLP Templates & Google Cloud Model Armor
+#
+# How the pieces connect:
+#   1. `ai_output_inspect` (Cloud DLP)    -> Defines WHICH sensitive infoTypes to detect
+#   2. `ai_output_deidentify` (Cloud DLP) -> Defines HOW to mask findings (`[INFO_TYPE]`)
+#   3. `modelarmor_sa` (Service Identity) -> Grants Model Armor permission to call Cloud DLP
+#   4. `rag_guard` (Model Armor Template) -> Combines Prompt Injection, Jailbreak, Malicious URI,
+#                                            Responsible AI, and Advanced Cloud DLP redaction
+#                                            into a single regional screening endpoint.
+# ==============================================================================
+
+# ==============================================================================
+# 1. Model Armor Service Agent & Cloud DLP Delegation Permissions
+# ==============================================================================
+
+# Triggers creation of Google's managed service agent for `modelarmor.googleapis.com`
+# (`service-<project_number>@gcp-sa-modelarmor.iam.gserviceaccount.com`).
+# When Model Armor executes Advanced SDP (`sdp_settings.advanced_config`), it calls Cloud DLP
+# under this service agent identity rather than the caller's service account.
 resource "google_project_service_identity" "modelarmor_sa" {
   provider = google-beta
   project  = var.project_id
@@ -9,19 +28,27 @@ resource "google_project_service_identity" "modelarmor_sa" {
   ]
 }
 
+# Allows the Model Armor service agent to execute Cloud DLP inspection and de-identification jobs.
 resource "google_project_iam_member" "modelarmor_sa_dlp_user" {
   project = var.project_id
   role    = "roles/dlp.user"
   member  = "serviceAccount:${google_project_service_identity.modelarmor_sa.email}"
 }
 
+# Allows the Model Armor service agent to read the Cloud DLP template definitions below.
 resource "google_project_iam_member" "modelarmor_sa_dlp_reader" {
   project = var.project_id
   role    = "roles/dlp.reader"
   member  = "serviceAccount:${google_project_service_identity.modelarmor_sa.email}"
 }
 
-# 2. Sensitive Data Protection (Cloud DLP) Inspect Template — detects PII & secret credentials
+# ==============================================================================
+# 2. Sensitive Data Protection (Cloud DLP) Inspect Template
+# ==============================================================================
+
+# Regional Cloud DLP Inspect Template (`locations/${var.region}`) scanning retrieved document
+# chunks and generated LLM answers for personal data (PII), financial identifiers, and secrets.
+# `min_likelihood = "POSSIBLE"` favors privacy safety so borderline PII matches are still masked.
 resource "google_data_loss_prevention_inspect_template" "ai_output_inspect" {
   parent       = "projects/${var.project_id}/locations/${var.region}"
   template_id  = "${var.app_name}-inspect-${var.environment}"
@@ -59,7 +86,13 @@ resource "google_data_loss_prevention_inspect_template" "ai_output_inspect" {
   ]
 }
 
-# 3. Sensitive Data Protection (Cloud DLP) De-identify Template — masks findings with [INFO_TYPE] placeholders
+# ==============================================================================
+# 3. Sensitive Data Protection (Cloud DLP) De-identify Template
+# ==============================================================================
+
+# Regional Cloud DLP De-identify Template replacing every matched span from `ai_output_inspect`
+# with its bracketed infoType label (e.g., `alice@example.com` -> `[EMAIL_ADDRESS]`), preserving
+# sentence readability and `[source, p.X]` citations while stripping raw sensitive values.
 resource "google_data_loss_prevention_deidentify_template" "ai_output_deidentify" {
   parent       = "projects/${var.project_id}/locations/${var.region}"
   template_id  = "${var.app_name}-deidentify-${var.environment}"
@@ -81,7 +114,17 @@ resource "google_data_loss_prevention_deidentify_template" "ai_output_deidentify
   ]
 }
 
-# 4. Google Cloud Model Armor Template — screens prompts (Prompt Injection/Jailbreak) & responses (SDP + RAI)
+# ==============================================================================
+# 4. Regional Google Cloud Model Armor Template (`rag_guard`)
+# ==============================================================================
+
+# Unified regional AI guardrail template invoked by `src/core/ai_security/armor.py`:
+# - `pi_and_jailbreak_filter_settings`: Blocks prompt injection and jailbreak attempts on input.
+# - `sdp_settings.advanced_config`: Masks PII and secrets in retrieved chunks and model outputs
+#   using the Cloud DLP inspect + de-identify templates above.
+# - `malicious_uri_filter_settings`: Blocks phishing and malware URLs in prompts and responses.
+# - `rai_settings`: Enforces Responsible AI harm thresholds across Hate Speech, Harassment,
+#   Sexually Explicit, and Dangerous content.
 resource "google_model_armor_template" "rag_guard" {
   project     = var.project_id
   location    = var.region
@@ -130,6 +173,8 @@ resource "google_model_armor_template" "rag_guard" {
     }
   }
 
+  # Data Residency Precondition:
+  # Ensures the Model Armor template is always provisioned in a concrete single GCP region.
   lifecycle {
     precondition {
       condition     = can(regex("^[a-z]+-[a-z]+[0-9]+$", var.region))

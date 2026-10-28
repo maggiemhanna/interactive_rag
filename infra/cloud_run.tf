@@ -1,22 +1,52 @@
+# ==============================================================================
+# Google Cloud Run Gen2 Microservices (`ingestion-api`, `agent-api`, `frontend`)
+#
+# Shared security & residency properties across all three services:
+# - `location = var.region`: Pinned to a single concrete GCP region.
+# - `ingress = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"`: Blocks direct internet
+#   access to `*.run.app` URLs; all external traffic must enter via the HTTPS Load Balancer.
+# - `invoker_iam_disabled = true`: Allows the External HTTPS Load Balancer Serverless NEG
+#   to forward browser requests without Cloud IAM headers, while FastAPI enforces
+#   Firebase / Identity Platform JWT authentication (`Authorization: Bearer <ID_TOKEN>`).
+# - `deletion_protection = var.environment == "prod"`: Prevents accidental service deletion
+#   in production while keeping `dev` / `staging` environments easy to tear down.
+# ==============================================================================
+
 locals {
   ingestion_service_name = "${var.app_name}-ingestion-${var.environment}"
   agent_service_name     = "${var.app_name}-agent-${var.environment}"
   frontend_service_name  = "${var.app_name}-frontend-${var.environment}"
 
-  # Deterministic Cloud Run regional hostname breaks any circular dependency between CORS and frontend env vars
+  # Deterministic Cloud Run regional hostname (`<service>-<project_number>.<region>.run.app`).
+  # Computing this upfront avoids circular dependencies between `frontend`, `auth.tf`,
+  # and backend `ALLOWED_ORIGINS` CORS lists during initial Terraform provisioning.
   frontend_deterministic_domain = "${local.frontend_service_name}-${data.google_project.current.number}.${var.region}.run.app"
   frontend_deterministic_url    = "https://${local.frontend_deterministic_domain}"
 
+  # Combined CORS allowlist passed to FastAPI (`src/core/config.py`): includes the primary
+  # HTTPS Load Balancer origin (`local.lb_url`), the deterministic frontend URL, and any
+  # custom origins in `var.extra_allowed_origins`.
   allowed_origins_csv = join(
     ",",
     distinct(concat([local.lb_url, local.frontend_deterministic_url], var.extra_allowed_origins))
   )
 
+  # Backend (`ingestion-api` and `agent-api`) shares a single Python Docker image (`Dockerfile.backend`),
+  # selecting its FastAPI entrypoint via the `APP_MODULE` environment variable.
   backend_image  = "${local.artifact_registry_url}/backend:${var.image_tag}"
   frontend_image = "${local.artifact_registry_url}/frontend:${var.image_tag}"
 }
 
-# 1. Document Ingestion & Collection Management Service (src/ingestion/app.py)
+# ==============================================================================
+# 1. Document Ingestion & Vector Search Service (`src/ingestion/app.py`)
+# ==============================================================================
+
+# Handles PDF uploads (`POST /ingest`), similarity search (`POST /query`), collection
+# management (`/collections`), and GDPR self-service data requests (`/compliance/my-data`).
+# - `EXECUTION_ENVIRONMENT_GEN2`: Provides full Linux compatibility and fast in-memory
+#   `/tmp` (`tmpfs`) storage for per-user ChromaDB SQLite/HNSW operations.
+# - `vpc_access` (`egress = "ALL_TRAFFIC"` -> `ingestion-subnet`): Forces 100% of outbound
+#   packets into the zero-internet VPC so untrusted PDFs can never trigger external connections.
 resource "google_cloud_run_v2_service" "ingestion_api" {
   name                 = local.ingestion_service_name
   location             = var.region
@@ -142,6 +172,8 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
     }
   }
 
+  # Ensures IAM bindings, Model Armor templates, and Private Google Access / PSC DNS records
+  # are active before Cloud Run starts serving traffic.
   depends_on = [
     google_project_service.required_apis["run.googleapis.com"],
     google_project_service.required_apis["logging.googleapis.com"],
@@ -159,7 +191,17 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
   ]
 }
 
-# 2. LangGraph Agentic RAG & SSE Streaming Service (src/agent/app.py)
+# ==============================================================================
+# 2. LangGraph Agentic RAG & SSE Streaming Service (`src/agent/app.py`)
+# ==============================================================================
+
+# Executes the guarded LangGraph pipeline (`input_guard -> model_call <-> tools -> output_guard`),
+# serving both standard JSON (`POST /agent`) and real-time Server-Sent Events (`POST /agent/stream`).
+# - `session_affinity = true`: Routes multi-turn chat requests from the same user browser session
+#   to the same warm Cloud Run container instance so in-memory `MEMORY_SAVER` checkpoints and
+#   synced `/tmp/chroma_db/{uid}` caches remain warm across turns.
+# - `vpc_access` (`egress = "ALL_TRAFFIC"` -> `agent-subnet`): Isolates agent network traffic in
+#   its own private subnet separate from `ingestion-subnet`.
 resource "google_cloud_run_v2_service" "agent_api" {
   name                 = local.agent_service_name
   location             = var.region
@@ -299,10 +341,16 @@ resource "google_cloud_run_v2_service" "agent_api" {
   ]
 }
 
-# 3. React SPA + Nginx Frontend Service
-# Note: Direct *.run.app reachability is blocked (INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER);
-# public traffic enters exclusively via the External HTTPS Load Balancer, and all backend API
-# endpoints enforce Firebase / Identity Platform JWT verification.
+# ==============================================================================
+# 3. React SPA + Nginx Frontend Service (`docker/Dockerfile.frontend`)
+# ==============================================================================
+
+# Serves static React assets and generates `/usr/share/nginx/html/env-config.js` at container
+# startup (`docker/entrypoint-frontend.sh`) from the environment variables below:
+# - `INGESTION_API_URL` & `AGENT_API_URL`: Same-origin relative paths (`/api/ingest` and
+#   `/api/agent`) routed by the External HTTPS Load Balancer (`load_balancer.tf`).
+# - `FIREBASE_API_KEY`: Auto-populated directly from `google_identity_platform_config.auth`
+#   (`auth.tf`) after Identity Platform is provisioned.
 resource "google_cloud_run_v2_service" "frontend" {
   name                 = local.frontend_service_name
   location             = var.region

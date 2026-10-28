@@ -1,3 +1,9 @@
+# ==============================================================================
+# 1. Public Entry Point (Global External HTTPS Load Balancer)
+# ==============================================================================
+
+# Primary URL for opening the InteractiveRAG web dashboard and calling `/api/ingest/*`
+# and `/api/agent/*` over HTTPS (`https://<IP-with-dashes>.sslip.io`).
 output "load_balancer_url" {
   description = "Primary public HTTPS URL for InteractiveRAG via the Global External Load Balancer."
   value       = local.lb_url
@@ -13,6 +19,12 @@ output "frontend_url" {
   value       = local.lb_url
 }
 
+# ==============================================================================
+# 2. Internal Cloud Run Service URIs (Direct Internet Access Blocked)
+#    Useful for verifying Network Segmentation (confirming direct `*.run.app`
+#    calls from the public internet return HTTP 404/403).
+# ==============================================================================
+
 output "frontend_service_uri" {
   description = "Internal Cloud Run URI for frontend (direct internet access blocked via INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER)."
   value       = google_cloud_run_v2_service.frontend.uri
@@ -27,6 +39,10 @@ output "agent_api_url" {
   description = "Internal Cloud Run URI for agent-api (direct internet access blocked via INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER)."
   value       = google_cloud_run_v2_service.agent_api.uri
 }
+
+# ==============================================================================
+# 3. Storage, Artifact Registry, IAM & Identity Platform Outputs
+# ==============================================================================
 
 output "chroma_gcs_bucket" {
   description = "Private GCS bucket storing isolated per-user ChromaDB vector stores and uploaded PDFs."
@@ -49,6 +65,10 @@ output "firebase_web_api_key" {
   sensitive   = true
 }
 
+# ==============================================================================
+# 4. AI Security & Private Service Connect Outputs
+# ==============================================================================
+
 output "model_armor_template_id" {
   description = "Full resource ID of the provisioned Google Cloud Model Armor template."
   value       = google_model_armor_template.rag_guard.id
@@ -69,6 +89,10 @@ output "model_armor_psc_endpoint_ip" {
   value       = google_network_connectivity_regional_endpoint.modelarmor_psc.address
 }
 
+# ==============================================================================
+# 5. Compliance, Data Residency & Audit Logging Outputs
+# ==============================================================================
+
 output "google_cloud_location" {
   description = "Pinned single GCP region enforced across Cloud Run, GCS, Model Armor, and Vertex AI."
   value       = var.region
@@ -88,4 +112,3 @@ output "application_audit_log_name" {
   description = "Full GCP Cloud Logging logName for structured InteractiveRAG compliance events."
   value       = "projects/${var.project_id}/logs/interactiverag-audit"
 }
-

@@ -1,8 +1,17 @@
 # ==============================================================================
 # Compliance & Governance — Cloud Audit Logs, Regional Audit Log Bucket & Sink
+#
+# Audit architecture:
+#   1. Application audit events (`projects/<project>/logs/interactiverag-audit`)
+#   2. GCP Data Access Audit Logs (`cloudaudit.googleapis.com/data_access`)
+#   3. HTTPS Load Balancer HTTP access logs (`resource.type="http_load_balancer"`)
+#      -> All three remain searchable in `_Default` (Logs Explorer) AND are copied into
+#         the regional `compliance_audit` log bucket in `var.region` for long-term retention.
 # ==============================================================================
 
 locals {
+  # Core data-bearing and AI services where `DATA_READ` and `DATA_WRITE` Cloud Audit Logs
+  # are enabled (GCP only enables `ADMIN_READ` by default).
   audited_gcp_services = toset([
     "storage.googleapis.com",
     "aiplatform.googleapis.com",
@@ -13,7 +22,14 @@ locals {
   compliance_audit_bucket_id = "${var.app_name}-audit-${var.environment}"
 }
 
-# 1. Enable ADMIN_READ, DATA_READ, and DATA_WRITE Cloud Audit Logs for core data & AI services
+# ==============================================================================
+# 1. Google Cloud Data-Access Audit Log Configuration
+# ==============================================================================
+
+# Enables `ADMIN_READ`, `DATA_READ`, and `DATA_WRITE` Cloud Audit Logs across Cloud Storage,
+# Vertex AI, Cloud DLP, and Model Armor so every object read/write, embedding/LLM call, and
+# DLP/Model Armor screening call is recorded in `cloudaudit.googleapis.com` and correlated
+# via `X-Cloud-Trace-Context`.
 resource "google_project_iam_audit_config" "compliance_data_access" {
   for_each = local.audited_gcp_services
   project  = var.project_id
@@ -32,7 +48,13 @@ resource "google_project_iam_audit_config" "compliance_data_access" {
   }
 }
 
-# 2. Regional Cloud Logging Bucket storing retained compliance & audit records in var.region
+# ==============================================================================
+# 2. Dedicated Regional Cloud Logging Audit Bucket
+# ==============================================================================
+
+# Stores compliance and audit records strictly inside `var.region` (unlike `_Default`, which is
+# global) with configurable long-term retention (`var.audit_log_retention_days`, default 365 days)
+# and optional WORM retention lock (`var.audit_log_bucket_locked`).
 resource "google_logging_project_bucket_config" "compliance_audit" {
   project          = var.project_id
   location         = var.region
@@ -54,10 +76,17 @@ resource "google_logging_project_bucket_config" "compliance_audit" {
   ]
 }
 
-# 3. Non-excluding Project Sink copying interactiverag-audit, Cloud Audit Logs, and LB access logs
-#    into the regional compliance bucket while keeping _Default populated for immediate Logs Explorer queries.
-#    Note: Sinks routing to a Cloud Logging bucket in the SAME project do not have a writer_identity
-#    and require no additional IAM grant (GCP Cloud Logging writes directly within the project).
+# ==============================================================================
+# 3. Project-Level Compliance Log Sink
+# ==============================================================================
+
+# Non-excluding log sink that copies:
+#   - Application compliance events (`interactiverag-audit`)
+#   - GCP Cloud Audit Logs (`cloudaudit.googleapis.com`)
+#   - External HTTPS Load Balancer access logs (`resource.type="http_load_balancer"`)
+# into `compliance_audit` while leaving `_Default` intact for immediate Logs Explorer queries.
+# Note: Sinks routing to a Cloud Logging bucket in the SAME project write directly within
+# the project and do not require a separate `writer_identity` IAM binding.
 resource "google_logging_project_sink" "compliance_audit_sink" {
   project     = var.project_id
   name        = "${var.app_name}-audit-sink-${var.environment}"
