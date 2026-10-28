@@ -192,6 +192,26 @@ def get_model_armor_location() -> str:
     return os.getenv("MODEL_ARMOR_LOCATION", "").strip() or get_google_cloud_location()
 
 
+def is_model_armor_fail_closed() -> bool:
+    """Returns True when missing or unavailable Model Armor / Cloud DLP screening must fail closed with HTTP 503."""
+    return os.getenv("MODEL_ARMOR_FAIL_CLOSED", "false").strip().lower() in {"1", "true", "yes"}
+
+
+def get_rate_limit_ingest_per_minute() -> int:
+    """Returns the maximum PDF ingestion requests permitted per user per 60-second sliding window."""
+    return _parse_positive_int("RATE_LIMIT_INGEST_PER_MINUTE", 10)
+
+
+def get_rate_limit_query_per_minute() -> int:
+    """Returns the maximum search or agent query requests permitted per user per 60-second sliding window."""
+    return _parse_positive_int("RATE_LIMIT_QUERY_PER_MINUTE", 30)
+
+
+def get_max_collections_per_user() -> int:
+    """Returns the maximum number of distinct ChromaDB collections an authenticated user may create."""
+    return _parse_positive_int("MAX_COLLECTIONS_PER_USER", 20)
+
+
 # Module-level snapshots (for direct constant imports; runtime validators call get_* helpers)
 GOOGLE_CLOUD_LOCATION: str = get_google_cloud_location()
 MAX_QUERY_CHARS: int = get_max_query_chars()
@@ -202,6 +222,10 @@ MAX_CHUNKS_PER_INGEST: int = get_max_chunks_per_ingest()
 GEMINI_SAFETY_THRESHOLD: str = get_gemini_safety_threshold()
 MODEL_ARMOR_TEMPLATE_ID: str = get_model_armor_template_id()
 MODEL_ARMOR_LOCATION: str = get_model_armor_location()
+MODEL_ARMOR_FAIL_CLOSED: bool = is_model_armor_fail_closed()
+RATE_LIMIT_INGEST_PER_MINUTE: int = get_rate_limit_ingest_per_minute()
+RATE_LIMIT_QUERY_PER_MINUTE: int = get_rate_limit_query_per_minute()
+MAX_COLLECTIONS_PER_USER: int = get_max_collections_per_user()
 
 
 def is_reload_enabled() -> bool:

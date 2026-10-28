@@ -25,6 +25,10 @@ from src.core.ai_security.guardrails import (
     validate_embedding_model,
     validate_file_count,
 )
+from src.core.compliance.policy import (
+    enforce_collection_quota,
+    enforce_ingest_rate_limit,
+)
 from src.core.config import get_max_upload_mb, is_cloud_run
 from src.core.logger import setup_logging
 from src.core.storage import archive_upload, get_bucket_name, get_upload_user_dir
@@ -105,6 +109,17 @@ def _validate_ingest_params(
         raise HTTPException(status_code=422, detail=str(e))
 
 
+def _enforce_ingest_policies(uid: str, collection_name: str) -> None:
+    """Enforces per-UID ingestion rate limits (HTTP 429) and new-collection quotas (HTTP 403).
+
+    Args:
+        uid: Verified tenant user identifier.
+        collection_name: Validated target Chroma collection identifier.
+    """
+    enforce_ingest_rate_limit(uid)
+    enforce_collection_quota(uid, collection_name)
+
+
 def _enforce_file_ceiling(count: int) -> None:
     """Enforces `MAX_FILES_PER_REQUEST`, mapping `ValueError` to `HTTP 400`."""
     try:
@@ -132,7 +147,7 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
         `IngestPayload` containing validated document chunks and collection metadata.
 
     Raises:
-        HTTPException: HTTP 400/403/413/422 when validation, signature, or ceiling checks fail.
+        HTTPException: HTTP 400/403/413/422/429 when validation, quota, rate-limit, or ceiling checks fail.
         FileNotFoundError: When a local-dev `pdf_paths` entry does not exist on disk.
     """
     content_type = request.headers.get("content-type", "")
@@ -154,6 +169,7 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
             collection_name, embedding_model = _validate_ingest_params(
                 raw_col, raw_emb
             )
+            _enforce_ingest_policies(uid=uid, collection_name=collection_name)
         elif "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
             async with request.form() as form:
                 raw_col = form.get("collection_name")
@@ -169,6 +185,7 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                 collection_name, embedding_model = _validate_ingest_params(
                     col_str, emb_str
                 )
+                _enforce_ingest_policies(uid=uid, collection_name=collection_name)
 
                 # Handle pdf_paths field if provided in form
                 paths_param = form.getlist("pdf_paths")
@@ -246,6 +263,7 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
             collection_name, embedding_model = _validate_ingest_params(
                 raw_col, raw_emb
             )
+            _enforce_ingest_policies(uid=uid, collection_name=collection_name)
 
         # Security guard: never allow arbitrary container filesystem reads in Cloud Run
         if raw_server_paths and is_cloud_run():

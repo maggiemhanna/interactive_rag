@@ -251,3 +251,42 @@ variable "lb_log_sample_rate" {
   }
 }
 
+variable "model_armor_fail_closed" {
+  description = "Fail closed with HTTP 503 when Cloud Model Armor or Cloud DLP screening is unconfigured or unavailable."
+  type        = bool
+  default     = true
+}
+
+variable "rate_limit_ingest_per_minute" {
+  description = "Maximum PDF ingestion requests permitted per authenticated user per sliding 60-second window."
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.rate_limit_ingest_per_minute >= 1 && floor(var.rate_limit_ingest_per_minute) == var.rate_limit_ingest_per_minute
+    error_message = "rate_limit_ingest_per_minute must be a positive integer (>= 1)."
+  }
+}
+
+variable "rate_limit_query_per_minute" {
+  description = "Maximum vector search or agent query requests permitted per authenticated user per sliding 60-second window."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.rate_limit_query_per_minute >= 1 && floor(var.rate_limit_query_per_minute) == var.rate_limit_query_per_minute
+    error_message = "rate_limit_query_per_minute must be a positive integer (>= 1)."
+  }
+}
+
+variable "max_collections_per_user" {
+  description = "Maximum number of distinct ChromaDB collections an authenticated user may create."
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.max_collections_per_user >= 1 && floor(var.max_collections_per_user) == var.max_collections_per_user
+    error_message = "max_collections_per_user must be a positive integer (>= 1)."
+  }
+}
+

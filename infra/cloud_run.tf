@@ -23,7 +23,7 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
   project              = var.project_id
   ingress              = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
   invoker_iam_disabled = true
-  deletion_protection  = false
+  deletion_protection  = var.environment == "prod"
 
   template {
     service_account       = google_service_account.backend_sa.email
@@ -96,6 +96,10 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
         value = var.region
       }
       env {
+        name  = "MODEL_ARMOR_FAIL_CLOSED"
+        value = tostring(var.model_armor_fail_closed)
+      }
+      env {
         name  = "ALLOWED_EMBEDDING_MODELS"
         value = var.allowed_embedding_models
       }
@@ -114,6 +118,18 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
       env {
         name  = "MAX_QUERY_CHARS"
         value = tostring(var.max_query_chars)
+      }
+      env {
+        name  = "RATE_LIMIT_INGEST_PER_MINUTE"
+        value = tostring(var.rate_limit_ingest_per_minute)
+      }
+      env {
+        name  = "RATE_LIMIT_QUERY_PER_MINUTE"
+        value = tostring(var.rate_limit_query_per_minute)
+      }
+      env {
+        name  = "MAX_COLLECTIONS_PER_USER"
+        value = tostring(var.max_collections_per_user)
       }
       env {
         name  = "AUDIT_LOG_NAME"
@@ -150,7 +166,7 @@ resource "google_cloud_run_v2_service" "agent_api" {
   project              = var.project_id
   ingress              = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
   invoker_iam_disabled = true
-  deletion_protection  = false
+  deletion_protection  = var.environment == "prod"
 
   template {
     service_account       = google_service_account.backend_sa.email
@@ -224,6 +240,10 @@ resource "google_cloud_run_v2_service" "agent_api" {
         value = var.region
       }
       env {
+        name  = "MODEL_ARMOR_FAIL_CLOSED"
+        value = tostring(var.model_armor_fail_closed)
+      }
+      env {
         name  = "GEMINI_SAFETY_THRESHOLD"
         value = var.gemini_safety_threshold
       }
@@ -242,6 +262,14 @@ resource "google_cloud_run_v2_service" "agent_api" {
       env {
         name  = "AGENT_RECURSION_LIMIT"
         value = tostring(var.agent_recursion_limit)
+      }
+      env {
+        name  = "RATE_LIMIT_QUERY_PER_MINUTE"
+        value = tostring(var.rate_limit_query_per_minute)
+      }
+      env {
+        name  = "MAX_COLLECTIONS_PER_USER"
+        value = tostring(var.max_collections_per_user)
       }
       env {
         name  = "AUDIT_LOG_NAME"
@@ -281,7 +309,7 @@ resource "google_cloud_run_v2_service" "frontend" {
   project              = var.project_id
   ingress              = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
   invoker_iam_disabled = true
-  deletion_protection  = false
+  deletion_protection  = var.environment == "prod"
 
   template {
     service_account       = google_service_account.frontend_sa.email

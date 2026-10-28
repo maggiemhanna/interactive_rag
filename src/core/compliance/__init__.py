@@ -1,9 +1,10 @@
 """Compliance & Governance package (Pillar 4) for InteractiveRAG.
 
-Provides modular regulatory, residency, and audit capabilities:
+Provides modular regulatory, residency, policy, and audit capabilities:
 - `residency`: Single-region GCP location validation (`validate_gcp_region`).
 - `context`: Per-request `contextvars` correlation and guardrail telemetry (`AuditRequestState`).
 - `audit`: PII-free Cloud Logging publisher (`emit_audit_event`), SHA-256 query hashing, and ASGI middleware.
+- `policy`: Per-user sliding-window rate limiters (`HTTP 429`) and Chroma collection count quotas (`HTTP 403`).
 - `dsar`: GDPR Art. 15 personal data inventory and Art. 17 complete versioned GCS/local erasure.
 - `provenance`: EU AI Act Art. 50 AI transparency, citation grounding, and Model Armor metadata.
 - `routes`: Self-service `GET` and `DELETE /compliance/my-data` FastAPI router.
@@ -42,6 +43,14 @@ if TYPE_CHECKING:
         was_pii_filtered,
     )
     from src.core.compliance.dsar import get_user_data_inventory, purge_all_user_data
+    from src.core.compliance.policy import (
+        DEFAULT_WINDOW_SECONDS,
+        SlidingWindowRateLimiter,
+        enforce_collection_quota,
+        enforce_ingest_rate_limit,
+        enforce_query_rate_limit,
+        reset_rate_limiters,
+    )
     from src.core.compliance.provenance import (
         ComplianceMetadata,
         GuardrailAction,
@@ -78,6 +87,12 @@ _EXPORT_MAP: dict[str, str] = {
     "was_pii_filtered": "src.core.compliance.context",
     "get_user_data_inventory": "src.core.compliance.dsar",
     "purge_all_user_data": "src.core.compliance.dsar",
+    "DEFAULT_WINDOW_SECONDS": "src.core.compliance.policy",
+    "SlidingWindowRateLimiter": "src.core.compliance.policy",
+    "enforce_collection_quota": "src.core.compliance.policy",
+    "enforce_ingest_rate_limit": "src.core.compliance.policy",
+    "enforce_query_rate_limit": "src.core.compliance.policy",
+    "reset_rate_limiters": "src.core.compliance.policy",
     "ComplianceMetadata": "src.core.compliance.provenance",
     "GuardrailAction": "src.core.compliance.provenance",
     "MODEL_ARMOR_DEFAULT_FILTERS": "src.core.compliance.provenance",

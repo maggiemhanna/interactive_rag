@@ -25,6 +25,9 @@ RECURSION_LIMIT_MESSAGE = (
     "Please narrow or rephrase your question."
 )
 INTERNAL_ERROR_MESSAGE = "An internal server error occurred. Please try again later."
+SCREENING_UNAVAILABLE_MESSAGE = (
+    "AI security screening is temporarily unavailable. Please try again shortly."
+)
 
 _SAFETY_THRESHOLD_MAP: Dict[str, HarmBlockThreshold] = {
     "BLOCK_LOW_AND_ABOVE": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
@@ -98,6 +101,7 @@ __all__ = [
     "PROMPT_BLOCKED_MESSAGE",
     "RECURSION_LIMIT_MESSAGE",
     "SAFETY_REFUSAL_MESSAGE",
+    "SCREENING_UNAVAILABLE_MESSAGE",
     "get_gemini_safety_settings",
     "is_safety_blocked",
 ]

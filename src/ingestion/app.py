@@ -10,10 +10,15 @@ from typing import Any, Dict
 from fastapi import Depends, HTTPException, Request
 import uvicorn
 
-from src.core.ai_security.safety import INTERNAL_ERROR_MESSAGE
+from src.core.ai_security.armor import SecurityScreeningUnavailableError
+from src.core.ai_security.safety import (
+    INTERNAL_ERROR_MESSAGE,
+    SCREENING_UNAVAILABLE_MESSAGE,
+)
 from src.core.app_factory import create_app
 from src.core.auth import get_current_user
 from src.core.compliance.audit import emit_audit_event, hash_query
+from src.core.compliance.policy import enforce_query_rate_limit
 from src.core.config import INGESTION_PORT, is_reload_enabled
 from src.core.logger import setup_logging
 from src.core.storage import LockTimeoutError
@@ -72,6 +77,16 @@ async def ingest(
             "collection_name": payload.collection_name,
             "processed_files": payload.processed_files,
         }
+    except SecurityScreeningUnavailableError as e:
+        emit_audit_event(
+            "document.ingest",
+            severity="ERROR",
+            status="screening_unavailable",
+            reason=e.reason,
+            http_status=503,
+            uid=uid,
+        )
+        raise HTTPException(status_code=503, detail=SCREENING_UNAVAILABLE_MESSAGE)
     except LockTimeoutError as e:
         emit_audit_event(
             "document.ingest",
@@ -126,6 +141,7 @@ def query(
     query_digest = hash_query(request.query)
     query_len = len(request.query)
     try:
+        enforce_query_rate_limit(uid)
         results = search_collection(
             uid=uid,
             query=request.query,
@@ -150,6 +166,19 @@ def query(
             "results_count": len(results),
             "results": results,
         }
+    except SecurityScreeningUnavailableError as e:
+        emit_audit_event(
+            "vectorstore.query",
+            severity="ERROR",
+            status="screening_unavailable",
+            reason=e.reason,
+            http_status=503,
+            uid=uid,
+            collection_name=request.collection_name,
+            query_sha256=query_digest,
+            query_chars=query_len,
+        )
+        raise HTTPException(status_code=503, detail=SCREENING_UNAVAILABLE_MESSAGE)
     except FileNotFoundError as e:
         emit_audit_event(
             "vectorstore.query",

@@ -1375,7 +1375,568 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         self.assertEqual(comp_uncited["citation_count"], 0)
 
 
+class TestPhase4PolicyEnforcement(unittest.TestCase):
+    """Phase 4 unit tests: fail-closed Model Armor (HTTP 503), per-UID rate limits (HTTP 429), collection quotas (HTTP 403), and static policy checks."""
+
+    def setUp(self) -> None:
+        from src.agent.memory import MEMORY_SAVER
+        from src.core.compliance.policy import reset_rate_limiters
+        from src.core.storage import gcs_sync as gcs_sync_module
+
+        self.chroma_root = tempfile.mkdtemp(prefix="comp_p4_chroma_")
+        self.uploads_root = tempfile.mkdtemp(prefix="comp_p4_uploads_")
+        self.fake_bucket = _VersionedFakeGCSBucket("interactive-rag-p4-bucket")
+        self.captured_events: list[dict] = []
+        self._unsubscribe = register_audit_listener(self.captured_events.append)
+
+        MEMORY_SAVER.storage.clear()
+        MEMORY_SAVER.writes.clear()
+        MEMORY_SAVER.blobs.clear()
+        armor_module._model_armor_clients.clear()
+        reset_rate_limiters()
+
+        self._env_patcher = patch.dict(
+            os.environ,
+            {
+                "LOCAL_CHROMA_ROOT": self.chroma_root,
+                "UPLOAD_TMP_ROOT": self.uploads_root,
+                "GCS_BUCKET_NAME": self.fake_bucket.name,
+                "ARCHIVE_UPLOADS_TO_GCS": "true",
+                "AUTH_DISABLED": "true",
+                "K_SERVICE": "",
+                "DEV_USER_ID": "alice_policy",
+                "GOOGLE_CLOUD_PROJECT": "interactive-rag",
+                "GOOGLE_CLOUD_LOCATION": "us-central1",
+                "ALLOWED_LLM_MODELS": "gemini-2.5-flash,gemini-2.5-pro",
+                "ALLOWED_EMBEDDING_MODELS": "gemini-embedding-001",
+                "MODEL_ARMOR_TEMPLATE_ID": "",
+                "MODEL_ARMOR_LOCATION": "us-central1",
+                "MODEL_ARMOR_FAIL_CLOSED": "false",
+                "RATE_LIMIT_INGEST_PER_MINUTE": "10",
+                "RATE_LIMIT_QUERY_PER_MINUTE": "30",
+                "MAX_COLLECTIONS_PER_USER": "20",
+                "AUDIT_CLOUD_LOGGING_ENABLED": "false",
+            },
+            clear=False,
+        )
+        self._env_patcher.start()
+
+        self._bucket_patcher = patch.object(
+            gcs_sync_module, "_get_bucket", return_value=self.fake_bucket
+        )
+        self._bucket_patcher.start()
+
+        self._emb_patcher = patch.object(
+            chroma_module,
+            "GoogleGenerativeAIEmbeddings",
+            return_value=DeterministicFakeEmbeddings(),
+        )
+        self._emb_patcher.start()
+
+        self.created_llms: list[GroundedCitingChatModel] = []
+
+        def _make_llm(**kwargs):
+            inst = GroundedCitingChatModel(**kwargs)
+            self.created_llms.append(inst)
+            return inst
+
+        self._llm_patcher = patch.object(
+            agent_graph_module,
+            "ChatGoogleGenerativeAI",
+            side_effect=_make_llm,
+        )
+        self._llm_patcher.start()
+
+        self.ingest_client = TestClient(ingestion_app_module.app)
+        self.agent_client = TestClient(agent_app_module.app)
+
+    def tearDown(self) -> None:
+        from src.agent.memory import MEMORY_SAVER
+        from src.core.compliance.policy import reset_rate_limiters
+
+        self._unsubscribe()
+        self._llm_patcher.stop()
+        self._emb_patcher.stop()
+        self._bucket_patcher.stop()
+        self._env_patcher.stop()
+        MEMORY_SAVER.storage.clear()
+        MEMORY_SAVER.writes.clear()
+        MEMORY_SAVER.blobs.clear()
+        armor_module._model_armor_clients.clear()
+        reset_rate_limiters()
+        if os.path.exists(self.chroma_root):
+            for entry in os.scandir(self.chroma_root):
+                if entry.is_dir():
+                    release_client_cache(entry.path)
+            shutil.rmtree(self.chroma_root, ignore_errors=True)
+        shutil.rmtree(self.uploads_root, ignore_errors=True)
+
+    def test_fail_closed_model_armor_returns_503_and_audits_vs_local_fail_open_fallback(
+        self,
+    ) -> None:
+        import json
+
+        from src.core.ai_security.safety import SCREENING_UNAVAILABLE_MESSAGE
+        from tests.ai_security import _clean_output_response
+
+        # Seed a collection under local fail-open mode (MODEL_ARMOR_FAIL_CLOSED="false", template unset)
+        r_seed = self.ingest_client.post(
+            "/ingest",
+            data={"collection_name": "policy_docs"},
+            files=[
+                (
+                    "files",
+                    (
+                        "report.pdf",
+                        make_test_pdf("Confidential SSN 123-45-6789 revenue summary."),
+                        "application/pdf",
+                    ),
+                )
+            ],
+        )
+        self.assertEqual(r_seed.status_code, 200)
+
+        # 1. Local fail-open mode (MODEL_ARMOR_FAIL_CLOSED="false", template unset) -> HTTP 200
+        r_local_q = self.ingest_client.post(
+            "/query",
+            json={"query": "revenue summary", "collection_name": "policy_docs"},
+        )
+        self.assertEqual(r_local_q.status_code, 200)
+        r_local_a = self.agent_client.post(
+            "/agent",
+            json={"query": "Summarize revenue", "collection_name": "policy_docs", "thread_id": "local-ok"},
+        )
+        self.assertEqual(r_local_a.status_code, 200)
+        self.created_llms.clear()
+
+        # 2. Fail-closed mode with missing MODEL_ARMOR_TEMPLATE_ID -> HTTP 503 on /agent, /agent/stream, and /query
+        with patch.dict(
+            os.environ,
+            {"MODEL_ARMOR_FAIL_CLOSED": "true", "MODEL_ARMOR_TEMPLATE_ID": ""},
+            clear=False,
+        ):
+            self.captured_events.clear()
+            r_fc_agent = self.agent_client.post(
+                "/agent",
+                json={"query": "Summarize revenue", "collection_name": "policy_docs", "thread_id": "fc-missing"},
+            )
+            self.assertEqual(r_fc_agent.status_code, 503)
+            self.assertEqual(r_fc_agent.json()["detail"], SCREENING_UNAVAILABLE_MESSAGE)
+            self.assertEqual(sum(m.invocations for m in self.created_llms), 0)
+            self.assertTrue(
+                any(
+                    e["event_type"] == "agent.query"
+                    and e.get("status") == "screening_unavailable"
+                    and e.get("http_status") == 503
+                    for e in self.captured_events
+                )
+            )
+
+            self.captured_events.clear()
+            r_fc_stream = self.agent_client.post(
+                "/agent/stream",
+                json={"query": "Summarize revenue", "collection_name": "policy_docs", "thread_id": "fc-missing-sse"},
+            )
+            self.assertEqual(r_fc_stream.status_code, 503)
+            self.assertEqual(r_fc_stream.json()["detail"], SCREENING_UNAVAILABLE_MESSAGE)
+
+            self.captured_events.clear()
+            r_fc_query = self.ingest_client.post(
+                "/query",
+                json={"query": "revenue summary", "collection_name": "policy_docs"},
+            )
+            self.assertEqual(r_fc_query.status_code, 503)
+            self.assertEqual(r_fc_query.json()["detail"], SCREENING_UNAVAILABLE_MESSAGE)
+            self.assertNotIn("123-45-6789", r_fc_query.text)
+            self.assertTrue(
+                any(
+                    e["event_type"] == "vectorstore.query"
+                    and e.get("status") == "screening_unavailable"
+                    and e.get("http_status") == 503
+                    for e in self.captured_events
+                )
+            )
+
+        # 3. Fail-closed mode with configured template when Model Armor / DLP raises upstream API errors
+        template_id = "projects/interactive-rag/locations/us-central1/templates/rag-guard"
+        mock_armor = MagicMock()
+
+        with patch.dict(
+            os.environ,
+            {"MODEL_ARMOR_FAIL_CLOSED": "true", "MODEL_ARMOR_TEMPLATE_ID": template_id},
+            clear=False,
+        ), patch.object(armor_module, "_get_model_armor_client", return_value=mock_armor):
+            # 3a. Prompt screening error -> HTTP 503, zero Gemini invocations
+            self.created_llms.clear()
+            self.captured_events.clear()
+            mock_armor.sanitize_user_prompt.side_effect = RuntimeError("Model Armor PSC timeout")
+            r_prompt_err = self.agent_client.post(
+                "/agent",
+                json={"query": "Summarize revenue", "collection_name": "policy_docs", "thread_id": "fc-prompt-err"},
+            )
+            self.assertEqual(r_prompt_err.status_code, 503)
+            self.assertEqual(r_prompt_err.json()["detail"], SCREENING_UNAVAILABLE_MESSAGE)
+            self.assertEqual(sum(m.invocations for m in self.created_llms), 0)
+            self.assertTrue(
+                any(e["event_type"] == "security.prompt_screening_error" for e in self.captured_events)
+            )
+
+            # 3b. Chunk sanitization error on /query -> HTTP 503, zero raw chunk leakage
+            self.captured_events.clear()
+            mock_armor.sanitize_model_response.side_effect = RuntimeError("Cloud DLP backend unavailable")
+            r_chunk_err = self.ingest_client.post(
+                "/query",
+                json={"query": "revenue summary", "collection_name": "policy_docs"},
+            )
+            self.assertEqual(r_chunk_err.status_code, 503)
+            self.assertEqual(r_chunk_err.json()["detail"], SCREENING_UNAVAILABLE_MESSAGE)
+            self.assertNotIn("123-45-6789", r_chunk_err.text)
+            self.assertTrue(
+                any(e["event_type"] == "security.chunk_screening_error" for e in self.captured_events)
+            )
+
+            # 3c. Output sanitization error on /agent (stream=False) -> HTTP 503, zero raw answer leakage
+            self.captured_events.clear()
+            mock_armor.sanitize_user_prompt.side_effect = None
+            mock_armor.sanitize_user_prompt.return_value = _clean_prompt_response()
+            mock_armor.sanitize_model_response.side_effect = [
+                _clean_output_response(),
+                RuntimeError("Output DLP timeout"),
+            ]
+            r_out_err = self.agent_client.post(
+                "/agent",
+                json={"query": "Summarize revenue", "collection_name": "policy_docs", "thread_id": "fc-out-err"},
+            )
+            self.assertEqual(r_out_err.status_code, 503)
+            self.assertEqual(r_out_err.json()["detail"], SCREENING_UNAVAILABLE_MESSAGE)
+            self.assertNotIn("123-45-6789", r_out_err.text)
+            self.assertTrue(
+                any(e["event_type"] == "security.output_screening_error" for e in self.captured_events)
+            )
+
+            # 3d. Mid-stream screening error on /agent/stream (both chunk DLP failure and output DLP failure) -> SSE error frame with http_status=503
+            for err_thread, side_effects in (
+                ("fc-sse-chunk-err", [RuntimeError("Mid-stream chunk DLP failure")]),
+                (
+                    "fc-sse-out-err",
+                    [
+                        _dlp_redacted_output_response(
+                            "Confidential SSN [US_SOCIAL_SECURITY_NUMBER] revenue summary."
+                        ),
+                        RuntimeError("Mid-stream output DLP failure"),
+                    ],
+                ),
+            ):
+                self.captured_events.clear()
+                mock_armor.sanitize_model_response.side_effect = side_effects
+                r_sse_fc = self.agent_client.post(
+                    "/agent/stream",
+                    json={"query": "Summarize revenue", "collection_name": "policy_docs", "thread_id": err_thread},
+                )
+                self.assertEqual(r_sse_fc.status_code, 200)
+                self.assertNotIn("123-45-6789", r_sse_fc.text)
+                sse_payloads = [
+                    json.loads(line[len("data: ") :])
+                    for line in r_sse_fc.text.splitlines()
+                    if line.startswith("data: ") and line != "data: [DONE]"
+                ]
+                err_frames = [p for p in sse_payloads if p.get("event") == "error"]
+                self.assertEqual(len(err_frames), 1)
+                self.assertEqual(err_frames[0].get("http_status"), 503)
+                self.assertEqual(err_frames[0].get("error"), SCREENING_UNAVAILABLE_MESSAGE)
+                self.assertTrue(
+                    any(
+                        e["event_type"] == "agent.query"
+                        and e.get("status") == "screening_unavailable"
+                        and e.get("http_status") == 503
+                        for e in self.captured_events
+                    )
+                )
+
+    def test_per_user_sliding_window_rate_limits_enforce_429_retry_after_and_tenant_isolation(
+        self,
+    ) -> None:
+        from src.core.compliance.policy import SlidingWindowRateLimiter
+
+        # Deterministic clock check on SlidingWindowRateLimiter window rollover
+        fake_now = [100.0]
+        limiter = SlidingWindowRateLimiter(window_seconds=60.0, clock=lambda: fake_now[0])
+        self.assertEqual(limiter.check_and_record("u1", 2), (True, 0))
+        fake_now[0] = 115.0
+        self.assertEqual(limiter.check_and_record("u1", 2), (True, 0))
+        fake_now[0] = 120.0
+        allowed, retry_after = limiter.check_and_record("u1", 2)
+        self.assertFalse(allowed)
+        self.assertEqual(retry_after, 40)
+        fake_now[0] = 160.1
+        self.assertEqual(limiter.check_and_record("u1", 2), (True, 0))
+
+        # End-to-end API rate-limit enforcement on /ingest, /query, and /agent with per-UID isolation
+        with patch.dict(
+            os.environ,
+            {
+                "RATE_LIMIT_INGEST_PER_MINUTE": "2",
+                "RATE_LIMIT_QUERY_PER_MINUTE": "3",
+            },
+            clear=False,
+        ):
+            for idx in range(2):
+                res = self.ingest_client.post(
+                    "/ingest",
+                    headers={"X-Dev-User-Id": "alice_policy"},
+                    data={"collection_name": "rate_col"},
+                    files=[
+                        (
+                            "files",
+                            (f"doc_{idx}.pdf", make_test_pdf(f"Batch {idx}"), "application/pdf"),
+                        )
+                    ],
+                )
+                self.assertEqual(res.status_code, 200)
+
+            self.captured_events.clear()
+            uploads_before = [
+                b.name
+                for b in self.fake_bucket.list_blobs(prefix="users/alice_policy/uploads/")
+            ]
+            res_ing_429 = self.ingest_client.post(
+                "/ingest",
+                headers={"X-Dev-User-Id": "alice_policy"},
+                data={"collection_name": "rate_col"},
+                files=[
+                    (
+                        "files",
+                        ("blocked.pdf", make_test_pdf("Should not upload"), "application/pdf"),
+                    )
+                ],
+            )
+            self.assertEqual(res_ing_429.status_code, 429)
+            self.assertGreaterEqual(int(res_ing_429.headers.get("retry-after", "0")), 1)
+            uploads_after = [
+                b.name
+                for b in self.fake_bucket.list_blobs(prefix="users/alice_policy/uploads/")
+            ]
+            self.assertEqual(
+                uploads_before,
+                uploads_after,
+                "Rate-limited /ingest request must be rejected before archiving PDFs to GCS",
+            )
+            rl_ing_events = [
+                e for e in self.captured_events if e["event_type"] == "policy.rate_limit_exceeded"
+            ]
+            self.assertEqual(len(rl_ing_events), 1)
+            self.assertEqual(rl_ing_events[0]["scope"], "ingest")
+            self.assertEqual(rl_ing_events[0]["uid"], "alice_policy")
+            self.assertEqual(rl_ing_events[0]["limit_per_minute"], 2)
+
+            # Tenant isolation: bob_policy has an independent ingest bucket
+            res_bob_ing = self.ingest_client.post(
+                "/ingest",
+                headers={"X-Dev-User-Id": "bob_policy"},
+                data={"collection_name": "bob_rate_col"},
+                files=[("files", ("bob.pdf", make_test_pdf("Bob doc"), "application/pdf"))],
+            )
+            self.assertEqual(res_bob_ing.status_code, 200)
+
+            # Query rate limit across /query and /agent (shared query ceiling = 3/min)
+            self.assertEqual(
+                self.ingest_client.post(
+                    "/query",
+                    headers={"X-Dev-User-Id": "alice_policy"},
+                    json={"query": "Batch", "collection_name": "rate_col"},
+                ).status_code,
+                200,
+            )
+            self.assertEqual(
+                self.agent_client.post(
+                    "/agent",
+                    headers={"X-Dev-User-Id": "alice_policy"},
+                    json={"query": "Batch", "collection_name": "rate_col", "thread_id": "q2"},
+                ).status_code,
+                200,
+            )
+            self.assertEqual(
+                self.agent_client.post(
+                    "/agent/stream",
+                    headers={"X-Dev-User-Id": "alice_policy"},
+                    json={"query": "Batch", "collection_name": "rate_col", "thread_id": "q3"},
+                ).status_code,
+                200,
+            )
+
+            self.captured_events.clear()
+            res_q_429 = self.agent_client.post(
+                "/agent",
+                headers={"X-Dev-User-Id": "alice_policy"},
+                json={"query": "Fourth query", "collection_name": "rate_col", "thread_id": "q4"},
+            )
+            self.assertEqual(res_q_429.status_code, 429)
+            self.assertGreaterEqual(int(res_q_429.headers.get("retry-after", "0")), 1)
+            rl_q_events = [
+                e for e in self.captured_events if e["event_type"] == "policy.rate_limit_exceeded"
+            ]
+            self.assertEqual(len(rl_q_events), 1)
+            self.assertEqual(rl_q_events[0]["scope"], "query")
+            self.assertEqual(rl_q_events[0]["limit_per_minute"], 3)
+
+            # Bob remains unaffected on /query
+            self.assertEqual(
+                self.ingest_client.post(
+                    "/query",
+                    headers={"X-Dev-User-Id": "bob_policy"},
+                    json={"query": "Bob", "collection_name": "bob_rate_col"},
+                ).status_code,
+                200,
+            )
+
+    def test_collection_quota_blocks_new_collections_at_cap_while_allowing_existing_collection_appends(
+        self,
+    ) -> None:
+        with patch.dict(os.environ, {"MAX_COLLECTIONS_PER_USER": "2"}, clear=False):
+            # Create 2 collections (reaches cap of 2)
+            for col in ("col_one", "col_two"):
+                res = self.ingest_client.post(
+                    "/ingest",
+                    headers={"X-Dev-User-Id": "alice_policy"},
+                    data={"collection_name": col},
+                    files=[("files", (f"{col}.pdf", make_test_pdf(f"Seed {col}"), "application/pdf"))],
+                )
+                self.assertEqual(res.status_code, 200, res.text)
+
+            # Creating a 3rd brand-new collection returns HTTP 403 + audit event without archiving orphaned PDFs
+            self.captured_events.clear()
+            uploads_before = [
+                b.name
+                for b in self.fake_bucket.list_blobs(prefix="users/alice_policy/uploads/")
+            ]
+            res_over_cap = self.ingest_client.post(
+                "/ingest",
+                headers={"X-Dev-User-Id": "alice_policy"},
+                data={"collection_name": "col_three"},
+                files=[("files", ("orphan.pdf", make_test_pdf("Over quota"), "application/pdf"))],
+            )
+            self.assertEqual(res_over_cap.status_code, 403)
+            uploads_after = [
+                b.name
+                for b in self.fake_bucket.list_blobs(prefix="users/alice_policy/uploads/")
+            ]
+            self.assertEqual(uploads_before, uploads_after)
+            quota_events = [
+                e for e in self.captured_events if e["event_type"] == "policy.collection_quota_exceeded"
+            ]
+            self.assertEqual(len(quota_events), 1)
+            self.assertEqual(quota_events[0]["uid"], "alice_policy")
+            self.assertEqual(quota_events[0]["collection_name"], "col_three")
+            self.assertEqual(quota_events[0]["current_collections"], 2)
+            self.assertEqual(quota_events[0]["max_collections"], 2)
+
+            # Appending new documents to an ALREADY EXISTING collection ('col_one') succeeds with HTTP 200
+            res_append = self.ingest_client.post(
+                "/ingest",
+                headers={"X-Dev-User-Id": "alice_policy"},
+                data={"collection_name": "col_one"},
+                files=[("files", ("append.pdf", make_test_pdf("Appended content"), "application/pdf"))],
+            )
+            self.assertEqual(res_append.status_code, 200, res_append.text)
+
+            # Separate tenant ('bob_policy') has an independent collection quota
+            res_bob = self.ingest_client.post(
+                "/ingest",
+                headers={"X-Dev-User-Id": "bob_policy"},
+                data={"collection_name": "bob_col_one"},
+                files=[("files", ("bob.pdf", make_test_pdf("Bob collection"), "application/pdf"))],
+            )
+            self.assertEqual(res_bob.status_code, 200, res_bob.text)
+
+            # Deleting 'col_two' frees a slot so 'alice_policy' can now create 'col_three'
+            res_del = self.ingest_client.delete(
+                "/collections/col_two",
+                headers={"X-Dev-User-Id": "alice_policy"},
+            )
+            self.assertEqual(res_del.status_code, 200)
+
+            res_col_three = self.ingest_client.post(
+                "/ingest",
+                headers={"X-Dev-User-Id": "alice_policy"},
+                data={"collection_name": "col_three"},
+                files=[("files", ("col3.pdf", make_test_pdf("Third after delete"), "application/pdf"))],
+            )
+            self.assertEqual(res_col_three.status_code, 200, res_col_three.text)
+
+    def test_static_policy_checks_and_cloud_run_deletion_protection(self) -> None:
+        from scripts.check_static_policies import evaluate_repo_static_policies
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        ok, violations = evaluate_repo_static_policies(repo_root)
+        self.assertTrue(ok, f"Expected live repository to pass static policy checks, got: {violations}")
+        self.assertEqual(violations, [])
+
+        # Verify Makefile wires policy-check before plan and deploy
+        with open(os.path.join(repo_root, "Makefile"), encoding="utf-8") as fh:
+            makefile_text = fh.read()
+        self.assertIn("policy-check:", makefile_text)
+        self.assertIn("plan: policy-check", makefile_text)
+        self.assertIn("deploy: policy-check", makefile_text)
+
+        # Synthetic repo mutation checks: global location default, disabled fail-closed, or disabled prod deletion_protection fail
+        syn_root = tempfile.mkdtemp(prefix="comp_static_policy_")
+        try:
+            os.makedirs(os.path.join(syn_root, "src", "core"), exist_ok=True)
+            shutil.copytree(os.path.join(repo_root, "infra"), os.path.join(syn_root, "infra"))
+            shutil.copy2(
+                os.path.join(repo_root, "src", "core", "config.py"),
+                os.path.join(syn_root, "src", "core", "config.py"),
+            )
+            syn_tfvars = os.path.join(syn_root, "infra", "terraform.tfvars")
+            if os.path.exists(syn_tfvars):
+                os.remove(syn_tfvars)
+
+            # 1. Mutate Python GOOGLE_CLOUD_LOCATION fallback to 'global'
+            cfg_path = os.path.join(syn_root, "src", "core", "config.py")
+            with open(cfg_path, encoding="utf-8") as fh:
+                orig_cfg = fh.read()
+            with open(cfg_path, "w", encoding="utf-8") as fh:
+                fh.write(orig_cfg.replace('or "us-central1"', 'or "global"'))
+            ok_cfg, v_cfg = evaluate_repo_static_policies(syn_root)
+            self.assertFalse(ok_cfg)
+            self.assertTrue(any("global" in msg for msg in v_cfg), v_cfg)
+            with open(cfg_path, "w", encoding="utf-8") as fh:
+                fh.write(orig_cfg)
+
+            # 2. Mutate Cloud Run deletion_protection back to false and disable MODEL_ARMOR_FAIL_CLOSED
+            cr_path = os.path.join(syn_root, "infra", "cloud_run.tf")
+            with open(cr_path, encoding="utf-8") as fh:
+                orig_cr = fh.read()
+            mutated_cr = orig_cr.replace(
+                'deletion_protection  = var.environment == "prod"',
+                "deletion_protection  = false",
+                1,
+            ).replace(
+                "tostring(var.model_armor_fail_closed)",
+                '"false"',
+                1,
+            )
+            with open(cr_path, "w", encoding="utf-8") as fh:
+                fh.write(mutated_cr)
+            ok_cr, v_cr = evaluate_repo_static_policies(syn_root)
+            self.assertFalse(ok_cr)
+            self.assertTrue(any("deletion_protection" in msg for msg in v_cr), v_cr)
+            self.assertTrue(any("MODEL_ARMOR_FAIL_CLOSED" in msg for msg in v_cr), v_cr)
+            with open(cr_path, "w", encoding="utf-8") as fh:
+                fh.write(orig_cr)
+
+            # 3. Synthetic terraform.tfvars overriding region='eu' and model_armor_fail_closed=false
+            with open(syn_tfvars, "w", encoding="utf-8") as fh:
+                fh.write('region = "eu"\nmodel_armor_fail_closed = false\n')
+            ok_tfv, v_tfv = evaluate_repo_static_policies(syn_root)
+            self.assertFalse(ok_tfv)
+            self.assertEqual(len(v_tfv), 2, v_tfv)
+        finally:
+            shutil.rmtree(syn_root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 

@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from src.core.ai_security.armor import (
         ScreeningDecision,
+        SecurityScreeningUnavailableError,
+        ensure_screening_available,
         sanitize_chunk_text,
         sanitize_model_output,
         sanitize_retrieved_documents,
@@ -31,12 +33,15 @@ if TYPE_CHECKING:
         PROMPT_BLOCKED_MESSAGE,
         RECURSION_LIMIT_MESSAGE,
         SAFETY_REFUSAL_MESSAGE,
+        SCREENING_UNAVAILABLE_MESSAGE,
         get_gemini_safety_settings,
         is_safety_blocked,
     )
 
 _EXPORT_MAP: dict[str, str] = {
     "ScreeningDecision": "src.core.ai_security.armor",
+    "SecurityScreeningUnavailableError": "src.core.ai_security.armor",
+    "ensure_screening_available": "src.core.ai_security.armor",
     "sanitize_chunk_text": "src.core.ai_security.armor",
     "sanitize_model_output": "src.core.ai_security.armor",
     "sanitize_retrieved_documents": "src.core.ai_security.armor",
@@ -52,6 +57,7 @@ _EXPORT_MAP: dict[str, str] = {
     "PROMPT_BLOCKED_MESSAGE": "src.core.ai_security.safety",
     "RECURSION_LIMIT_MESSAGE": "src.core.ai_security.safety",
     "SAFETY_REFUSAL_MESSAGE": "src.core.ai_security.safety",
+    "SCREENING_UNAVAILABLE_MESSAGE": "src.core.ai_security.safety",
     "get_gemini_safety_settings": "src.core.ai_security.safety",
     "is_safety_blocked": "src.core.ai_security.safety",
 }

@@ -16,10 +16,18 @@ from src.agent.display import print_header
 from src.agent.memory import MEMORY_SAVER, clear_user_memory, list_user_memory_threads
 from src.agent.schemas import AgentRequest
 from src.agent.stream import SSE_HEADERS, stream_events, stream_sse
-from src.core.ai_security.safety import INTERNAL_ERROR_MESSAGE
+from src.core.ai_security.armor import (
+    SecurityScreeningUnavailableError,
+    ensure_screening_available,
+)
+from src.core.ai_security.safety import (
+    INTERNAL_ERROR_MESSAGE,
+    SCREENING_UNAVAILABLE_MESSAGE,
+)
 from src.core.app_factory import create_app
 from src.core.auth import get_current_user
 from src.core.compliance.audit import emit_audit_event, hash_query
+from src.core.compliance.policy import enforce_query_rate_limit
 from src.core.compliance.provenance import build_compliance_metadata
 from src.core.config import AGENT_PORT, is_reload_enabled
 from src.core.logger import setup_logging
@@ -42,8 +50,9 @@ def agent(
 ) -> Any:
     """Executes an Agentic RAG turn for `uid`, returning grounded JSON or an SSE `StreamingResponse`.
 
-    Pre-validates the tenant's synced ChromaDB collection before starting execution so missing
-    collections consistently return `HTTP 404` in both synchronous and streaming modes.
+    Pre-validates per-user query rate limits, Model Armor fail-closed configuration, and the
+    tenant's synced ChromaDB collection before starting execution so rate-limited, unscreened,
+    or missing-collection requests fail fast across both JSON and SSE streaming modes.
 
     Args:
         request: Validated `AgentRequest` specifying `query`, `collection_name`, models, and `stream`.
@@ -56,6 +65,9 @@ def agent(
     query_digest = hash_query(request.query)
     query_len = len(request.query)
     try:
+        enforce_query_rate_limit(uid)
+        ensure_screening_available()
+
         logger.info(
             f"Received Agentic RAG query from uid='{uid}' for collection '{request.collection_name}' "
             f"(query_sha256='{query_digest}', query_chars={query_len}, stream={request.stream})"
@@ -129,6 +141,23 @@ def agent(
             "messages": formatted_messages,
             "compliance": compliance_meta,
         }
+    except SecurityScreeningUnavailableError as e:
+        logger.error(
+            f"Fail-closed screening unavailable on /agent for uid='{uid}' (reason={e.reason})."
+        )
+        emit_audit_event(
+            "agent.query",
+            severity="ERROR",
+            status="screening_unavailable",
+            reason=e.reason,
+            http_status=503,
+            uid=uid,
+            collection_name=request.collection_name,
+            stream=request.stream,
+            query_sha256=query_digest,
+            query_chars=query_len,
+        )
+        raise HTTPException(status_code=503, detail=SCREENING_UNAVAILABLE_MESSAGE)
     except LockTimeoutError as e:
         emit_audit_event(
             "agent.query",

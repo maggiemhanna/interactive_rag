@@ -144,14 +144,14 @@ flowchart TB
   - Update `frontend/src/api.js` and `frontend/src/App.jsx`: Display AI provenance (`AI-generated` vs. `Guardrail refusal`), explicit grounding status (`Grounded · N citations` vs. `Not grounded`), all Cloud Model Armor filter actions (`Prompt Injection / Jailbreak blocked`, `Malicious URI blocked`, `RAI blocked (...)`, `PII redacted`, `Gemini Safety blocked`, or `Model Armor verified` when clean), and a **"My Data & Privacy"** modal (`GET/DELETE /compliance/my-data`).
 
 ### Phase 4: Policy Enforcement (Fail-Closed Screening, Rate Limits, Collection Quotas & Pre-Deploy Checks)
-- [ ] **Fail-Closed Model Armor Enforcement:**
+- [x] **Fail-Closed Model Armor Enforcement:**
   - Update `src/core/config.py` and `src/core/ai_security/armor.py`: Add `MODEL_ARMOR_FAIL_CLOSED` (default `"false"` locally, set to `"true"` in `infra/cloud_run.tf`). Raise `SecurityScreeningUnavailableError` on upstream Model Armor / DLP errors when fail-closed is active, returning `HTTP 503` in `src/agent/app.py` / `src/agent/stream.py` / `src/ingestion/app.py` with an audit event.
-- [ ] **Per-User Rate Limits & Collection Count Quota:**
+- [x] **Per-User Rate Limits & Collection Count Quota:**
   - Create `src/core/compliance/policy.py`:
     - Sliding-window per-UID rate limiters enforcing `RATE_LIMIT_INGEST_PER_MINUTE` (default `10`) and `RATE_LIMIT_QUERY_PER_MINUTE` (default `30`), raising `HTTP 429` with `Retry-After` header and emitting `policy.rate_limit_exceeded` audit events.
     - `enforce_collection_quota(uid, collection_name)` enforcing `MAX_COLLECTIONS_PER_USER` (default `20`) when creating a **new** collection (raising `HTTP 403` and emitting `policy.collection_quota_exceeded`), while allowing appends to existing collections.
   - Wire rate limits and collection quotas into `src/ingestion/app.py`, `src/agent/app.py`, `infra/variables.tf`, `infra/terraform.tfvars.example`, and `infra/cloud_run.tf`.
-- [ ] **Infrastructure Guardrails (`prod` Deletion Protection & `make policy-check`):**
+- [x] **Infrastructure Guardrails (`prod` Deletion Protection & `make policy-check`):**
   - Update `infra/cloud_run.tf`: Set `deletion_protection = var.environment == "prod"` on `ingestion_api`, `agent_api`, and `frontend` so live `prod` services cannot be accidentally deleted while non-prod environments stay tear-down friendly.
   - Add `policy-check` target to `Makefile` (run automatically before `make plan` and `make deploy`) combining `check-region-policy` (live GCP Organization Policy check), static verification that no Cloud Run / Python config defaults to `"global"` or disables fail-closed screening, and `make validate`.
 

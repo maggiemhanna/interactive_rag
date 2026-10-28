@@ -122,16 +122,21 @@ def _dlp_redacted_output_response(redacted_text: str) -> modelarmor_v1.SanitizeM
 
 class TestAISecuritySuite(unittest.TestCase):
     def setUp(self):
+        from src.core.compliance.policy import reset_rate_limiters
+
         self.chroma_tmp = tempfile.mkdtemp(prefix="ai_sec_chroma_")
         self.uploads_tmp = tempfile.mkdtemp(prefix="ai_sec_uploads_")
         self.fake_bucket = FakeGCSBucket("interactive-rag-sec-bucket")
         agent_graph_module.MEMORY_SAVER.storage.clear()
         armor_module._model_armor_clients.clear()
+        reset_rate_limiters()
 
         self.ingestion_client = TestClient(ingestion_module.app)
         self.agent_client = TestClient(agent_module.app)
 
     def tearDown(self):
+        from src.core.compliance.policy import reset_rate_limiters
+
         if os.path.exists(self.chroma_tmp):
             for entry in os.scandir(self.chroma_tmp):
                 if entry.is_dir():
@@ -139,6 +144,7 @@ class TestAISecuritySuite(unittest.TestCase):
             shutil.rmtree(self.chroma_tmp, ignore_errors=True)
         shutil.rmtree(self.uploads_tmp, ignore_errors=True)
         armor_module._model_armor_clients.clear()
+        reset_rate_limiters()
 
     def _env(self, **overrides) -> Dict[str, str]:
         env = {

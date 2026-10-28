@@ -41,8 +41,12 @@ max_chunks_per_ingest      = 1000
 max_query_chars            = 4000
 agent_recursion_limit      = 6
 
-# Compliance & Audit Logging
-audit_log_retention_days = 365
-audit_log_bucket_locked  = false
-lb_log_sample_rate       = 1.0
+# Compliance, Audit Logging & Policy Enforcement
+audit_log_retention_days     = 365
+audit_log_bucket_locked      = false
+lb_log_sample_rate           = 1.0
+model_armor_fail_closed      = true
+rate_limit_ingest_per_minute = 10
+rate_limit_query_per_minute  = 30
+max_collections_per_user     = 20
 

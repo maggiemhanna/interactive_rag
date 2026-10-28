@@ -110,16 +110,21 @@ def fake_verify_bearer_token(token: str) -> Dict[str, str]:
 
 class TestMultiTenantBackendAPIs(unittest.TestCase):
     def setUp(self):
+        from src.core.compliance.policy import reset_rate_limiters
+
         self.ingestion_tmp = tempfile.mkdtemp(prefix="ingest_chroma_")
         self.agent_tmp = tempfile.mkdtemp(prefix="agent_chroma_")
         self.uploads_tmp = tempfile.mkdtemp(prefix="uploads_tmp_")
         self.fake_bucket = FakeGCSBucket("interactive-rag-mt-bucket")
         agent_graph_module.MEMORY_SAVER.storage.clear()
+        reset_rate_limiters()
 
         self.ingestion_client = TestClient(ingestion_module.app)
         self.agent_client = TestClient(agent_module.app)
 
     def tearDown(self):
+        from src.core.compliance.policy import reset_rate_limiters
+
         for root in (self.ingestion_tmp, self.agent_tmp):
             if os.path.exists(root):
                 for entry in os.scandir(root):
@@ -127,6 +132,7 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
                         release_client_cache(entry.path)
                 shutil.rmtree(root, ignore_errors=True)
         shutil.rmtree(self.uploads_tmp, ignore_errors=True)
+        reset_rate_limiters()
 
     def _base_env(self, chroma_root: str, **extra) -> Dict[str, str]:
         env = {

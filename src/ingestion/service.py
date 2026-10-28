@@ -13,6 +13,7 @@ from langchain_core.documents import Document
 
 from src.core.ai_security.armor import sanitize_retrieved_documents
 from src.core.compliance.audit import hash_query
+from src.core.compliance.policy import enforce_collection_quota
 from src.core.logger import setup_logging
 from src.core.storage import (
     get_vectorstore,
@@ -78,6 +79,9 @@ def ingest_documents(
 ) -> None:
     """Indexes document chunks into `uid`'s isolated ChromaDB inside the distributed GCS write lock.
 
+    Re-verifies `MAX_COLLECTIONS_PER_USER` inside `user_write_lock` to prevent concurrent
+    multi-instance new-collection uploads from bypassing the tenant collection quota.
+
     Args:
         uid: Verified tenant user identifier.
         documents: List of split `Document` chunks to index.
@@ -85,6 +89,11 @@ def ingest_documents(
         embedding_model: Optional approved Vertex AI embedding model identifier.
     """
     with user_write_lock(uid) as persist_directory:
+        enforce_collection_quota(
+            uid=uid,
+            collection_name=collection_name,
+            persist_directory=persist_directory,
+        )
         vectorstore = index_documents(
             documents=documents,
             collection_name=collection_name,

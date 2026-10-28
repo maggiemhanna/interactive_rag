@@ -18,8 +18,13 @@ from src.agent.graph import build_agent
 from src.agent.memory import MEMORY_SAVER
 from src.agent.schemas import AgentRequest
 from src.agent.tools import get_retriever_tool
+from src.core.ai_security.armor import SecurityScreeningUnavailableError
 from src.core.ai_security.guardrails import get_bounded_recursion_limit
-from src.core.ai_security.safety import INTERNAL_ERROR_MESSAGE, RECURSION_LIMIT_MESSAGE
+from src.core.ai_security.safety import (
+    INTERNAL_ERROR_MESSAGE,
+    RECURSION_LIMIT_MESSAGE,
+    SCREENING_UNAVAILABLE_MESSAGE,
+)
 from src.core.compliance.audit import emit_audit_event, hash_query
 from src.core.compliance.provenance import build_compliance_metadata
 from src.core.config import is_cloud_run
@@ -245,7 +250,7 @@ def stream_sse(
     """Yields Server-Sent Events (`data: ...\n\n`) frames while pinning the user's Chroma cache.
 
     Emits each message event frame followed by a terminal `event="compliance"` provenance frame
-    and `data: [DONE]`, or a sanitized `event="error"` frame if an unexpected failure occurs.
+    and `data: [DONE]`, or a sanitized `event="error"` frame if screening or execution fails.
 
     Args:
         uid: Verified tenant user identifier.
@@ -311,6 +316,36 @@ def stream_sse(
                 a["filter"] + ":" + a["action"] for a in compliance_meta["guardrail_actions"]
             ],
         )
+        yield "data: [DONE]\n\n"
+    except SecurityScreeningUnavailableError as e:
+        logger.error(
+            f"Fail-closed screening unavailable during SSE stream for uid='{uid}' "
+            f"(thread_id='{scoped_thread_id}', reason={e.reason})."
+        )
+        emit_audit_event(
+            "agent.query",
+            severity="ERROR",
+            status="screening_unavailable",
+            reason=e.reason,
+            http_status=503,
+            uid=uid,
+            collection_name=request.collection_name,
+            model_name=request.model_name,
+            embedding_model=request.embedding_model,
+            stream=True,
+            query_sha256=query_digest,
+            query_chars=query_len,
+        )
+        err_data = {
+            "event": "error",
+            "http_status": 503,
+            "error": SCREENING_UNAVAILABLE_MESSAGE,
+            "message": {
+                "type": "ai",
+                "content": SCREENING_UNAVAILABLE_MESSAGE,
+            },
+        }
+        yield f"data: {json.dumps(err_data)}\n\n"
         yield "data: [DONE]\n\n"
     except Exception:
         logger.exception(

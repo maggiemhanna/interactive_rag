@@ -53,7 +53,7 @@ TF_DEPLOYER_ROLES := \
 
 PYTHON       ?= $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || command -v python3)
 
-.PHONY: help check-project check-region-policy bootstrap ensure-deployer-sa tf-init build-push build-push-local plan deploy outputs destroy fmt validate
+.PHONY: help check-project check-region-policy check-static-policy policy-check bootstrap ensure-deployer-sa tf-init build-push build-push-local plan deploy outputs destroy fmt validate
 
 help: ## Show available reproducible build & deployment commands
 	@echo "InteractiveRAG — GCP Cloud Run & Terraform Automation"
@@ -86,6 +86,14 @@ check-project:
 check-region-policy: ## Verify REGION adheres to live GCP gcp.resourceLocations Organization Policy
 	@echo "==> Verifying REGION ($(REGION)) against live GCP Organization Policy on $(PROJECT_ID)..."
 	@$(PYTHON) scripts/check_region_policy.py --project="$(PROJECT_ID)" --region="$(REGION)"
+
+check-static-policy: ## Verify static single-region defaults, fail-closed Model Armor, and prod deletion protection
+	@echo "==> Verifying static compliance & security policies..."
+	@$(PYTHON) scripts/check_static_policies.py
+
+policy-check: check-project check-region-policy check-static-policy ## Run pre-deploy Org Policy, static policy, and Terraform validation checks
+	@$(MAKE) validate
+	@echo "==> All compliance & governance pre-deploy policy checks passed."
 
 ensure-deployer-sa: check-project ## Create least-privilege Cloud Build deployer service account if missing
 	@echo "==> Ensuring Cloud Build deployer service account ($(TF_DEPLOYER_SA))..."
@@ -145,6 +153,7 @@ bootstrap: check-project ## Enable seed APIs, create GCS Terraform state bucket,
 			-target=google_artifact_registry_repository.docker_repo \
 			-var="project_id=$(PROJECT_ID)" \
 			-var="region=$(REGION)" \
+			-var="image_tag=$(IMAGE_TAG)" \
 			-auto-approve; \
 	else \
 		gcloud builds submit $(TF_DIR) \
@@ -184,7 +193,7 @@ build-push-local: check-project ## Build & push linux/amd64 images locally using
 		-t "$(REGISTRY_URL)/frontend:latest" \
 		--push .
 
-plan: check-project check-region-policy ## Preview Terraform infrastructure changes
+plan: policy-check ## Preview Terraform infrastructure changes
 	@if [ "$(TF_MODE)" = "local" ]; then \
 		GOOGLE_OAUTH_ACCESS_TOKEN="$$(gcloud auth print-access-token)" \
 		terraform -chdir=$(TF_DIR) plan \
@@ -200,7 +209,7 @@ plan: check-project check-region-policy ## Preview Terraform infrastructure chan
 			--substitutions="_TF_ACTION=plan,_TF_STATE_BUCKET=$(TF_STATE_BUCKET),_STATE_PREFIX=$(STATE_PREFIX),_PROJECT_ID=$(PROJECT_ID),_REGION=$(REGION),_IMAGE_TAG=$(IMAGE_TAG)"; \
 	fi
 
-deploy: check-project check-region-policy ## Apply full Terraform stack (GCS, IAM, Identity Platform, Cloud Run services)
+deploy: policy-check ## Apply full Terraform stack (GCS, IAM, Identity Platform, Cloud Run services)
 	@if [ "$(TF_MODE)" = "local" ]; then \
 		GOOGLE_OAUTH_ACCESS_TOKEN="$$(gcloud auth print-access-token)" \
 		terraform -chdir=$(TF_DIR) apply \
@@ -235,7 +244,10 @@ fmt: ## Format all Terraform files in infra/
 
 validate: check-project ## Validate Terraform syntax
 	@if [ "$(TF_MODE)" = "local" ]; then \
-		terraform -chdir=$(TF_DIR) init -backend=false && terraform -chdir=$(TF_DIR) validate; \
+		if [ ! -d "$(TF_DIR)/.terraform" ]; then \
+			terraform -chdir=$(TF_DIR) init -backend=false; \
+		fi; \
+		terraform -chdir=$(TF_DIR) validate; \
 	else \
 		gcloud builds submit $(TF_DIR) \
 			--project="$(PROJECT_ID)" \
