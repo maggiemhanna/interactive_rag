@@ -631,7 +631,7 @@ class TestPhase2AuditLogging(unittest.TestCase):
 
     def test_governance_terraform_audit_configs_bucket_sink_and_lb_logs(self) -> None:
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        gov_path = os.path.join(repo_root, "infra", "governance.tf")
+        gov_path = os.path.join(repo_root, "infra", "compliance.tf")
         lb_path = os.path.join(repo_root, "infra", "load_balancer.tf")
 
         with open(gov_path, encoding="utf-8") as fh:

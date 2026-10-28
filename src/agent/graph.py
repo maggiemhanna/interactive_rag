@@ -1,8 +1,8 @@
 """Hardened LangGraph Agentic RAG workflow (`START -> input_guard -> model_call <-> tools -> output_guard -> END`).
 
 Combines XML-spotlighted instruction hierarchy prompts, regional Vertex AI Gemini execution,
-explicit `HarmBlockThreshold` safety settings, and pre/post Google Cloud Model Armor + Cloud DLP
-guardrail nodes so unscreened prompts never reach Gemini and unsanitized answers never stream out.
+and pre/post Google Cloud Model Armor + Cloud DLP guardrail nodes so unscreened prompts never
+reach Gemini and unsanitized answers never stream out.
 """
 
 import os
@@ -18,11 +18,6 @@ from src.agent.memory import MEMORY_SAVER
 from src.agent.schemas import AgentState
 from src.core.ai_security.armor import sanitize_model_output, screen_user_prompt
 from src.core.ai_security.guardrails import validate_llm_model, validate_query_text
-from src.core.ai_security.safety import (
-    SAFETY_REFUSAL_MESSAGE,
-    get_gemini_safety_settings,
-    is_safety_blocked,
-)
 from src.core.compliance.audit import emit_audit_event
 from src.core.compliance.context import record_guardrail_action
 from src.core.compliance.residency import validate_gcp_region
@@ -112,7 +107,6 @@ def build_agent(
         temperature=0,
         project=os.getenv("GOOGLE_CLOUD_PROJECT"),
         location=safe_location,
-        safety_settings=get_gemini_safety_settings(),
     )
 
     tools = [retriever_tool]
@@ -158,24 +152,6 @@ def build_agent(
         system_prompt = SystemMessage(content=SYSTEM_PROMPT)
         response = model_with_tools.invoke([system_prompt] + list(state["messages"]))
 
-        if is_safety_blocked(response):
-            logger.warning(
-                "Gemini blocked model response via safety_settings; returning polite refusal fallback."
-            )
-            record_guardrail_action("gemini_safety", "blocked", stage="model")
-            emit_audit_event(
-                "security.gemini_safety_blocked",
-                severity="WARNING",
-                status="blocked",
-                model_name=safe_model_name,
-            )
-            refusal = AIMessage(
-                id=getattr(response, "id", None),
-                content=SAFETY_REFUSAL_MESSAGE,
-                response_metadata=getattr(response, "response_metadata", {}),
-            )
-            return {"pending_response": refusal}
-
         if getattr(response, "tool_calls", None):
             return {"messages": [response], "pending_response": None}
 
@@ -198,9 +174,6 @@ def build_agent(
             return {}
 
         raw_text = _extract_message_text(getattr(pending, "content", ""))
-        if is_safety_blocked(pending) and raw_text == SAFETY_REFUSAL_MESSAGE:
-            return {"messages": [pending], "pending_response": None}
-
         latest_query = _latest_human_text(state["messages"])
         decision = sanitize_model_output(raw_text, user_prompt=latest_query or None)
 

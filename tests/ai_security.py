@@ -683,18 +683,15 @@ class TestAISecuritySuite(unittest.TestCase):
             self.assertTrue(r_loop_sse.text.strip().endswith("data: [DONE]"))
 
     def test_08_gemini_safety_settings_refusal_fallback_and_sanitized_500_responses(self):
-        """Verifies HarmBlockThreshold configuration, finish_reason='SAFETY' refusal fallback, and leak-free 500s."""
+        """Verifies safety.py helpers remain reusable, build_agent omits redundant Gemini safety_settings, and 500s are leak-free."""
+        from src.core.ai_security.safety import get_gemini_safety_settings, is_safety_blocked
+
         captured_llm_kwargs = {}
 
-        class SafetyBlockedLLM:
+        class CapturingLLM(GroundedCitingChatModel):
             def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
                 captured_llm_kwargs.update(kwargs)
-
-            def bind_tools(self, tools):
-                return self
-
-            def invoke(self, messages):
-                return AIMessage(content="", response_metadata={"finish_reason": "SAFETY"})
 
         with patch.dict(
             os.environ,
@@ -703,11 +700,11 @@ class TestAISecuritySuite(unittest.TestCase):
         ), patch.object(
             chroma_module, "GoogleGenerativeAIEmbeddings", return_value=DeterministicFakeEmbeddings()
         ), patch.object(
-            agent_graph_module, "ChatGoogleGenerativeAI", side_effect=SafetyBlockedLLM
+            agent_graph_module, "ChatGoogleGenerativeAI", side_effect=CapturingLLM
         ):
             self._seed_collection("safety_col")
 
-            r_safety = self.agent_client.post(
+            r_agent = self.agent_client.post(
                 "/agent",
                 json={
                     "query": "Borderline query",
@@ -716,16 +713,22 @@ class TestAISecuritySuite(unittest.TestCase):
                     "stream": False,
                 },
             )
-            self.assertEqual(r_safety.status_code, 200)
-            self.assertEqual(r_safety.json()["answer"], SAFETY_REFUSAL_MESSAGE)
+            self.assertEqual(r_agent.status_code, 200)
+            # Content safety is enforced via Cloud Model Armor; build_agent does not attach redundant Gemini safety_settings
+            self.assertNotIn("safety_settings", captured_llm_kwargs)
 
+            # Standalone safety.py helpers remain functional for future reuse
             expected_settings = {
                 HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
                 HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
                 HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
                 HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
             }
-            self.assertEqual(captured_llm_kwargs.get("safety_settings"), expected_settings)
+            self.assertEqual(get_gemini_safety_settings(), expected_settings)
+            self.assertTrue(
+                is_safety_blocked(AIMessage(content="", response_metadata={"finish_reason": "SAFETY"}))
+            )
+            self.assertFalse(is_safety_blocked(AIMessage(content="ok", response_metadata={"finish_reason": "STOP"})))
 
             # Verify raw internal exception details never leak in HTTP 500 or SSE error payloads
             secret_exc = RuntimeError("DB_MASTER_PASSWORD_LEAK=hunter2")

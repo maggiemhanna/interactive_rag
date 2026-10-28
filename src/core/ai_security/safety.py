@@ -1,8 +1,9 @@
 """Content safety controls and standardized user-facing refusal messages (Pillar 3: AI Security).
 
-Centralizes Vertex AI Gemini `HarmCategory` / `HarmBlockThreshold` configuration,
-post-generation safety block detection (`finish_reason` and `prompt_feedback`), and
-sanitized, leak-free fallback messages shared across REST and SSE responses.
+Centralizes sanitized, leak-free fallback messages shared across REST and SSE responses.
+Also retains Vertex AI Gemini `HarmCategory` / `HarmBlockThreshold` configuration and
+post-generation safety block detection (`get_gemini_safety_settings`, `is_safety_blocked`)
+for optional/future reuse, while runtime content safety is enforced by Cloud Model Armor.
 """
 
 from typing import Any, Dict
