@@ -1032,20 +1032,36 @@ function loadStoredThreads(uid) {
     if (!parsed || !Array.isArray(parsed.threads) || parsed.threads.length === 0) {
       return null;
     }
-    const sanitizedThreads = parsed.threads.map((t) => ({
-      ...t,
-      turns: Array.isArray(t.turns)
-        ? t.turns.map((trn) =>
-            trn.status === 'streaming'
-              ? {
+    const sanitizedThreads = parsed.threads
+      .filter((t) => t && typeof t === 'object')
+      .map((t) => ({
+        ...t,
+        id: typeof t.id === 'string' && t.id ? t.id : createThreadId(),
+        title: typeof t.title === 'string' && t.title ? t.title : 'New Chat',
+        collection: typeof t.collection === 'string' ? t.collection : '',
+        turns: Array.isArray(t.turns)
+          ? t.turns
+              .filter((trn) => trn && typeof trn === 'object')
+              .map((trn) => {
+                const normalizedTurn = {
                   ...trn,
-                  status: trn.answer ? 'done' : 'error',
-                  error: trn.answer ? null : 'Response interrupted when the page reloaded.',
-                }
-              : trn
-          )
-        : [],
-    }));
+                  query: typeof trn.query === 'string' ? trn.query : String(trn.query ?? ''),
+                  answer: typeof trn.answer === 'string' ? trn.answer : String(trn.answer ?? ''),
+                  events: Array.isArray(trn.events) ? trn.events : [],
+                };
+                return normalizedTurn.status === 'streaming'
+                  ? {
+                      ...normalizedTurn,
+                      status: normalizedTurn.answer ? 'done' : 'error',
+                      error: normalizedTurn.answer
+                        ? null
+                        : 'Response interrupted when the page reloaded.',
+                    }
+                  : normalizedTurn;
+              })
+          : [],
+      }));
+    if (sanitizedThreads.length === 0) return null;
     return {
       threads: sanitizedThreads,
       activeThreadId: parsed.activeThreadId || sanitizedThreads[0].id,

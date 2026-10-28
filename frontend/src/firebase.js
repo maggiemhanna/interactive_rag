@@ -98,7 +98,14 @@ export function subscribeToAuthChanges(callback) {
     callback(null);
     return () => {};
   }
-  return onAuthStateChanged(auth, callback);
+  return onAuthStateChanged(
+    auth,
+    callback,
+    (err) => {
+      console.error('Firebase auth state listener error:', err);
+      callback(null);
+    }
+  );
 }
 
 export function formatAuthError(err) {
