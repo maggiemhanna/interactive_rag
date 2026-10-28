@@ -294,28 +294,49 @@ def _inspect_sanitization_result(
     return ScreeningDecision(allowed=True, text=original_text)
 
 
-def ensure_screening_available() -> None:
-    """Verifies Model Armor template configuration when `MODEL_ARMOR_FAIL_CLOSED=true`.
+def ensure_screening_available(
+    *,
+    stage: Optional[str] = None,
+    audit_event_type: str = "security.screening_unavailable",
+    **audit_fields: Any,
+) -> Optional[Tuple[str, str]]:
+    """Resolves the Model Armor target and enforces fail-closed availability when `MODEL_ARMOR_FAIL_CLOSED=true`.
 
-    Called prior to opening SSE streams or running vector retrieval sanitization so
-    missing or invalid Model Armor configuration fails closed immediately with HTTP 503.
+    Called prior to opening SSE streams and reused across prompt, retrieval chunk, and output
+    screening functions so missing or invalid Model Armor configuration fails closed immediately
+    with HTTP 503 (`SecurityScreeningUnavailableError`).
+
+    Args:
+        stage: Optional pipeline stage (`'input'`, `'retrieval'`, or `'output'`) recorded
+            in guardrail actions when fail-closed configuration is missing or invalid.
+        audit_event_type: Structured audit event name emitted when screening is unavailable.
+        **audit_fields: Additional PII-free metadata fields included in the audit event.
+
+    Returns:
+        Tuple of `(full_template_name, validated_gcp_region)`, or `None` when
+        `MODEL_ARMOR_TEMPLATE_ID` is unset and `MODEL_ARMOR_FAIL_CLOSED=false`.
 
     Raises:
         SecurityScreeningUnavailableError: If `MODEL_ARMOR_FAIL_CLOSED=true` and
             `MODEL_ARMOR_TEMPLATE_ID` is unset or misconfigured.
+        ValueError: If `MODEL_ARMOR_FAIL_CLOSED=false` and the configured location is invalid.
+        RuntimeError: If `MODEL_ARMOR_FAIL_CLOSED=false` and `GOOGLE_CLOUD_PROJECT` is missing for a short ID.
     """
-    if not is_model_armor_fail_closed():
-        return
-
+    fail_closed = is_model_armor_fail_closed()
     try:
         target = _resolve_model_armor_target()
     except Exception as e:
+        if not fail_closed:
+            raise
         logger.error(f"Invalid Model Armor configuration with MODEL_ARMOR_FAIL_CLOSED=true: {e}")
+        if stage:
+            record_guardrail_action("invalid_model_armor_config", "blocked", stage=stage)
         emit_audit_event(
-            "security.screening_unavailable",
+            audit_event_type,
             severity="ERROR",
             status="screening_unavailable",
             reason="invalid_model_armor_config",
+            **audit_fields,
         )
         raise SecurityScreeningUnavailableError(
             "Model Armor configuration is invalid while MODEL_ARMOR_FAIL_CLOSED=true.",
@@ -323,19 +344,30 @@ def ensure_screening_available() -> None:
         ) from e
 
     if target is None:
-        logger.error(
-            "MODEL_ARMOR_TEMPLATE_ID is unset with MODEL_ARMOR_FAIL_CLOSED=true; failing closed."
-        )
-        emit_audit_event(
-            "security.screening_unavailable",
-            severity="ERROR",
-            status="screening_unavailable",
-            reason="missing_model_armor_config",
-        )
-        raise SecurityScreeningUnavailableError(
-            "MODEL_ARMOR_TEMPLATE_ID is unset while MODEL_ARMOR_FAIL_CLOSED=true.",
-            reason="missing_model_armor_config",
-        )
+        if fail_closed:
+            logger.error(
+                "MODEL_ARMOR_TEMPLATE_ID is unset with MODEL_ARMOR_FAIL_CLOSED=true; failing closed."
+            )
+            if stage:
+                record_guardrail_action("missing_model_armor_config", "blocked", stage=stage)
+            emit_audit_event(
+                audit_event_type,
+                severity="ERROR",
+                status="screening_unavailable",
+                reason="missing_model_armor_config",
+                **audit_fields,
+            )
+            raise SecurityScreeningUnavailableError(
+                "MODEL_ARMOR_TEMPLATE_ID is unset while MODEL_ARMOR_FAIL_CLOSED=true.",
+                reason="missing_model_armor_config",
+            )
+        if is_cloud_run():
+            logger.warning(
+                f"MODEL_ARMOR_TEMPLATE_ID is unset in Cloud Run; skipping Model Armor {stage or 'security'} check."
+            )
+        return None
+
+    return target
 
 
 def screen_user_prompt(prompt: str) -> ScreeningDecision:
@@ -357,25 +389,13 @@ def screen_user_prompt(prompt: str) -> ScreeningDecision:
     prompt_digest = hash_query(prompt)
     prompt_len = len(prompt)
     fail_closed = is_model_armor_fail_closed()
-    target = _resolve_model_armor_target()
+    target = ensure_screening_available(
+        stage="input",
+        audit_event_type="security.prompt_screening_error",
+        query_sha256=prompt_digest,
+        query_chars=prompt_len,
+    )
     if target is None:
-        if fail_closed:
-            logger.error("MODEL_ARMOR_TEMPLATE_ID is unset with MODEL_ARMOR_FAIL_CLOSED=true; failing closed.")
-            record_guardrail_action("missing_model_armor_config", "blocked", stage="input")
-            emit_audit_event(
-                "security.prompt_screening_error",
-                severity="ERROR",
-                status="screening_unavailable",
-                reason="missing_model_armor_config",
-                query_sha256=prompt_digest,
-                query_chars=prompt_len,
-            )
-            raise SecurityScreeningUnavailableError(
-                "MODEL_ARMOR_TEMPLATE_ID is unset while MODEL_ARMOR_FAIL_CLOSED=true.",
-                reason="missing_model_armor_config",
-            )
-        if is_cloud_run():
-            logger.warning("MODEL_ARMOR_TEMPLATE_ID is unset in Cloud Run; skipping Model Armor prompt check.")
         return ScreeningDecision(allowed=True, text=prompt)
 
     template_name, location = target
@@ -457,24 +477,12 @@ def sanitize_model_output(
 
     output_len = len(output_text)
     fail_closed = is_model_armor_fail_closed()
-    target = _resolve_model_armor_target()
+    target = ensure_screening_available(
+        stage="output",
+        audit_event_type="security.output_screening_error",
+        output_chars=output_len,
+    )
     if target is None:
-        if fail_closed:
-            logger.error("MODEL_ARMOR_TEMPLATE_ID is unset with MODEL_ARMOR_FAIL_CLOSED=true; failing closed.")
-            record_guardrail_action("missing_model_armor_config", "blocked", stage="output")
-            emit_audit_event(
-                "security.output_screening_error",
-                severity="ERROR",
-                status="screening_unavailable",
-                reason="missing_model_armor_config",
-                output_chars=output_len,
-            )
-            raise SecurityScreeningUnavailableError(
-                "MODEL_ARMOR_TEMPLATE_ID is unset while MODEL_ARMOR_FAIL_CLOSED=true.",
-                reason="missing_model_armor_config",
-            )
-        if is_cloud_run():
-            logger.warning("MODEL_ARMOR_TEMPLATE_ID is unset in Cloud Run; skipping Model Armor output check.")
         return ScreeningDecision(allowed=True, text=output_text)
 
     template_name, location = target
@@ -616,23 +624,12 @@ def sanitize_chunk_text(chunk_text: str) -> str:
 
     chunk_len = len(chunk_text)
     fail_closed = is_model_armor_fail_closed()
-    target = _resolve_model_armor_target()
+    target = ensure_screening_available(
+        stage="retrieval",
+        audit_event_type="security.chunk_screening_error",
+        chunk_chars=chunk_len,
+    )
     if target is None:
-        if fail_closed:
-            logger.error("MODEL_ARMOR_TEMPLATE_ID is unset with MODEL_ARMOR_FAIL_CLOSED=true; failing closed.")
-            emit_audit_event(
-                "security.chunk_screening_error",
-                severity="ERROR",
-                status="screening_unavailable",
-                reason="missing_model_armor_config",
-                chunk_chars=chunk_len,
-            )
-            raise SecurityScreeningUnavailableError(
-                "Model Armor chunk sanitization failed (missing_model_armor_config).",
-                reason="missing_model_armor_config",
-            )
-        if is_cloud_run():
-            logger.warning("MODEL_ARMOR_TEMPLATE_ID is unset in Cloud Run; skipping Model Armor chunk sanitization.")
         return chunk_text
 
     template_name, location = target
@@ -694,16 +691,10 @@ def sanitize_retrieved_documents(docs: Sequence[Document]) -> List[Document]:
         SecurityScreeningUnavailableError: When `MODEL_ARMOR_FAIL_CLOSED=true` and Model Armor / Cloud DLP
             is unconfigured or unavailable.
     """
-    ensure_screening_available()
+    target = ensure_screening_available(stage="retrieval")
     if not docs:
         return []
-
-    target = _resolve_model_armor_target()
     if target is None:
-        if is_cloud_run():
-            logger.warning(
-                "MODEL_ARMOR_TEMPLATE_ID is unset in Cloud Run; skipping Model Armor chunk sanitization."
-            )
         return list(docs)
 
     if len(docs) == 1:
