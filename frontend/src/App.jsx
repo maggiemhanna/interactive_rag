@@ -1226,6 +1226,7 @@ const RAI_CATEGORY_LABELS = {
 
 function formatRaiCategory(code) {
   const key = String(code || '').trim().toUpperCase();
+  if (!key) return '';
   if (RAI_CATEGORY_LABELS[key]) return RAI_CATEGORY_LABELS[key];
   return key
     .toLowerCase()
@@ -1299,7 +1300,7 @@ function summarizeGuardrailPills(compliance) {
       const raiDetails = entry.details.map(formatRaiCategory).filter(Boolean);
       text =
         raiDetails.length > 0
-          ? `RAI blocked (${raiDetails.join(', ')})`
+          ? `RAI Safety blocked: ${raiDetails.join(', ')}`
           : 'RAI Safety blocked';
     } else if (entry.filter === 'sdp') {
       text = 'Sensitive Data blocked';
@@ -1318,11 +1319,14 @@ function summarizeGuardrailPills(compliance) {
           ? 'Input validation policy'
           : 'Google Cloud Model Armor';
 
+    const detailSuffix =
+      entry.details.length > 0 ? ` · Subcategories: ${entry.details.join(', ')}` : '';
+
     pills.push({
       key,
       variant: 'guardrail-blocked',
       text,
-      title: `Blocked by ${provider}${stageNote}`,
+      title: `Blocked by ${provider}${stageNote}${detailSuffix}`,
     });
   }
 

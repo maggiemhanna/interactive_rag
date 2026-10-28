@@ -1306,8 +1306,9 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
                         rai_filter_result=modelarmor_v1.RaiFilterResult(
                             match_state=modelarmor_v1.FilterMatchState.MATCH_FOUND,
                             rai_filter_type_results={
+                                # Live Model Armor wire format omits filter_type (defaults to RAI_FILTER_TYPE_UNSPECIFIED)
+                                # and carries the subcategory identifier in the map key:
                                 "harassment": modelarmor_v1.RaiFilterResult.RaiFilterTypeResult(
-                                    filter_type=modelarmor_v1.RaiFilterType.HARASSMENT,
                                     match_state=modelarmor_v1.FilterMatchState.MATCH_FOUND,
                                 ),
                                 "dangerous": modelarmor_v1.RaiFilterResult.RaiFilterTypeResult(
@@ -1315,7 +1316,6 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
                                     match_state=modelarmor_v1.FilterMatchState.MATCH_FOUND,
                                 ),
                                 "hate_speech": modelarmor_v1.RaiFilterResult.RaiFilterTypeResult(
-                                    filter_type=modelarmor_v1.RaiFilterType.HATE_SPEECH,
                                     match_state=modelarmor_v1.FilterMatchState.NO_MATCH_FOUND,
                                 ),
                             },

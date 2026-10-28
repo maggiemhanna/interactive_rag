@@ -164,6 +164,11 @@ def _has_proto_field(msg: Any, field_name: str) -> bool:
 def _extract_matched_rai_types(rai_res: Any) -> Tuple[str, ...]:
     """Extracts matched Responsible AI subcategory names from a Model Armor `RaiFilterResult`.
 
+    Handles both explicit `entry.filter_type` enum values and live Model Armor map responses
+    where `entry.filter_type` defaults to `RAI_FILTER_TYPE_UNSPECIFIED` and the subcategory
+    identifier is carried in the `rai_filter_type_results` map key (e.g., `'hate_speech'`,
+    `'harassment'`, `'sexually_explicit'`, `'dangerous'`).
+
     Args:
         rai_res: `modelarmor_v1.RaiFilterResult` message from `filter_results`.
 
@@ -177,10 +182,11 @@ def _extract_matched_rai_types(rai_res: Any) -> Tuple[str, ...]:
         for key, entry in type_results.items():
             if getattr(entry, "match_state", None) == match_found:
                 ft = getattr(entry, "filter_type", None)
-                raw_name = getattr(ft, "name", None) or str(key)
-                cleaned = raw_name.strip().upper()
-                if cleaned and cleaned not in {"RAI_FILTER_TYPE_UNSPECIFIED", "0", "NONE"}:
-                    matched.append(cleaned)
+                ft_name = (getattr(ft, "name", None) or "").strip().upper()
+                if ft_name in {"", "RAI_FILTER_TYPE_UNSPECIFIED", "0", "NONE"}:
+                    ft_name = str(key).strip().upper()
+                if ft_name and ft_name not in {"RAI_FILTER_TYPE_UNSPECIFIED", "0", "NONE"}:
+                    matched.append(ft_name)
     return tuple(sorted(set(matched)))
 
 
