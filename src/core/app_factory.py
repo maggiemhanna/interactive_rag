@@ -1,7 +1,7 @@
 """Shared FastAPI application factory for InteractiveRAG microservices.
 
 Constructs standardized FastAPI instances (`ingestion-api` and `agent-api`) wired with
-CORS origin policies, `AuditCorrelationMiddleware` (`X-Request-Id` / `X-Cloud-Trace-Context`),
+CORS origin policies, `RequestCorrelationMiddleware` (`X-Request-Id` / `X-Cloud-Trace-Context`),
 unauthenticated `/health` readiness probes, shared `/collections` endpoints, and GDPR
 `/compliance/my-data` DSAR routes.
 """
@@ -12,9 +12,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import src.core.config  # noqa: F401 - ensures .env files are loaded
-from src.core.compliance.audit import AuditCorrelationMiddleware
 from src.core.compliance.routes import build_compliance_router
 from src.core.config import get_allowed_origins
+from src.core.context import RequestCorrelationMiddleware
 from src.core.storage.routes import collections_router
 
 
@@ -47,7 +47,7 @@ def create_app(
         allow_headers=["*"],
         expose_headers=["X-Request-Id"],
     )
-    app.add_middleware(AuditCorrelationMiddleware, service_name=service_name)
+    app.add_middleware(RequestCorrelationMiddleware, service_name=service_name)
 
     @app.get("/health")
     def health_check() -> Dict[str, str]:

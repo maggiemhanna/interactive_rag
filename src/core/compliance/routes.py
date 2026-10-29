@@ -12,8 +12,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from src.core.ai_security.safety import INTERNAL_ERROR_MESSAGE
 from src.core.auth import get_current_user
 from src.core.compliance.audit import emit_audit_event
-from src.core.compliance.context import get_request_id
 from src.core.compliance.dsar import get_user_data_inventory, purge_all_user_data
+from src.core.context import get_request_id
 from src.core.logger import setup_logging
 from src.core.storage.locks import LockTimeoutError
 

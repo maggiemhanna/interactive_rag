@@ -18,8 +18,8 @@ from firebase_admin import auth as firebase_auth
 from pydantic import BaseModel
 
 from src.core.compliance.audit import emit_audit_event
-from src.core.compliance.context import set_audit_uid
 from src.core.config import get_allowed_origins, is_cloud_run
+from src.core.context import set_request_uid
 from src.core.logger import setup_logging
 
 logger = setup_logging(name="auth")
@@ -279,7 +279,7 @@ def get_current_user_info(
     if is_auth_bypassed():
         raw_dev_uid = (x_dev_user_id or os.getenv("DEV_USER_ID", "local-dev")).strip()
         uid = validate_uid(raw_dev_uid)
-        set_audit_uid(uid)
+        set_request_uid(uid)
         return AuthenticatedUser(
             uid=uid,
             email=f"{uid}@local.dev",
@@ -290,7 +290,7 @@ def get_current_user_info(
     claims = verify_bearer_token(token)
     raw_uid = claims.get("uid") or claims.get("sub")
     uid = validate_uid(raw_uid)
-    set_audit_uid(uid)
+    set_request_uid(uid)
 
     return AuthenticatedUser(
         uid=uid,

@@ -1,11 +1,10 @@
-"""Structured compliance audit logging and ASGI request correlation middleware (Pillar 4: Compliance & Governance).
+"""Structured compliance audit logging for InteractiveRAG (Pillar 4: Compliance & Governance).
 
 Publishes PII-free, SHA-256 query-scrubbed audit records to Google Cloud Logging (`interactiverag-audit`)
 with automatic Cloud Trace correlation and graceful stdout JSON fallback when running offline.
 """
 
 from datetime import datetime, timezone
-import hashlib
 import json
 import os
 import sys
@@ -15,16 +14,8 @@ import uuid
 
 from google.cloud import logging as cloud_logging
 
-from src.core.compliance.context import (
-    AuditRequestState,
-    bind_audit_state,
-    extract_trace_id,
-    get_audit_state,
-    get_service_name,
-    reset_audit_state,
-    sanitize_request_id,
-)
 from src.core.config import get_google_cloud_location
+from src.core.context import get_request_context, get_service_name, hash_query
 from src.core.logger import setup_logging
 
 logger = setup_logging(name="audit")
@@ -34,19 +25,6 @@ DEFAULT_AUDIT_LOG_NAME = "interactiverag-audit"
 _cloud_loggers: Dict[Tuple[str, str], Any] = {}
 _cloud_loggers_lock = threading.Lock()
 _audit_listeners: List[Callable[[Dict[str, Any]], None]] = []
-
-
-def hash_query(text: Optional[str]) -> str:
-    """Computes a deterministic SHA-256 hex digest of query text without storing raw PII.
-
-    Args:
-        text: Raw user query or prompt string.
-
-    Returns:
-        64-character lowercase hexadecimal SHA-256 digest of the UTF-8 trimmed text.
-    """
-    normalized = (text or "").strip().encode("utf-8")
-    return hashlib.sha256(normalized).hexdigest()
 
 
 def get_audit_log_name() -> str:
@@ -132,7 +110,7 @@ def emit_audit_event(
     """Emits a structured, PII-free compliance audit record to GCP Cloud Logging (`interactiverag-audit`).
 
     Automatically enriches the record with `request_id`, `trace_id`, `service`, `region`,
-    `http_method`, `http_path`, and `uid` from the active request context, scrubs any raw
+    `http_method`, `http_path`, and `uid` from the active `RequestContext`, scrubs any raw
     `query`/`prompt` keyword arguments into `query_sha256` + `query_chars`, and falls back to
     structured stdout JSON when Cloud Logging is disabled or unreachable.
 
@@ -146,7 +124,7 @@ def emit_audit_event(
     Returns:
         Complete structured audit record dictionary that was published.
     """
-    state = get_audit_state()
+    state = get_request_context()
     project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
     resolved_uid = uid or (state.uid if state is not None else None)
     request_id = state.request_id if state is not None else f"req-{uuid.uuid4().hex}"
@@ -217,79 +195,7 @@ def emit_audit_event(
     return record
 
 
-class AuditCorrelationMiddleware:
-    """Pure ASGI middleware propagating `X-Request-Id` and `X-Cloud-Trace-Context` across REST and SSE routes.
-
-    Implemented as a raw ASGI middleware (rather than `BaseHTTPMiddleware`) so `ContextVar`
-    state stays bound for the full lifetime of streaming `StreamingResponse` generators.
-    """
-
-    def __init__(self, app: Any, service_name: str) -> None:
-        """Initializes the correlation middleware for a FastAPI/ASGI service.
-
-        Args:
-            app: Downstream ASGI application.
-            service_name: Logical service name recorded in audit events (`'ingestion-api'` or `'agent-api'`).
-        """
-        self.app = app
-        self.service_name = service_name
-
-    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
-        """Intercepts HTTP requests, binds `AuditRequestState`, and injects `X-Request-Id` on responses."""
-        if scope.get("type") != "http":
-            await self.app(scope, receive, send)
-            return
-
-        raw_headers: Dict[bytes, bytes] = {}
-        for k, v in scope.get("headers") or []:
-            if k not in raw_headers:
-                raw_headers[k.lower()] = v
-
-        raw_req_id = (
-            raw_headers.get(b"x-request-id", b"").decode("latin-1", errors="ignore")
-            if b"x-request-id" in raw_headers
-            else None
-        )
-        raw_trace = (
-            raw_headers.get(b"x-cloud-trace-context", b"").decode("latin-1", errors="ignore")
-            if b"x-cloud-trace-context" in raw_headers
-            else None
-        )
-
-        request_id = sanitize_request_id(raw_req_id)
-        trace_id = extract_trace_id(raw_trace)
-        method = str(scope.get("method") or "")
-        path = str(scope.get("path") or "")
-
-        state = AuditRequestState(
-            request_id=request_id,
-            trace_id=trace_id,
-            service_name=self.service_name,
-            method=method,
-            path=path,
-        )
-        token = bind_audit_state(state)
-
-        async def send_with_request_id(message: Dict[str, Any]) -> None:
-            """Injects the canonical `X-Request-Id` header into `http.response.start` frames."""
-            if message.get("type") == "http.response.start":
-                headers = [
-                    (hk, hv)
-                    for hk, hv in list(message.get("headers") or [])
-                    if hk.lower() != b"x-request-id"
-                ]
-                headers.append((b"x-request-id", request_id.encode("latin-1")))
-                message = {**message, "headers": headers}
-            await send(message)
-
-        try:
-            await self.app(scope, receive, send_with_request_id)
-        finally:
-            reset_audit_state(token)
-
-
 __all__ = [
-    "AuditCorrelationMiddleware",
     "DEFAULT_AUDIT_LOG_NAME",
     "emit_audit_event",
     "get_audit_log_name",

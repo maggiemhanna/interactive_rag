@@ -21,7 +21,7 @@ from src.core.ai_security.guardrails import (
     validate_collection_name,
     validate_embedding_model,
 )
-from src.core.compliance.context import record_retrieved_chunks
+from src.core.compliance.state import record_retrieved_chunks
 from src.core.storage import get_vectorstore, require_collection
 
 EMPTY_RETRIEVAL_MARKER = (

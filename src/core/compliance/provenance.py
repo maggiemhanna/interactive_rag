@@ -1,8 +1,8 @@
 """EU AI Act Art. 50 AI transparency, citation grounding, and Model Armor provenance (Pillar 4: Compliance & Governance).
 
 Evaluates final agent responses against retrieved document passages, counts inline `[source, p.X]`
-citations, and packages machine-readable provenance and guardrail telemetry for both standard JSON
-responses (`POST /agent`) and live SSE streams (`POST /agent/stream`).
+citations, and packages machine-readable provenance metadata (`ComplianceMetadata`) for JSON
+(`POST /agent`) and SSE (`POST /agent/stream`) responses.
 """
 
 import re
@@ -11,14 +11,15 @@ from typing import Any, Dict, List, Optional, Sequence
 from pydantic import BaseModel, Field
 
 from src.core.ai_security.guardrails import validate_llm_model
-from src.core.compliance.context import (
+from src.core.compliance.residency import validate_gcp_region
+from src.core.compliance.state import (
+    GUARDRAIL_FILTER_LABELS,
     get_guardrail_actions,
-    get_request_id,
     get_retrieved_chunks_count,
     was_model_armor_active,
     was_pii_filtered,
 )
-from src.core.compliance.residency import validate_gcp_region
+from src.core.context import get_request_id
 
 MODEL_ARMOR_DEFAULT_FILTERS: List[str] = [
     "pi_and_jailbreak",
@@ -206,9 +207,18 @@ def build_compliance_metadata(
 
 __all__ = [
     "ComplianceMetadata",
+    "GUARDRAIL_FILTER_LABELS",
     "GuardrailAction",
     "MODEL_ARMOR_DEFAULT_FILTERS",
     "build_compliance_metadata",
     "count_inline_citations",
+    "get_guardrail_actions",
+    "get_retrieved_chunks_count",
     "has_thread_retrieved_chunks",
+    "mark_model_armor_active",
+    "mark_pii_filtered",
+    "record_guardrail_action",
+    "record_retrieved_chunks",
+    "was_model_armor_active",
+    "was_pii_filtered",
 ]

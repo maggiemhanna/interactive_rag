@@ -27,12 +27,12 @@ from src.core.ai_security.safety import (
     SAFETY_REFUSAL_MESSAGE,
 )
 from src.core.compliance.audit import emit_audit_event, hash_query
-from src.core.compliance.context import (
+from src.core.compliance.residency import validate_gcp_region
+from src.core.compliance.state import (
     mark_model_armor_active,
     mark_pii_filtered,
     record_guardrail_action,
 )
-from src.core.compliance.residency import validate_gcp_region
 from src.core.config import (
     get_model_armor_location,
     get_model_armor_template_id,

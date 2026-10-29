@@ -19,8 +19,8 @@ from src.agent.schemas import AgentState
 from src.core.ai_security.armor import sanitize_model_output, screen_user_prompt
 from src.core.ai_security.guardrails import validate_llm_model, validate_query_text
 from src.core.compliance.audit import emit_audit_event
-from src.core.compliance.context import record_guardrail_action
 from src.core.compliance.residency import validate_gcp_region
+from src.core.compliance.state import record_guardrail_action
 from src.core.logger import setup_logging
 
 logger = setup_logging(name="agent.graph")
