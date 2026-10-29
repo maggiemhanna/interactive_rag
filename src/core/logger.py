@@ -15,6 +15,9 @@ from typing import Any, Optional
 
 import coloredlogs
 
+from src.core.config import is_structured_logging_enabled
+from src.core.observability.logging import GCPJsonFormatter, RequestContextLogFilter
+
 # Define the constants for the log format
 # We use the same format string as before, coloredlogs handles the coloring automatically.
 LOG_FORMAT = (
@@ -28,44 +31,78 @@ LOG_FORMAT = (
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
-def setup_logging(level: int = logging.INFO, name: Optional[str] = None) -> logging.Logger:
-    """Configures and installs `coloredlogs` on the root logger and returns a named logger.
+def _ensure_context_filter(target: Any) -> None:
+    """Attaches a `RequestContextLogFilter` to a logger or handler if not already present."""
+    if not any(isinstance(f, RequestContextLogFilter) for f in getattr(target, "filters", [])):
+        target.addFilter(RequestContextLogFilter())
+
+
+def setup_logging(
+    level: int = logging.INFO,
+    name: Optional[str] = None,
+    force: bool = False,
+) -> logging.Logger:
+    """Configures the root logger (`GCPJsonFormatter` on Cloud Run, `coloredlogs` locally) and returns a named logger.
 
     Args:
         level: Minimum Python logging level to emit (defaults to `logging.INFO`).
         name: Optional logger namespace (e.g., `'ingestion'`, `'agent'`, `'audit'`).
+        force: When `True`, rebuilds root logger handlers even if already configured.
 
     Returns:
         Configured `logging.Logger` instance at the requested level.
     """
-    # Define custom styles for standard levels
-    custom_level_styles = deepcopy(coloredlogs.DEFAULT_LEVEL_STYLES)
-    custom_level_styles["error"] = {"color": "red"}
-    custom_level_styles["info"] = {"color": "green", "bold": True}
-    custom_level_styles["warning"] = {"color": "yellow"}
-
-    # Define custom styles for fields
-    custom_field_styles = deepcopy(coloredlogs.DEFAULT_FIELD_STYLES)
-    custom_field_styles["filename"] = {"color": "cyan", "bold": True}
-    custom_field_styles["funcName"] = {"color": "white", "bold": True}
-    custom_field_styles["lineno"] = {"color": "cyan", "bold": True}  # e.g., make lineno cyan
-
+    structured = is_structured_logging_enabled()
     root_logger = logging.getLogger()
 
-    if not root_logger.handlers:
-        coloredlogs.install(
-            level=level,
-            fmt=LOG_FORMAT,
-            datefmt=DATE_FORMAT,
-            logger=root_logger,  # Ensure it configures the root logger,
-            level_styles=custom_level_styles,
-            field_styles=custom_field_styles,
-            stream=sys.stdout,
-        )
+    has_json_handler = any(
+        isinstance(getattr(h, "formatter", None), GCPJsonFormatter)
+        for h in root_logger.handlers
+    )
+    mode_mismatch = bool(root_logger.handlers) and (structured != has_json_handler)
+
+    if force or not root_logger.handlers or mode_mismatch:
+        for existing in list(root_logger.handlers):
+            root_logger.removeHandler(existing)
+
+        if structured:
+            json_handler = logging.StreamHandler(sys.stdout)
+            json_handler.setLevel(level)
+            json_handler.setFormatter(GCPJsonFormatter())
+            _ensure_context_filter(json_handler)
+            root_logger.addHandler(json_handler)
+            root_logger.setLevel(level)
+        else:
+            # Define custom styles for standard levels
+            custom_level_styles = deepcopy(coloredlogs.DEFAULT_LEVEL_STYLES)
+            custom_level_styles["error"] = {"color": "red"}
+            custom_level_styles["info"] = {"color": "green", "bold": True}
+            custom_level_styles["warning"] = {"color": "yellow"}
+
+            # Define custom styles for fields
+            custom_field_styles = deepcopy(coloredlogs.DEFAULT_FIELD_STYLES)
+            custom_field_styles["filename"] = {"color": "cyan", "bold": True}
+            custom_field_styles["funcName"] = {"color": "white", "bold": True}
+            custom_field_styles["lineno"] = {"color": "cyan", "bold": True}  # e.g., make lineno cyan
+
+            coloredlogs.install(
+                level=level,
+                fmt=LOG_FORMAT,
+                datefmt=DATE_FORMAT,
+                logger=root_logger,  # Ensure it configures the root logger,
+                level_styles=custom_level_styles,
+                field_styles=custom_field_styles,
+                stream=sys.stdout,
+            )
+
+    for handler in root_logger.handlers:
+        _ensure_context_filter(handler)
+    _ensure_context_filter(root_logger)
 
     # 2. Retrieve the specific logger instance
     logger = logging.getLogger(name)
     logger.setLevel(level)  # Ensure the retrieved logger uses the specified level
+    _ensure_context_filter(logger)
 
     return logger
 

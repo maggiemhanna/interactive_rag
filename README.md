@@ -181,6 +181,7 @@ InteractiveRAG/
 │   │   │   ├── routes.py               # Self-service privacy endpoints (GET/DELETE /compliance/my-data)
 │   │   │   └── state.py                # Per-request compliance guardrail & retrieval state helpers
 │   │   ├── observability/              # Observability & AI monitoring package
+│   │   │   ├── logging.py              # Structured GCP JSON formatter & request correlation filter
 │   │   │   └── state.py                # Per-request latency, TTFT, token, score & span state accumulators
 │   │   ├── storage/                    # Multi-tenant ChromaDB & Cloud Storage persistence
 │   │   │   ├── chroma.py               # Regional Vertex AI embeddings & ChromaDB client factory

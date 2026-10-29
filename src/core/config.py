@@ -83,6 +83,20 @@ def is_cloud_run() -> bool:
     return bool(os.getenv("K_SERVICE", "").strip())
 
 
+def is_structured_logging_enabled() -> bool:
+    """Returns True when application logs should be emitted as single-line GCP JSON on stdout.
+
+    Honors explicit `STRUCTURED_LOGGING` (`true`/`false`), and defaults to `True` on
+    Cloud Run (`K_SERVICE` set) and `False` during local terminal development.
+    """
+    raw = os.getenv("STRUCTURED_LOGGING", "").strip().lower()
+    if raw in {"1", "true", "yes"}:
+        return True
+    if raw in {"0", "false", "no"}:
+        return False
+    return is_cloud_run()
+
+
 def get_allowed_origins() -> List[str]:
     """Parses `ALLOWED_ORIGINS` from the environment for FastAPI CORS middleware.
 

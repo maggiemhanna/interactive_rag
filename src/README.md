@@ -58,7 +58,8 @@ This directory contains the Python backend packages for **InteractiveRAG**, a mu
 - **`dsar.py`**: Executes GDPR Article 15 data inventory (`get_user_data_inventory`) and Article 17 hard erasure (`purge_all_user_data`) across live + noncurrent versioned GCS blobs, local `/tmp` caches, and LangGraph memory checkpoints.
 - **`routes.py`**: Builds the self-service `/compliance/my-data` FastAPI router (`build_compliance_router`).
 
-### `src/core/observability/` - Observability & AI Monitoring State
+### `src/core/observability/` - Observability & AI Monitoring
+- **`logging.py`**: Enriches `LogRecord` instances from `RequestContext`, scrubs raw queries into `query_sha256` / `query_chars` (`RequestContextLogFilter`), and formats single-line Cloud Logging JSON (`GCPJsonFormatter`).
 - **`state.py`**: Manages per-request observability state accumulators (`get_elapsed_latency_ms`, `record_ttft`, `record_token_usage`, `record_retrieval_scores`, `record_tool_call`, `record_span`, `get_stage_latency_ms`) stored on `RequestContext`.
 
 ---
@@ -247,6 +248,7 @@ src/
 │   │   └── routes.py          # Self-service GET/DELETE /compliance/my-data router
 │   └── observability/
 │       ├── __init__.py
+│       ├── logging.py         # Structured GCP JSON formatter & request correlation filter
 │       └── state.py           # Per-request latency, TTFT, token, score & span state accumulators
 ├── ingestion/
 │   ├── __init__.py

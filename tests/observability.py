@@ -238,5 +238,189 @@ class TestPhase1ContextAndPackageSeparation(unittest.TestCase):
         self.assertEqual(body["span_id"], "0000000000000010")
 
 
+class TestPhase2StructuredLoggingAndTraceCorrelation(unittest.TestCase):
+    """Phase 2 unit tests: `is_structured_logging_enabled`, `GCPJsonFormatter`, `RequestContextLogFilter`, and query scrubbing."""
+
+    def tearDown(self) -> None:
+        from src.core.logger import setup_logging
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"STRUCTURED_LOGGING": "false", "K_SERVICE": ""},
+            clear=False,
+        ):
+            setup_logging(force=True)
+
+    def test_is_structured_logging_enabled_env_and_cloud_run_defaults(self) -> None:
+        """Verifies `is_structured_logging_enabled()` defaults to `is_cloud_run()` and honors `STRUCTURED_LOGGING`."""
+        from src.core.config import is_structured_logging_enabled
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"STRUCTURED_LOGGING": "", "K_SERVICE": ""},
+            clear=False,
+        ):
+            self.assertFalse(is_structured_logging_enabled())
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"STRUCTURED_LOGGING": "", "K_SERVICE": "interactive-rag-agent"},
+            clear=False,
+        ):
+            self.assertTrue(is_structured_logging_enabled())
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"STRUCTURED_LOGGING": "true", "K_SERVICE": ""},
+            clear=False,
+        ):
+            self.assertTrue(is_structured_logging_enabled())
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"STRUCTURED_LOGGING": "false", "K_SERVICE": "interactive-rag-agent"},
+            clear=False,
+        ):
+            self.assertFalse(is_structured_logging_enabled())
+
+    def test_gcp_json_formatter_emits_single_line_json_with_trace_and_source_location(self) -> None:
+        """Verifies `GCPJsonFormatter` produces single-line GCP structured JSON enriched from `RequestContext`."""
+        import io
+        import json
+        import logging
+
+        from src.core.observability import GCPJsonFormatter, RequestContextLogFilter
+
+        ctx = RequestContext(
+            request_id="req-phase2-json-001",
+            trace_id="105445aa7843bc8bf206b12000100000",
+            root_span_id="000000000000002a",
+            service_name="agent-api",
+            uid="alice_logger",
+            method="POST",
+            path="/agent",
+        )
+        token = bind_request_context(ctx)
+        try:
+            stream = io.StringIO()
+            handler = logging.StreamHandler(stream)
+            handler.setFormatter(GCPJsonFormatter())
+            handler.addFilter(RequestContextLogFilter())
+
+            test_logger = logging.getLogger("test.phase2.json")
+            test_logger.handlers = [handler]
+            test_logger.setLevel(logging.INFO)
+            test_logger.propagate = False
+
+            with unittest.mock.patch.dict(
+                os.environ,
+                {"GOOGLE_CLOUD_PROJECT": "interactive-rag-proj"},
+                clear=False,
+            ):
+                test_logger.info("Completed agent turn successfully")
+
+            raw_line = stream.getvalue().strip()
+            self.assertNotIn("\n", raw_line, "GCPJsonFormatter must emit single-line JSON")
+            parsed = json.loads(raw_line)
+
+            self.assertEqual(parsed["severity"], "INFO")
+            self.assertEqual(parsed["message"], "Completed agent turn successfully")
+            self.assertEqual(parsed["logger"], "test.phase2.json")
+            self.assertEqual(parsed["service"], "agent-api")
+            self.assertEqual(parsed["request_id"], "req-phase2-json-001")
+            self.assertEqual(parsed["uid"], "alice_logger")
+            self.assertEqual(parsed["http_method"], "POST")
+            self.assertEqual(parsed["http_path"], "/agent")
+            self.assertEqual(
+                parsed["logging.googleapis.com/trace"],
+                "projects/interactive-rag-proj/traces/105445aa7843bc8bf206b12000100000",
+            )
+            self.assertEqual(parsed["logging.googleapis.com/spanId"], "000000000000002a")
+            self.assertTrue(parsed["logging.googleapis.com/trace_sampled"])
+            self.assertIn("logging.googleapis.com/sourceLocation", parsed)
+            self.assertEqual(
+                parsed["logging.googleapis.com/sourceLocation"]["file"],
+                "observability.py",
+            )
+        finally:
+            reset_request_context(token)
+
+    def test_request_context_log_filter_scrubs_raw_queries_in_extra_and_inline_messages(self) -> None:
+        """Verifies `RequestContextLogFilter` scrubs raw `query` / `prompt` strings into `query_sha256` and `query_chars`."""
+        import io
+        import json
+        import logging
+
+        from src.core.context import hash_query
+        from src.core.observability import GCPJsonFormatter, RequestContextLogFilter
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(GCPJsonFormatter())
+        handler.addFilter(RequestContextLogFilter())
+
+        test_logger = logging.getLogger("test.phase2.scrub")
+        test_logger.handlers = [handler]
+        test_logger.setLevel(logging.INFO)
+        test_logger.propagate = False
+
+        secret_query = "What is CEO Jane Doe's home address and SSN?"
+        expected_hash = hash_query(secret_query)
+
+        # 1. Raw query passed in extra={...}
+        test_logger.info("Executing vector search", extra={"query": secret_query})
+        # 2. Raw query accidentally interpolated inline as query='...'
+        test_logger.warning(f"Slow query detected: query='{secret_query}'")
+
+        lines = [line for line in stream.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 2)
+
+        first_payload = json.loads(lines[0])
+        self.assertNotIn("query", first_payload)
+        self.assertNotIn(secret_query, lines[0])
+        self.assertEqual(first_payload["query_sha256"], expected_hash)
+        self.assertEqual(first_payload["query_chars"], len(secret_query))
+
+        second_payload = json.loads(lines[1])
+        self.assertNotIn(secret_query, lines[1])
+        self.assertIn(f"query_sha256='{expected_hash}'", second_payload["message"])
+        self.assertIn(f"query_chars={len(secret_query)}", second_payload["message"])
+
+    def test_setup_logging_switches_between_structured_json_and_coloredlogs(self) -> None:
+        """Verifies `setup_logging()` installs `GCPJsonFormatter` when `STRUCTURED_LOGGING=true` and `coloredlogs` when `false`."""
+        import logging
+
+        from src.core.logger import setup_logging
+        from src.core.observability import GCPJsonFormatter, RequestContextLogFilter
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"STRUCTURED_LOGGING": "true", "K_SERVICE": ""},
+            clear=False,
+        ):
+            logger_json = setup_logging(name="phase2.mode.test", force=True)
+            root_handlers = logging.getLogger().handlers
+            self.assertTrue(
+                any(isinstance(getattr(h, "formatter", None), GCPJsonFormatter) for h in root_handlers),
+                "setup_logging() must install GCPJsonFormatter when STRUCTURED_LOGGING=true",
+            )
+            self.assertTrue(
+                any(isinstance(f, RequestContextLogFilter) for f in logger_json.filters),
+                "setup_logging() must attach RequestContextLogFilter to returned logger",
+            )
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"STRUCTURED_LOGGING": "false", "K_SERVICE": ""},
+            clear=False,
+        ):
+            setup_logging(name="phase2.mode.test", force=True)
+            root_handlers = logging.getLogger().handlers
+            self.assertFalse(
+                any(isinstance(getattr(h, "formatter", None), GCPJsonFormatter) for h in root_handlers),
+                "setup_logging() must use coloredlogs formatter when STRUCTURED_LOGGING=false",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

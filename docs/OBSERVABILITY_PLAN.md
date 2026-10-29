@@ -99,10 +99,10 @@ A common question is: *If we already generate an `X-Request-Id` on every call, w
 ### Phase 2: Structured JSON Application Logging & Trace Correlation (`src/core/observability/logging.py` & `src/core/logger.py`)
 **Goal:** Emit single-line GCP-structured JSON operational logs on `stdout` in Cloud Run (or when `STRUCTURED_LOGGING="true"`), automatically enriched with `RequestContext` correlation fields, while preserving `coloredlogs` for local terminal development.
 
-- [ ] **Correlation Filter & Structured JSON Formatter (`src/core/observability/logging.py`):**
+- [x] **Correlation Filter & Structured JSON Formatter (`src/core/observability/logging.py`):**
   - Implement `RequestContextLogFilter(logging.Filter)` to inject `request_id`, `trace_id`, `span_id`, `service`, and `uid` from `src/core/context.py` into every `LogRecord` and scrub any accidental raw query text.
   - Implement `GCPJsonFormatter(logging.Formatter)` producing single-line JSON records with `severity`, `message`, `timestamp`, `request_id`, `service`, `uid`, `logging.googleapis.com/trace`, `logging.googleapis.com/spanId`, and `logging.googleapis.com/sourceLocation`.
-- [ ] **Environment-Aware Logger Setup (`src/core/logger.py` & `src/core/config.py`):**
+- [x] **Environment-Aware Logger Setup (`src/core/logger.py` & `src/core/config.py`):**
   - Add `is_structured_logging_enabled()` in `src/core/config.py` (enabled automatically on Cloud Run or when `STRUCTURED_LOGGING="true"`).
   - Update `setup_logging()` in `src/core/logger.py` to use `GCPJsonFormatter` + `RequestContextLogFilter` when structured logging is active, and `coloredlogs` otherwise.
 

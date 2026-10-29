@@ -11,6 +11,10 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from src.core.observability.logging import (
+        GCPJsonFormatter,
+        RequestContextLogFilter,
+    )
     from src.core.observability.state import (
         get_elapsed_latency_ms,
         get_recorded_spans,
@@ -27,6 +31,8 @@ if TYPE_CHECKING:
     )
 
 _EXPORT_MAP: dict[str, str] = {
+    "GCPJsonFormatter": "src.core.observability.logging",
+    "RequestContextLogFilter": "src.core.observability.logging",
     "get_elapsed_latency_ms": "src.core.observability.state",
     "get_recorded_spans": "src.core.observability.state",
     "get_retrieval_scores_summary": "src.core.observability.state",
