@@ -142,7 +142,7 @@ Enterprise governance controls ensure that all data and AI calls stay within app
   - **Backend Regional Endpoint Binding:** At runtime, the Python backend validates that the configured location is a single region and explicitly binds all Vertex AI chat models, Vertex AI embedding models, and Model Armor clients to that regional endpoint. — *See [`src/core/compliance/residency.py`](src/core/compliance/residency.py), [`src/core/config.py`](src/core/config.py), [`src/core/storage/chroma.py`](src/core/storage/chroma.py), [`src/agent/graph.py`](src/agent/graph.py) & [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*
 
 - **4.2 Pillar 2 — Privacy-Safe Audit Logging, GCP Data Access Logs & Trace Correlation**
-  - **End-to-End Request & Trace Correlation:** A correlation middleware assigns or forwards a unique request ID (`X-Request-Id`) on every call and links it with Google Cloud's trace context so administrators can filter by a single ID in **Logs Explorer** to trace a request across the Load Balancer, backend microservices, AI safety checks, and cloud storage operations. — *See [`src/core/compliance/context.py`](src/core/compliance/context.py), [`src/core/compliance/audit.py`](src/core/compliance/audit.py) & [`src/core/app_factory.py`](src/core/app_factory.py)*
+  - **End-to-End Request & Trace Correlation:** A correlation middleware assigns or forwards a unique request ID (`X-Request-Id`) on every call and links it with Google Cloud's trace context so administrators can filter by a single ID in **Logs Explorer** to trace a request across the Load Balancer, backend microservices, AI safety checks, and cloud storage operations. — *See [`src/core/context.py`](src/core/context.py), [`src/core/compliance/audit.py`](src/core/compliance/audit.py) & [`src/core/app_factory.py`](src/core/app_factory.py)*
   - **PII-Free Application Audit Stream:** Backend services publish structured JSON audit records to the `interactiverag-audit` stream in Google Cloud Logging for authentication failures, document uploads, searches, agent chats, collection changes, privacy requests, rate-limit blocks, and safety filter actions—replacing raw user questions with one-way SHA-256 hashes and character counts so personal data never leaks into logs. — *See [`src/core/compliance/audit.py`](src/core/compliance/audit.py), [`src/core/auth.py`](src/core/auth.py), [`src/ingestion/app.py`](src/ingestion/app.py), [`src/agent/app.py`](src/agent/app.py) & [`src/agent/stream.py`](src/agent/stream.py)*
   - **GCP Data Access Audit Logs, Load Balancer HTTP Access Logs & 365-Day Regional Archive:** Terraform enables Google Cloud `ADMIN_READ`, `DATA_READ`, and `DATA_WRITE` Data Access Audit Logs for Cloud Storage, Vertex AI, Cloud DLP, and Model Armor, enables HTTP access logging on the HTTPS Load Balancer backends, and routes all three log streams (application audit events, GCP Data Access Audit Logs, and Load Balancer HTTP access logs) into a dedicated regional Cloud Logging bucket with 365-day retention. — *See [`infra/compliance.tf`](infra/compliance.tf) & [`infra/load_balancer.tf`](infra/load_balancer.tf)*
 
@@ -153,7 +153,7 @@ Enterprise governance controls ensure that all data and AI calls stay within app
     - **AI Generation, Model & Region:** Whether the reply was AI-generated or stopped by a guardrail, which exact **Gemini model** and **cloud region** produced it, and the correlating request ID.
     - **Citation Grounding:** Whether document grounding was enforced, whether the answer is backed by inline `[filename.pdf, p.X]` citations, and how many passages were retrieved.
     - **PII Redaction & Content Safety Activation:** Whether sensitive personal data (PII) was detected and redacted, whether Model Armor screening was active, which security filters ran, and whether any content safety or prompt-protection guardrails were triggered.
-    — *See [`src/core/compliance/provenance.py`](src/core/compliance/provenance.py), [`src/agent/schemas.py`](src/agent/schemas.py), [`src/agent/app.py`](src/agent/app.py), [`src/agent/stream.py`](src/agent/stream.py) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*
+    — *See [`src/core/compliance/provenance.py`](src/core/compliance/provenance.py), [`src/core/compliance/state.py`](src/core/compliance/state.py), [`src/agent/schemas.py`](src/agent/schemas.py), [`src/agent/app.py`](src/agent/app.py), [`src/agent/stream.py`](src/agent/stream.py) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*
 
 - **4.4 Pillar 4 — Policy Enforcement (Fail-Closed Screening, Rate Limits, Quotas & Pre-Deploy Gates)**
   - **Fail-Closed Security Screening in Production:** In production deployments, if Google Cloud Model Armor or Cloud DLP is unreachable, misconfigured, or times out during prompt screening, chunk redaction, or output filtering, the backend immediately halts processing, logs a high-severity audit event, and returns `HTTP 503 Service Unavailable` so unscreened content is never exposed. — *See [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py), [`src/core/config.py`](src/core/config.py), [`src/ingestion/app.py`](src/ingestion/app.py), [`src/agent/app.py`](src/agent/app.py) & [`src/agent/stream.py`](src/agent/stream.py)*
@@ -167,19 +167,21 @@ Enterprise governance controls ensure that all data and AI calls stay within app
 ```text
 InteractiveRAG/
 ├── src/                                # Unified Python backend packages
-│   ├── core/                           # Shared authentication, storage, AI security & compliance
+│   ├── core/                           # Shared authentication, storage, AI security, compliance & observability
 │   │   ├── ai_security/                # 5-pillar AI security package
 │   │   │   ├── armor.py                # Model Armor & Cloud DLP screening/redaction client
 │   │   │   ├── guardrails.py           # Collection/query validators & PDF upload guardrails
 │   │   │   └── safety.py               # Gemini safety settings & refusal detection
 │   │   ├── compliance/                 # 4-pillar compliance & governance package
 │   │   │   ├── audit.py                # Structured JSON audit logger & SHA-256 query hashing
-│   │   │   ├── context.py              # Request-scoped X-Request-Id & trace context middleware
 │   │   │   ├── dsar.py                 # GDPR Art. 15 inventory & Art. 17 versioned erasure
 │   │   │   ├── policy.py               # Per-user sliding-window rate limiters & collection quotas
-│   │   │   ├── provenance.py           # EU AI Act Art. 50 transparency & guardrail telemetry
+│   │   │   ├── provenance.py           # EU AI Act Art. 50 transparency & citation grounding metadata
 │   │   │   ├── residency.py            # Single-region GCP location validation
-│   │   │   └── routes.py               # Self-service privacy endpoints (GET/DELETE /compliance/my-data)
+│   │   │   ├── routes.py               # Self-service privacy endpoints (GET/DELETE /compliance/my-data)
+│   │   │   └── state.py                # Per-request compliance guardrail & retrieval state helpers
+│   │   ├── observability/              # Observability & AI monitoring package
+│   │   │   └── state.py                # Per-request latency, TTFT, token, score & span state accumulators
 │   │   ├── storage/                    # Multi-tenant ChromaDB & Cloud Storage persistence
 │   │   │   ├── chroma.py               # Regional Vertex AI embeddings & ChromaDB client factory
 │   │   │   ├── gcs_sync.py             # Per-user GCS <-> /tmp sync, version markers & PDF archive
@@ -189,6 +191,7 @@ InteractiveRAG/
 │   │   ├── app_factory.py              # Shared FastAPI app factory, CORS, middleware & /health
 │   │   ├── auth.py                     # Identity Platform / Firebase Bearer JWT verification
 │   │   ├── config.py                   # Approved model catalogs, guardrail limits & settings
+│   │   ├── context.py                  # Shared RequestContext & RequestCorrelationMiddleware
 │   │   └── logger.py                   # Application logging setup
 │   ├── ingestion/                      # Document Ingestion & Semantic Search API (Port 8000)
 │   │   ├── app.py                      # FastAPI endpoints (/ingest, /query, /collections, /compliance/my-data)

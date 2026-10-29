@@ -32,9 +32,10 @@ This directory contains the Python backend packages for **InteractiveRAG**, a mu
 
 ### Core Infrastructure
 - **`config.py`**: Loads `.env` settings and exposes runtime environment helpers (`is_cloud_run`, `get_allowed_origins`, `get_google_cloud_location`, `get_model_armor_location`, `get_allowed_llm_models`, `get_allowed_embedding_models`) plus local service ports.
+- **`context.py`**: Manages per-request `contextvars` correlation state (`RequestContext`, `RequestCorrelationMiddleware`) tracking sanitized `X-Request-Id`, Cloud Trace ID, active span ID, authenticated `uid`, and a thread-safe `data` store for domain modules.
 - **`auth.py`**: Verifies Google Identity Platform / Firebase Bearer JWTs (`verify_bearer_token`, `get_current_user`, `get_current_user_info`), enforces path-safe `uid` validation (`validate_uid`), and blocks `AUTH_DISABLED` bypasses when running on Cloud Run.
 - **`logger.py`**: Configures structured ANSI-colored console logging (`setup_logging`, `format_dict_for_logs`).
-- **`app_factory.py`**: Provides `create_app()` to wire CORS middleware, `AuditCorrelationMiddleware`, `/health` readiness probes, `/collections` routes, and `/compliance/my-data` self-service DSAR routes.
+- **`app_factory.py`**: Provides `create_app()` to wire CORS middleware, `RequestCorrelationMiddleware`, `/health` readiness probes, `/collections` routes, and `/compliance/my-data` self-service DSAR routes.
 
 ### `src/core/storage/` - Multi-Tenant Persistence & Distributed Locking
 - **`paths.py`**: Isolates per-user local directories (`/tmp/chroma_db/{uid}`, `/tmp/uploads/{uid}`), constructs GCS object prefixes, checkpoints SQLite WAL files, and evicts cached Chroma `SharedSystemClient` registries (`release_client_cache`).
@@ -50,11 +51,15 @@ This directory contains the Python backend packages for **InteractiveRAG**, a mu
 
 ### `src/core/compliance/` - Data Residency, Audit Logging, Provenance & DSAR
 - **`residency.py`**: Enforces single-region GCP locations (`validate_gcp_region`), rejecting `global` and multi-region specifiers (`us`, `eu`, `asia`, `nam4`, `eur4`) before any Vertex AI or Model Armor client call.
-- **`context.py`**: Manages per-request `contextvars` state (`AuditRequestState`) tracking sanitized `X-Request-Id`, Cloud Trace ID, authenticated `uid`, retrieved chunk counts, and Model Armor filter actions across threads.
-- **`audit.py`**: Emits PII-free structured audit records (`emit_audit_event`) to stdout and Google Cloud Logging (`interactiverag-audit`), hashes queries via SHA-256 (`hash_query`), and attaches `X-Request-Id` response headers via `AuditCorrelationMiddleware`.
-- **`provenance.py`**: Builds EU AI Act Article 50 transparency, citation grounding, and Model Armor guardrail telemetry (`ComplianceMetadata`, `build_compliance_metadata`).
+- **`state.py`**: Manages per-request compliance guardrail and retrieval state (`GUARDRAIL_FILTER_LABELS`, `mark_pii_filtered`, `mark_model_armor_active`, `record_guardrail_action`, `record_retrieved_chunks`) stored on `RequestContext`.
+- **`audit.py`**: Emits PII-free structured audit records (`emit_audit_event`) to stdout and Google Cloud Logging (`interactiverag-audit`) and hashes queries via SHA-256 (`hash_query`).
+- **`policy.py`**: Enforces per-user sliding-window rate limiters (`enforce_ingest_rate_limit`, `enforce_query_rate_limit`) and collection count quotas (`enforce_collection_quota`).
+- **`provenance.py`**: Builds EU AI Act Article 50 transparency, citation grounding, and Model Armor provenance metadata (`ComplianceMetadata`, `build_compliance_metadata`).
 - **`dsar.py`**: Executes GDPR Article 15 data inventory (`get_user_data_inventory`) and Article 17 hard erasure (`purge_all_user_data`) across live + noncurrent versioned GCS blobs, local `/tmp` caches, and LangGraph memory checkpoints.
 - **`routes.py`**: Builds the self-service `/compliance/my-data` FastAPI router (`build_compliance_router`).
+
+### `src/core/observability/` - Observability & AI Monitoring State
+- **`state.py`**: Manages per-request observability state accumulators (`get_elapsed_latency_ms`, `record_ttft`, `record_token_usage`, `record_retrieval_scores`, `record_tool_call`, `record_span`, `get_stage_latency_ms`) stored on `RequestContext`.
 
 ---
 
@@ -215,9 +220,10 @@ src/
 ├── core/
 │   ├── __init__.py
 │   ├── config.py              # .env loading, runtime environment & allowlist getters
+│   ├── context.py             # Shared RequestContext & RequestCorrelationMiddleware
 │   ├── auth.py                # Firebase JWT verification & path-safe uid validation
 │   ├── logger.py              # ANSI-colored structured logging setup
-│   ├── app_factory.py         # Shared FastAPI factory (CORS, AuditCorrelationMiddleware, routers)
+│   ├── app_factory.py         # Shared FastAPI factory (CORS, RequestCorrelationMiddleware, routers)
 │   ├── storage/
 │   │   ├── __init__.py
 │   │   ├── paths.py           # Per-user /tmp & GCS paths, SQLite WAL & Chroma cache helpers
@@ -230,14 +236,18 @@ src/
 │   │   ├── armor.py           # Regional Model Armor + Cloud DLP prompt/chunk/output screening
 │   │   ├── safety.py          # Gemini HarmBlockThreshold settings & refusal messages
 │   │   └── guardrails.py      # Model allowlists, query/upload/chunk ceilings & recursion bounds
-│   └── compliance/
+│   ├── compliance/
+│   │   ├── __init__.py
+│   │   ├── residency.py       # Single-region GCP location enforcement
+│   │   ├── state.py           # Per-request compliance guardrail & retrieval state helpers
+│   │   ├── audit.py           # PII-free Cloud Logging publisher & SHA-256 query hashing
+│   │   ├── policy.py          # Per-user sliding-window rate limiters & collection quotas
+│   │   ├── provenance.py      # EU AI Act Art. 50 transparency & citation grounding metadata
+│   │   ├── dsar.py            # GDPR Art. 15 inventory & Art. 17 versioned hard erasure
+│   │   └── routes.py          # Self-service GET/DELETE /compliance/my-data router
+│   └── observability/
 │       ├── __init__.py
-│       ├── residency.py       # Single-region GCP location enforcement
-│       ├── context.py         # Per-request contextvars correlation & guardrail state
-│       ├── audit.py           # PII-free Cloud Logging publisher & correlation middleware
-│       ├── provenance.py      # EU AI Act Art. 50 transparency & citation grounding metadata
-│       ├── dsar.py            # GDPR Art. 15 inventory & Art. 17 versioned hard erasure
-│       └── routes.py          # Self-service GET/DELETE /compliance/my-data router
+│       └── state.py           # Per-request latency, TTFT, token, score & span state accumulators
 ├── ingestion/
 │   ├── __init__.py
 │   ├── __main__.py            # Entrypoint (`python -m src.ingestion`)

@@ -102,12 +102,12 @@ To keep the governance layer practical, maintainable, and aligned with cloud sec
 ### Phase 2: Privacy-Safe Audit Logging & Trace Correlation
 **Goal:** Create an end-to-end, PII-free audit trail across the Load Balancer, backend microservices, and Google Cloud services that is immediately searchable in Cloud Logging and archived regionally.
 
-- [x] **Request Correlation & Structured Audit Logger (`src/core/compliance/`):**
-  - **`src/core/compliance/context.py`:** Manage per-request context (`request_id`, `trace_id`, `service_name`) using Python `contextvars` so correlation IDs automatically propagate across async handlers and worker threads.
+- [x] **Request Correlation & Structured Audit Logger (`src/core/context.py`, `src/core/compliance/`):**
+  - **`src/core/context.py`:** Manage generic per-request correlation context (`RequestContext`: `request_id`, `trace_id`, `active_span_id`, `service_name`, `uid`, `method`, `path`) using Python `contextvars` and wire `RequestCorrelationMiddleware` into both services via `src/core/app_factory.py` to read or generate `X-Request-Id`, extract Cloud Run's `X-Cloud-Trace-Context`, and echo `X-Request-Id` on every HTTP response.
+  - **`src/core/compliance/state.py`:** Store per-request compliance guardrail and retrieval state (`GUARDRAIL_FILTER_LABELS`, `mark_pii_filtered`, `mark_model_armor_active`, `record_guardrail_action`, `record_retrieved_chunks`) on the active `RequestContext`.
   - **`src/core/compliance/audit.py`:**
-    - Implement `AuditCorrelationMiddleware` (wired into both services via `src/core/app_factory.py`) to read or generate `X-Request-Id`, extract Cloud Run's `X-Cloud-Trace-Context`, and echo `X-Request-Id` on every HTTP response.
     - Implement `emit_audit_event()` to publish structured JSON audit records to the `interactiverag-audit` stream in Google Cloud Logging (with stdout JSON fallback when running offline).
-    - Implement `hash_query()` to automatically replace any raw user query text with `query_sha256` and `query_chars`.
+    - Re-export `hash_query()` from `src/core/context.py` to automatically replace any raw user query text with `query_sha256` and `query_chars`.
 - [x] **Application-Wide Audit Coverage & PII Scrubbing (`src/`):**
   - Remove plaintext user query logging from `src/agent/app.py`, `src/agent/stream.py`, and `src/ingestion/service.py`.
   - Emit structured audit events for authentication failures (`src/core/auth.py`), collection listing and deletion (`src/core/storage/routes.py`), document ingestion and vector search (`src/ingestion/app.py`), agent chat and streaming (`src/agent/app.py`, `src/agent/stream.py`), and Model Armor / DLP blocks or redactions (`src/core/ai_security/armor.py`, `src/agent/graph.py`).
@@ -131,7 +131,7 @@ To keep the governance layer practical, maintainable, and aligned with cloud sec
   - **`src/agent/memory.py`:** Implement `list_user_memory_threads(uid)` and `purge_user_memory_threads(uid)` to count and wipe all `{uid}:*` conversation checkpoints from in-memory chat storage.
   - **`src/core/compliance/routes.py` & `src/core/app_factory.py`:** Expose `GET /compliance/my-data` (Art. 15 inventory) and `DELETE /compliance/my-data` (Art. 17 complete erasure) on both backend services, emitting `dsar.export_inventory` and `dsar.erase_user_data` audit events.
 - [x] **EU AI Act Provenance Metadata & Frontend Privacy Controls (`src/` & `frontend/`):**
-  - **`src/core/compliance/provenance.py`, `src/agent/schemas.py`, `src/agent/app.py`, `src/agent/stream.py`:** Build and attach a structured `compliance` metadata object (`ai_generated`, `model`, `region`, `grounding_enforced`, `grounded`, `citation_count`, `retrieved_passages`, `pii_filtered`, `model_armor_active`, `filters_checked`, `guardrail_actions`, `request_id`) to all `/agent` JSON responses and `/agent/stream` SSE completion events.
+  - **`src/core/compliance/provenance.py`, `src/core/compliance/state.py`, `src/agent/schemas.py`, `src/agent/app.py`, `src/agent/stream.py`:** Build and attach a structured `compliance` metadata object (`ai_generated`, `model`, `region`, `grounding_enforced`, `grounded`, `citation_count`, `retrieved_passages`, `pii_filtered`, `model_armor_active`, `filters_checked`, `guardrail_actions`, `request_id`) to all `/agent` JSON responses and `/agent/stream` SSE completion events.
   - **`frontend/src/api.js` & `frontend/src/App.jsx`:**
     - Render transparency badges on every assistant message showing AI generation status, model and region, citation grounding status, and any Model Armor / DLP safety actions taken.
     - Add the **"My Data & Privacy"** self-service modal allowing authenticated users to inspect their stored data footprint and trigger complete account data erasure.

@@ -112,7 +112,7 @@ A common question is: *If we already generate an `X-Request-Id` on every call, w
 **Goal:** Record hierarchical spans and millisecond timings across Cloud Storage synchronization, PDF ingestion, vector search, and every LangGraph agent node.
 
 - [ ] **Span Tracer (`src/core/observability/tracing.py`):**
-  - Implement `start_span(name, stage=None, **attributes)` context manager that generates a 16-character hex `span_id`, links to the parent `active_span_id` on `RequestContext`, measures duration via `time.perf_counter()`, appends the span to `RequestContext.spans`, accumulates `RequestContext.stage_latency_ms[stage]`, and optionally exports spans to **Google Cloud Trace** when `CLOUD_TRACE_ENABLED="true"`.
+  - Implement `start_span(name, stage=None, **attributes)` context manager that generates a 16-character hex `span_id`, links to the parent `active_span_id` on `RequestContext`, measures duration via `time.perf_counter()`, records the completed span and stage latency via `record_span()` in `src/core/observability/state.py`, and optionally exports spans to **Google Cloud Trace** when `CLOUD_TRACE_ENABLED="true"`.
 - [ ] **Pipeline Instrumentation (`src/core/storage/`, `src/ingestion/`, `src/agent/`):**
   - **`src/core/storage/gcs_sync.py`:** Instrument Cloud Storage download/upload sync (`stage="gcs_sync"`).
   - **`src/ingestion/splitter.py` & `src/ingestion/service.py`:** Instrument PDF splitting (`stage="chunking"`), batched Chroma indexing (`stage="embedding"`), and vector search (`stage="retrieval"`).
@@ -124,9 +124,9 @@ A common question is: *If we already generate an `X-Request-Id` on every call, w
 **Goal:** Capture per-turn latency breakdowns, streaming TTFT, Gemini token usage, and retrieval/grounding quality signals, and publish them as structured events to `interactiverag-telemetry`.
 
 - [ ] **AI Telemetry Helpers & `interactiverag-telemetry` Publisher (`src/core/observability/telemetry.py`):**
-  - Implement `record_llm_usage(response)` in `src/agent/graph.py` (`model_call`) to extract `input_tokens`, `output_tokens`, and `total_tokens` from `AIMessage.usage_metadata` and accumulate them across multi-step tool calls on `RequestContext`.
-  - Implement `record_retrieval_metrics(docs_with_scores)` in `src/agent/tools.py` and `src/ingestion/service.py` to capture `top_similarity_score`, `mean_similarity_score`, retrieved passage counts, and tool call counts on `RequestContext`.
-  - Implement `emit_telemetry_event(event_type, **fields)` publishing one structured AI/performance JSON record per completed request (`ingest.telemetry`, `query.telemetry`, `agent.telemetry`) to `projects/<project>/logs/interactiverag-telemetry` (`TELEMETRY_LOG_NAME`), enriched with `total_latency_ms`, `ttft_ms`, `stage_latency_ms`, `span_count`, `input_tokens`, `output_tokens`, `total_tokens`, `llm_calls`, `tool_calls_count`, `retrieved_passages`, `top_similarity_score`, `mean_similarity_score`, `citation_count`, and `grounded`.
+  - Implement `record_llm_usage(response)` in `src/agent/graph.py` (`model_call`) to extract `input_tokens`, `output_tokens`, and `total_tokens` from `AIMessage.usage_metadata` and accumulate them across multi-step tool calls via `record_token_usage()` in `src/core/observability/state.py`.
+  - Implement `record_retrieval_metrics(docs_with_scores)` in `src/agent/tools.py` and `src/ingestion/service.py` to capture `top_similarity_score`, `mean_similarity_score`, retrieved passage counts, and tool call counts via `src/core/observability/state.py`.
+  - Implement `emit_telemetry_event(event_type, **fields)` reading accumulated state from `src/core/observability/state.py` and publishing one structured AI/performance JSON record per completed request (`ingest.telemetry`, `query.telemetry`, `agent.telemetry`) to `projects/<project>/logs/interactiverag-telemetry` (`TELEMETRY_LOG_NAME`), enriched with `total_latency_ms`, `ttft_ms`, `stage_latency_ms`, `span_count`, `input_tokens`, `output_tokens`, `total_tokens`, `llm_calls`, `tool_calls_count`, `retrieved_passages`, `top_similarity_score`, `mean_similarity_score`, `citation_count`, and `grounded`.
 
 ---
 
