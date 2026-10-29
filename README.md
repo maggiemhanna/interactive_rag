@@ -182,7 +182,8 @@ InteractiveRAG/
 │   │   │   └── state.py                # Per-request compliance guardrail & retrieval state helpers
 │   │   ├── observability/              # Observability & AI monitoring package
 │   │   │   ├── logging.py              # Structured GCP JSON formatter & request correlation filter
-│   │   │   └── state.py                # Per-request latency, TTFT, token, score & span state accumulators
+│   │   │   ├── state.py                # Per-request latency, TTFT, token, score & span state accumulators
+│   │   │   └── tracing.py              # Hierarchical per-stage span tracer & Cloud Trace exporter
 │   │   ├── storage/                    # Multi-tenant ChromaDB & Cloud Storage persistence
 │   │   │   ├── chroma.py               # Regional Vertex AI embeddings & ChromaDB client factory
 │   │   │   ├── gcs_sync.py             # Per-user GCS <-> /tmp sync, version markers & PDF archive

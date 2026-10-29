@@ -97,6 +97,20 @@ def is_structured_logging_enabled() -> bool:
     return is_cloud_run()
 
 
+def is_cloud_trace_enabled() -> bool:
+    """Returns True when completed spans should be exported to Google Cloud Trace.
+
+    Honors explicit `CLOUD_TRACE_ENABLED` (`true`/`false`), and defaults to `True` on
+    Cloud Run (`K_SERVICE` set) and `False` during local development and offline tests.
+    """
+    raw = os.getenv("CLOUD_TRACE_ENABLED", "").strip().lower()
+    if raw in {"1", "true", "yes"}:
+        return True
+    if raw in {"0", "false", "no"}:
+        return False
+    return is_cloud_run()
+
+
 def get_allowed_origins() -> List[str]:
     """Parses `ALLOWED_ORIGINS` from the environment for FastAPI CORS middleware.
 

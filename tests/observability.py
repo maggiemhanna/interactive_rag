@@ -422,5 +422,260 @@ class TestPhase2StructuredLoggingAndTraceCorrelation(unittest.TestCase):
             )
 
 
+class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
+    """Phase 3 unit tests: hierarchical span tracer (`start_span`), active span correlation, and pipeline spans."""
+
+    def test_nested_spans_preserve_hierarchy_and_restore_active_span_id_and_log_span_id(self) -> None:
+        """Verifies parent-child `span_id` hierarchy, `active_span_id` restoration, and log record span correlation."""
+        import io
+        import json
+        import logging
+
+        from src.core.observability import (
+            GCPJsonFormatter,
+            RequestContextLogFilter,
+            register_span_listener,
+            start_span,
+        )
+
+        ctx = RequestContext(
+            request_id="req-phase3-001",
+            trace_id="105445aa7843bc8bf206b12000100000",
+            root_span_id="0000000000000001",
+            service_name="agent-api",
+            uid="alice_tracer",
+        )
+        token = bind_request_context(ctx)
+        listener_spans = []
+        unregister = register_span_listener(listener_spans.append)
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(GCPJsonFormatter())
+        handler.addFilter(RequestContextLogFilter())
+        test_logger = logging.getLogger("test.phase3.span_log")
+        test_logger.handlers = [handler]
+        test_logger.setLevel(logging.INFO)
+        test_logger.propagate = False
+
+        try:
+            self.assertEqual(get_active_span_id(), "0000000000000001")
+            with start_span("agent.turn", stage="turn", model_name="gemini-2.5-flash") as turn_span:
+                turn_span_id = turn_span["span_id"]
+                self.assertEqual(get_active_span_id(), turn_span_id)
+                self.assertEqual(turn_span["parent_span_id"], "0000000000000001")
+
+                with start_span("agent.model_call", stage="llm", model_name="gemini-2.5-flash") as llm_span:
+                    llm_span_id = llm_span["span_id"]
+                    self.assertEqual(get_active_span_id(), llm_span_id)
+                    self.assertEqual(llm_span["parent_span_id"], turn_span_id)
+                    test_logger.info("Inside nested LLM span")
+
+                # Exiting child span restores parent's span_id
+                self.assertEqual(get_active_span_id(), turn_span_id)
+
+                with start_span("agent.retriever_tool", stage="retrieval", k=5) as ret_span:
+                    ret_span_id = ret_span["span_id"]
+                    self.assertEqual(get_active_span_id(), ret_span_id)
+                    self.assertEqual(ret_span["parent_span_id"], turn_span_id)
+                    ret_span["attributes"]["retrieved_chunks"] = 3
+
+            # Exiting outer span restores root_span_id
+            self.assertEqual(get_active_span_id(), "0000000000000001")
+
+            spans = get_recorded_spans()
+            self.assertEqual(len(spans), 3)
+            self.assertEqual(len(listener_spans), 3)
+
+            # Spans finish in inner-to-outer order: model_call, retriever_tool, turn
+            self.assertEqual([s["name"] for s in spans], ["agent.model_call", "agent.retriever_tool", "agent.turn"])
+            self.assertEqual(spans[0]["parent_span_id"], turn_span_id)
+            self.assertEqual(spans[1]["parent_span_id"], turn_span_id)
+            self.assertEqual(spans[1]["attributes"]["retrieved_chunks"], 3)
+            self.assertEqual(spans[2]["parent_span_id"], "0000000000000001")
+            for s in spans:
+                self.assertEqual(s["status"], "ok")
+                self.assertGreaterEqual(s["duration_ms"], 0.0)
+
+            stage_latencies = get_stage_latency_ms()
+            self.assertIn("llm_ms", stage_latencies)
+            self.assertIn("retrieval_ms", stage_latencies)
+            self.assertIn("turn_ms", stage_latencies)
+
+            # Log emitted inside child span must carry that child span's logging.googleapis.com/spanId
+            log_payload = json.loads(stream.getvalue().strip())
+            self.assertEqual(log_payload["logging.googleapis.com/spanId"], llm_span_id)
+        finally:
+            unregister()
+            reset_request_context(token)
+
+    def test_span_error_status_and_raw_query_attribute_scrubbing(self) -> None:
+        """Verifies exceptions inside `start_span` mark `status='error'` and scrub raw `query` attributes."""
+        from src.core.context import hash_query
+        from src.core.observability import start_span
+
+        ctx = RequestContext(
+            request_id="req-phase3-err",
+            trace_id="205445aa7843bc8bf206b12000100000",
+            root_span_id="0000000000000009",
+            service_name="ingestion-api",
+        )
+        token = bind_request_context(ctx)
+        secret_query = "Confidential acquisition target name?"
+        try:
+            with self.assertRaises(RuntimeError):
+                with start_span("ingestion.search_collection", stage="retrieval", query=secret_query):
+                    raise RuntimeError("Simulated vector index error")
+
+            # Active span ID restored even after exception
+            self.assertEqual(get_active_span_id(), "0000000000000009")
+            spans = get_recorded_spans()
+            self.assertEqual(len(spans), 1)
+            err_span = spans[0]
+            self.assertEqual(err_span["status"], "error")
+            self.assertEqual(err_span["attributes"]["error_type"], "RuntimeError")
+            self.assertNotIn("query", err_span["attributes"])
+            self.assertEqual(err_span["attributes"]["query_sha256"], hash_query(secret_query))
+            self.assertEqual(err_span["attributes"]["query_chars"], len(secret_query))
+        finally:
+            reset_request_context(token)
+
+    def test_end_to_end_pipeline_spans_across_ingestion_and_agent_execution(self) -> None:
+        """Verifies `start_span` records stage latencies across PDF splitting, indexing, search, and LangGraph nodes."""
+        import shutil
+        import tempfile
+        from unittest.mock import patch
+
+        from langchain_core.messages import HumanMessage
+
+        from src.agent import graph as agent_graph_module
+        from src.agent.tools import get_retriever_tool
+        from src.core.storage import chroma as chroma_module
+        from src.core.storage import release_client_cache
+        from src.ingestion.service import index_documents, search_collection
+        from src.ingestion.splitter import split_pdfs
+        from tests.ai_security import (
+            DeterministicFakeEmbeddings,
+            GroundedCitingChatModel,
+            make_test_pdf,
+        )
+
+        temp_dir = tempfile.mkdtemp(prefix="obs_phase3_")
+        pdf_dir = os.path.join(temp_dir, "pdfs")
+        chroma_root = os.path.join(temp_dir, "chroma")
+        user_chroma_dir = os.path.join(chroma_root, "alice_e2e")
+        os.makedirs(pdf_dir, exist_ok=True)
+        os.makedirs(user_chroma_dir, exist_ok=True)
+        pdf_path = os.path.join(pdf_dir, "report.pdf")
+        with open(pdf_path, "wb") as f:
+            f.write(make_test_pdf("Annual revenue grew 24 percent in 2025."))
+
+        ctx = RequestContext(
+            request_id="req-phase3-e2e",
+            trace_id="305445aa7843bc8bf206b12000100000",
+            root_span_id="0000000000000010",
+            service_name="agent-api",
+            uid="alice_e2e",
+        )
+        token = bind_request_context(ctx)
+        try:
+            with patch.object(
+                chroma_module,
+                "get_embeddings",
+                side_effect=lambda *args, **kwargs: DeterministicFakeEmbeddings(),
+            ), patch.dict(
+                os.environ,
+                {
+                    "GOOGLE_CLOUD_PROJECT": "interactive-rag",
+                    "GOOGLE_CLOUD_LOCATION": "us-central1",
+                    "MODEL_ARMOR_TEMPLATE_ID": "",
+                    "LOCAL_CHROMA_ROOT": chroma_root,
+                    "GCS_BUCKET_NAME": "",
+                },
+                clear=False,
+            ):
+                # 1. Split PDFs -> ingestion.split_pdfs (stage="chunking")
+                docs = split_pdfs([pdf_path], chunk_size=300, chunk_overlap=30)
+                self.assertGreaterEqual(len(docs), 1)
+
+                # 2. Index documents -> ingestion.index_documents (stage="embedding")
+                indexed = index_documents(
+                    docs,
+                    persist_directory=user_chroma_dir,
+                    collection_name="obs_reports",
+                    embedding_model="gemini-embedding-001",
+                )
+                self.assertIsNotNone(indexed)
+
+                # 3. Direct vector search -> ingestion.search_collection (stage="retrieval")
+                results = search_collection(
+                    uid="alice_e2e",
+                    query="Annual revenue growth",
+                    collection_name="obs_reports",
+                    k=2,
+                    embedding_model="gemini-embedding-001",
+                )
+                self.assertGreaterEqual(len(results), 1)
+
+                # 4. Build and run LangGraph agent -> agent.input_guard, agent.model_call, agent.retriever_tool, agent.output_guard
+                retriever_tool = get_retriever_tool(
+                    persist_directory=user_chroma_dir,
+                    collection_name="obs_reports",
+                    embedding_model="gemini-embedding-001",
+                    k=2,
+                )
+                with patch.object(
+                    agent_graph_module,
+                    "ChatGoogleGenerativeAI",
+                    side_effect=lambda *args, **kwargs: GroundedCitingChatModel(*args, **kwargs),
+                ):
+                    agent = agent_graph_module.build_agent(
+                        retriever_tool=retriever_tool,
+                        model_name="gemini-2.5-flash",
+                    )
+                    state = agent.invoke(
+                        {"messages": [HumanMessage(content="What was annual revenue growth?")]},
+                        config={"configurable": {"thread_id": "alice_e2e:obs-thread"}},
+                    )
+                    self.assertTrue(len(state["messages"]) >= 2)
+
+            recorded_names = [s["name"] for s in get_recorded_spans()]
+            for expected_span_name in (
+                "ingestion.split_pdfs",
+                "ingestion.index_documents",
+                "ingestion.search_collection",
+                "agent.input_guard",
+                "agent.model_call",
+                "agent.retriever_tool",
+                "agent.output_guard",
+            ):
+                self.assertIn(
+                    expected_span_name,
+                    recorded_names,
+                    f"Expected span '{expected_span_name}' in recorded spans {recorded_names}",
+                )
+
+            stage_latencies = get_stage_latency_ms()
+            for expected_stage_key in (
+                "chunking_ms",
+                "embedding_ms",
+                "retrieval_ms",
+                "input_guard_ms",
+                "llm_ms",
+                "output_guard_ms",
+            ):
+                self.assertIn(
+                    expected_stage_key,
+                    stage_latencies,
+                    f"Expected stage metric '{expected_stage_key}' in {stage_latencies}",
+                )
+                self.assertGreaterEqual(stage_latencies[expected_stage_key], 0.0)
+        finally:
+            reset_request_context(token)
+            release_client_cache(user_chroma_dir)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -29,6 +29,10 @@ if TYPE_CHECKING:
         record_tool_call,
         record_ttft,
     )
+    from src.core.observability.tracing import (
+        register_span_listener,
+        start_span,
+    )
 
 _EXPORT_MAP: dict[str, str] = {
     "GCPJsonFormatter": "src.core.observability.logging",
@@ -45,6 +49,8 @@ _EXPORT_MAP: dict[str, str] = {
     "record_token_usage": "src.core.observability.state",
     "record_tool_call": "src.core.observability.state",
     "record_ttft": "src.core.observability.state",
+    "register_span_listener": "src.core.observability.tracing",
+    "start_span": "src.core.observability.tracing",
 }
 
 __all__ = sorted(_EXPORT_MAP.keys())

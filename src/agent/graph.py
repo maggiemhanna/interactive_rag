@@ -22,6 +22,7 @@ from src.core.compliance.audit import emit_audit_event
 from src.core.compliance.residency import validate_gcp_region
 from src.core.compliance.state import record_guardrail_action
 from src.core.logger import setup_logging
+from src.core.observability.tracing import start_span
 
 logger = setup_logging(name="agent.graph")
 
@@ -114,34 +115,38 @@ def build_agent(
 
     def input_guard(state: AgentState) -> Dict[str, Any]:
         """Validates query length and screens the latest user prompt via Cloud Model Armor."""
-        raw_query = _latest_human_text(state["messages"])
-        try:
-            cleaned_query = validate_query_text(raw_query)
-        except ValueError as exc:
-            logger.warning(f"input_guard rejected invalid query: {exc}")
-            record_guardrail_action("invalid_query_text", "blocked", stage="input")
-            emit_audit_event(
-                "security.prompt_blocked",
-                severity="WARNING",
-                status="blocked",
-                reason="invalid_query_text",
-                query_chars=len(raw_query or ""),
-            )
-            return {
-                "messages": [AIMessage(content=str(exc))],
-                "input_blocked": True,
-                "pending_response": None,
-            }
+        with start_span("agent.input_guard", stage="input_guard") as span:
+            raw_query = _latest_human_text(state["messages"])
+            try:
+                cleaned_query = validate_query_text(raw_query)
+            except ValueError as exc:
+                logger.warning(f"input_guard rejected invalid query: {exc}")
+                record_guardrail_action("invalid_query_text", "blocked", stage="input")
+                emit_audit_event(
+                    "security.prompt_blocked",
+                    severity="WARNING",
+                    status="blocked",
+                    reason="invalid_query_text",
+                    query_chars=len(raw_query or ""),
+                )
+                span["attributes"]["blocked"] = True
+                return {
+                    "messages": [AIMessage(content=str(exc))],
+                    "input_blocked": True,
+                    "pending_response": None,
+                }
 
-        decision = screen_user_prompt(cleaned_query)
-        if not decision.allowed:
-            return {
-                "messages": [AIMessage(content=decision.text)],
-                "input_blocked": True,
-                "pending_response": None,
-            }
+            decision = screen_user_prompt(cleaned_query)
+            if not decision.allowed:
+                span["attributes"]["blocked"] = True
+                return {
+                    "messages": [AIMessage(content=decision.text)],
+                    "input_blocked": True,
+                    "pending_response": None,
+                }
 
-        return {"input_blocked": False, "pending_response": None}
+            span["attributes"]["blocked"] = False
+            return {"input_blocked": False, "pending_response": None}
 
     def route_after_input_guard(state: AgentState) -> str:
         """Routes blocked prompts directly to `END`, or clean prompts to `model_call`."""
@@ -149,14 +154,17 @@ def build_agent(
 
     def model_call(state: AgentState) -> Dict[str, Any]:
         """Invokes Vertex AI Gemini with `SYSTEM_PROMPT` and stages final answers in `pending_response`."""
-        system_prompt = SystemMessage(content=SYSTEM_PROMPT)
-        response = model_with_tools.invoke([system_prompt] + list(state["messages"]))
+        with start_span("agent.model_call", stage="llm", model_name=safe_model_name) as span:
+            system_prompt = SystemMessage(content=SYSTEM_PROMPT)
+            response = model_with_tools.invoke([system_prompt] + list(state["messages"]))
 
-        if getattr(response, "tool_calls", None):
-            return {"messages": [response], "pending_response": None}
+            has_tools = bool(getattr(response, "tool_calls", None))
+            span["attributes"]["has_tool_calls"] = has_tools
+            if has_tools:
+                return {"messages": [response], "pending_response": None}
 
-        # Hold final AIMessage in `pending_response` so `output_guard` sanitizes it before `messages` / SSE emission
-        return {"pending_response": response}
+            # Hold final AIMessage in `pending_response` so `output_guard` sanitizes it before `messages` / SSE emission
+            return {"pending_response": response}
 
     def should_continue(state: AgentState) -> str:
         """Routes tool-calling turns to `tools` and final turns to `output_guard`."""
@@ -173,25 +181,27 @@ def build_agent(
         if pending is None:
             return {}
 
-        raw_text = _extract_message_text(getattr(pending, "content", ""))
-        latest_query = _latest_human_text(state["messages"])
-        decision = sanitize_model_output(raw_text, user_prompt=latest_query or None)
+        with start_span("agent.output_guard", stage="output_guard") as span:
+            raw_text = _extract_message_text(getattr(pending, "content", ""))
+            latest_query = _latest_human_text(state["messages"])
+            decision = sanitize_model_output(raw_text, user_prompt=latest_query or None)
 
-        if not decision.allowed:
-            safe_msg = AIMessage(
-                id=getattr(pending, "id", None),
-                content=decision.text,
-            )
-        elif decision.text != raw_text:
-            safe_msg = AIMessage(
-                id=getattr(pending, "id", None),
-                content=decision.text,
-                response_metadata=getattr(pending, "response_metadata", {}),
-            )
-        else:
-            safe_msg = pending
+            span["attributes"]["blocked"] = not decision.allowed
+            if not decision.allowed:
+                safe_msg = AIMessage(
+                    id=getattr(pending, "id", None),
+                    content=decision.text,
+                )
+            elif decision.text != raw_text:
+                safe_msg = AIMessage(
+                    id=getattr(pending, "id", None),
+                    content=decision.text,
+                    response_metadata=getattr(pending, "response_metadata", {}),
+                )
+            else:
+                safe_msg = pending
 
-        return {"messages": [safe_msg], "pending_response": None}
+            return {"messages": [safe_msg], "pending_response": None}
 
     # Build LangGraph StateGraph: START -> input_guard -> model_call <-> tools -> output_guard -> END
     graph = StateGraph(AgentState)

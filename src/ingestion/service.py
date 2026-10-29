@@ -15,6 +15,7 @@ from src.core.ai_security.armor import sanitize_retrieved_documents
 from src.core.compliance.audit import hash_query
 from src.core.compliance.policy import enforce_collection_quota
 from src.core.logger import setup_logging
+from src.core.observability.tracing import start_span
 from src.core.storage import (
     get_vectorstore,
     require_collection,
@@ -45,30 +46,36 @@ def index_documents(
     if not os.path.exists(persist_directory):
         os.makedirs(persist_directory)
 
-    try:
-        vectorstore = get_vectorstore(
-            collection_name=collection_name,
-            persist_directory=persist_directory,
-            embedding_model=embedding_model,
-        )
-
-        batch_size = 100
-        total_chunks = len(documents)
-        for i in range(0, total_chunks, batch_size):
-            batch = documents[i : i + batch_size]
-            vectorstore.add_documents(documents=batch)
-            logger.info(
-                f"Ingested batch {i // batch_size + 1} / {(total_chunks - 1) // batch_size + 1} "
-                f"({len(batch)} chunks) into collection '{collection_name}'."
+    with start_span(
+        "ingestion.index_documents",
+        stage="embedding",
+        collection_name=collection_name,
+        chunks_count=len(documents),
+    ):
+        try:
+            vectorstore = get_vectorstore(
+                collection_name=collection_name,
+                persist_directory=persist_directory,
+                embedding_model=embedding_model,
             )
 
-        logger.info(
-            f"Successfully added {total_chunks} documents to collection '{collection_name}' in '{persist_directory}'."
-        )
-        return vectorstore
-    except Exception as e:
-        logger.error(f"Error updating vectorstore: {e}")
-        raise
+            batch_size = 100
+            total_chunks = len(documents)
+            for i in range(0, total_chunks, batch_size):
+                batch = documents[i : i + batch_size]
+                vectorstore.add_documents(documents=batch)
+                logger.info(
+                    f"Ingested batch {i // batch_size + 1} / {(total_chunks - 1) // batch_size + 1} "
+                    f"({len(batch)} chunks) into collection '{collection_name}'."
+                )
+
+            logger.info(
+                f"Successfully added {total_chunks} documents to collection '{collection_name}' in '{persist_directory}'."
+            )
+            return vectorstore
+        except Exception as e:
+            logger.error(f"Error updating vectorstore: {e}")
+            raise
 
 
 def ingest_documents(
@@ -126,25 +133,32 @@ def search_collection(
         FileNotFoundError: If `collection_name` does not exist for `uid`.
     """
     with user_read_lock(uid) as persist_directory:
-        require_collection(persist_directory, collection_name)
-        vectorstore = get_vectorstore(
+        with start_span(
+            "ingestion.search_collection",
+            stage="retrieval",
             collection_name=collection_name,
-            persist_directory=persist_directory,
-            embedding_model=embedding_model,
-        )
-        retriever = vectorstore.as_retriever(
-            search_type="similarity", search_kwargs={"k": k}
-        )
-        docs = retriever.invoke(query)
+            k=k,
+        ) as span:
+            require_collection(persist_directory, collection_name)
+            vectorstore = get_vectorstore(
+                collection_name=collection_name,
+                persist_directory=persist_directory,
+                embedding_model=embedding_model,
+            )
+            retriever = vectorstore.as_retriever(
+                search_type="similarity", search_kwargs={"k": k}
+            )
+            docs = retriever.invoke(query)
 
-    safe_docs = sanitize_retrieved_documents(docs)
-    results = [
-        {
-            "page_content": doc.page_content,
-            "metadata": doc.metadata,
-        }
-        for doc in safe_docs
-    ]
+            safe_docs = sanitize_retrieved_documents(docs)
+            results = [
+                {
+                    "page_content": doc.page_content,
+                    "metadata": doc.metadata,
+                }
+                for doc in safe_docs
+            ]
+            span["attributes"]["results_count"] = len(results)
 
     query_digest = hash_query(query)
     logger.info(

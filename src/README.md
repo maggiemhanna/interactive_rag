@@ -61,6 +61,7 @@ This directory contains the Python backend packages for **InteractiveRAG**, a mu
 ### `src/core/observability/` - Observability & AI Monitoring
 - **`logging.py`**: Enriches `LogRecord` instances from `RequestContext`, scrubs raw queries into `query_sha256` / `query_chars` (`RequestContextLogFilter`), and formats single-line Cloud Logging JSON (`GCPJsonFormatter`).
 - **`state.py`**: Manages per-request observability state accumulators (`get_elapsed_latency_ms`, `record_ttft`, `record_token_usage`, `record_retrieval_scores`, `record_tool_call`, `record_span`, `get_stage_latency_ms`) stored on `RequestContext`.
+- **`tracing.py`**: Provides `start_span(name, stage=None, **attributes)` context manager for hierarchical per-stage span timing and optional Google Cloud Trace export.
 
 ---
 
@@ -249,7 +250,8 @@ src/
 │   └── observability/
 │       ├── __init__.py
 │       ├── logging.py         # Structured GCP JSON formatter & request correlation filter
-│       └── state.py           # Per-request latency, TTFT, token, score & span state accumulators
+│       ├── state.py           # Per-request latency, TTFT, token, score & span state accumulators
+│       └── tracing.py         # Hierarchical per-stage span tracer & Cloud Trace exporter
 ├── ingestion/
 │   ├── __init__.py
 │   ├── __main__.py            # Entrypoint (`python -m src.ingestion`)

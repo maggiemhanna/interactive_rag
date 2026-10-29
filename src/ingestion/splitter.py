@@ -15,6 +15,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.core.logger import setup_logging
+from src.core.observability.tracing import start_span
 
 logger = setup_logging(name="ingestion.splitter")
 
@@ -66,27 +67,29 @@ def split_pdfs(
     if isinstance(pdf_paths, str):
         pdf_paths = [pdf_paths]
 
-    all_chunks: List[Document] = []
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size, chunk_overlap=chunk_overlap
-    )
+    with start_span("ingestion.split_pdfs", stage="chunking", file_count=len(pdf_paths)) as span:
+        all_chunks: List[Document] = []
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size, chunk_overlap=chunk_overlap
+        )
 
-    for pdf_path in pdf_paths:
-        if not os.path.exists(pdf_path):
-            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+        for pdf_path in pdf_paths:
+            if not os.path.exists(pdf_path):
+                raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
-        try:
-            pdf_loader = PyPDFLoader(pdf_path)
-            pages = pdf_loader.load()
-            logger.info(f"Loaded PDF '{pdf_path}' ({len(pages)} pages).")
-            chunks = text_splitter.split_documents(pages)
-            logger.info(f"Split PDF '{pdf_path}' into {len(chunks)} chunks.")
-            all_chunks.extend(chunks)
-        except Exception as e:
-            logger.error(f"Error loading PDF '{pdf_path}': {e}")
-            raise
+            try:
+                pdf_loader = PyPDFLoader(pdf_path)
+                pages = pdf_loader.load()
+                logger.info(f"Loaded PDF '{pdf_path}' ({len(pages)} pages).")
+                chunks = text_splitter.split_documents(pages)
+                logger.info(f"Split PDF '{pdf_path}' into {len(chunks)} chunks.")
+                all_chunks.extend(chunks)
+            except Exception as e:
+                logger.error(f"Error loading PDF '{pdf_path}': {e}")
+                raise
 
-    return all_chunks
+        span["attributes"]["chunks_count"] = len(all_chunks)
+        return all_chunks
 
 
 __all__ = ["sanitize_filename", "split_pdfs"]

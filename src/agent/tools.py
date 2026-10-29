@@ -22,6 +22,7 @@ from src.core.ai_security.guardrails import (
     validate_embedding_model,
 )
 from src.core.compliance.state import record_retrieved_chunks
+from src.core.observability.tracing import start_span
 from src.core.storage import get_vectorstore, require_collection
 
 EMPTY_RETRIEVAL_MARKER = (
@@ -184,10 +185,17 @@ def get_retriever_tool(
 
     def _retrieve(query: str) -> str:
         """Executes similarity search, sanitizes chunks via DLP, and formats XML spotlight blocks."""
-        docs = retriever.invoke(query)
-        safe_docs = sanitize_retrieved_documents(docs)
-        record_retrieved_chunks(len(safe_docs))
-        return format_retrieved_chunks(safe_docs)
+        with start_span(
+            "agent.retriever_tool",
+            stage="retrieval",
+            collection_name=safe_collection,
+            k=k,
+        ) as span:
+            docs = retriever.invoke(query)
+            safe_docs = sanitize_retrieved_documents(docs)
+            record_retrieved_chunks(len(safe_docs))
+            span["attributes"]["retrieved_chunks"] = len(safe_docs)
+            return format_retrieved_chunks(safe_docs)
 
     return StructuredTool.from_function(
         func=_retrieve,

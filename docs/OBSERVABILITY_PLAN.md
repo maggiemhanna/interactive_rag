@@ -111,9 +111,9 @@ A common question is: *If we already generate an `X-Request-Id` on every call, w
 ### Phase 3: Distributed Tracing & Per-Stage Span Instrumentation (`src/core/observability/tracing.py` & `src/`)
 **Goal:** Record hierarchical spans and millisecond timings across Cloud Storage synchronization, PDF ingestion, vector search, and every LangGraph agent node.
 
-- [ ] **Span Tracer (`src/core/observability/tracing.py`):**
+- [x] **Span Tracer (`src/core/observability/tracing.py`):**
   - Implement `start_span(name, stage=None, **attributes)` context manager that generates a 16-character hex `span_id`, links to the parent `active_span_id` on `RequestContext`, measures duration via `time.perf_counter()`, records the completed span and stage latency via `record_span()` in `src/core/observability/state.py`, and optionally exports spans to **Google Cloud Trace** when `CLOUD_TRACE_ENABLED="true"`.
-- [ ] **Pipeline Instrumentation (`src/core/storage/`, `src/ingestion/`, `src/agent/`):**
+- [x] **Pipeline Instrumentation (`src/core/storage/`, `src/ingestion/`, `src/agent/`):**
   - **`src/core/storage/gcs_sync.py`:** Instrument Cloud Storage download/upload sync (`stage="gcs_sync"`).
   - **`src/ingestion/splitter.py` & `src/ingestion/service.py`:** Instrument PDF splitting (`stage="chunking"`), batched Chroma indexing (`stage="embedding"`), and vector search (`stage="retrieval"`).
   - **`src/agent/graph.py` & `src/agent/tools.py`:** Instrument `input_guard` (`stage="input_guard"`), `model_call` (`stage="llm"`), retriever tool execution (`stage="retrieval"`), and `output_guard` (`stage="output_guard"`).
