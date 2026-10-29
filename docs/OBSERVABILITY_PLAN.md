@@ -123,10 +123,10 @@ A common question is: *If we already generate an `X-Request-Id` on every call, w
 ### Phase 4: AI-Specific Monitoring & `interactiverag-telemetry` Stream (`src/core/observability/telemetry.py`, `src/agent/`, `src/ingestion/`)
 **Goal:** Capture per-turn latency breakdowns, streaming TTFT, Gemini token usage, and retrieval/grounding quality signals, and publish them as structured events to `interactiverag-telemetry`.
 
-- [ ] **AI Telemetry Helpers & `interactiverag-telemetry` Publisher (`src/core/observability/telemetry.py`):**
+- [x] **AI Telemetry Helpers & `interactiverag-telemetry` Publisher (`src/core/observability/telemetry.py`):**
   - Implement `record_llm_usage(response)` in `src/agent/graph.py` (`model_call`) to extract `input_tokens`, `output_tokens`, and `total_tokens` from `AIMessage.usage_metadata` and accumulate them across multi-step tool calls via `record_token_usage()` in `src/core/observability/state.py`.
   - Implement `record_retrieval_metrics(docs_with_scores)` in `src/agent/tools.py` and `src/ingestion/service.py` to capture `top_similarity_score`, `mean_similarity_score`, retrieved passage counts, and tool call counts via `src/core/observability/state.py`.
-  - Implement `emit_telemetry_event(event_type, **fields)` reading accumulated state from `src/core/observability/state.py` and publishing one structured AI/performance JSON record per completed request (`ingest.telemetry`, `query.telemetry`, `agent.telemetry`) to `projects/<project>/logs/interactiverag-telemetry` (`TELEMETRY_LOG_NAME`), enriched with `total_latency_ms`, `ttft_ms`, `stage_latency_ms`, `span_count`, `input_tokens`, `output_tokens`, `total_tokens`, `llm_calls`, `tool_calls_count`, `retrieved_passages`, `top_similarity_score`, `mean_similarity_score`, `citation_count`, and `grounded`.
+  - Implement `emit_telemetry_event(event_type, **fields)` reading accumulated state from `src/core/observability/state.py` and publishing one structured AI/performance JSON record per completed request (`document.ingest`, `vectorstore.query`, `agent.query`) to `projects/<project>/logs/interactiverag-telemetry` (`TELEMETRY_LOG_NAME`), enriched with `total_latency_ms`, `ttft_ms`, `stage_latency_ms`, `span_count`, `input_tokens`, `output_tokens`, `total_tokens`, `llm_calls`, `tool_calls_count`, `retrieved_passages`, `top_similarity_score`, `mean_similarity_score`, `citation_count`, and `grounded`.
 
 ---
 
@@ -170,9 +170,9 @@ curl -i -X POST "${AGENT_URL}/agent" \
   -d '{"query": "Summarize the key findings.", "collection_name": "financial_reports", "stream": false}'
 # Expect:
 # - HTTP response echoes `X-Request-Id: req-obs-demo-001`
-# - A structured `agent.telemetry` record is written to `interactiverag-telemetry` with:
+# - A structured `agent.query` record is written to `interactiverag-telemetry` with:
 #   {
-#     "event_type": "agent.telemetry", "model_name": "gemini-2.5-flash", "region": "us-central1",
+#     "event_type": "agent.query", "model_name": "gemini-2.5-flash", "region": "us-central1",
 #     "total_latency_ms": 1840.5,
 #     "stage_latency_ms": {"input_guard_ms": 95.2, "llm_ms": 1310.4, "retrieval_ms": 340.1, "output_guard_ms": 94.8},
 #     "input_tokens": 1420, "output_tokens": 215, "total_tokens": 1635, "llm_calls": 2,

@@ -31,6 +31,7 @@ from src.core.compliance.policy import enforce_query_rate_limit
 from src.core.compliance.provenance import build_compliance_metadata
 from src.core.config import AGENT_PORT, is_reload_enabled
 from src.core.logger import setup_logging
+from src.core.observability.telemetry import emit_telemetry_event
 from src.core.storage import LockTimeoutError, require_collection, user_read_lock
 
 logger = setup_logging(name="agent")
@@ -131,6 +132,19 @@ def agent(
             guardrail_actions=[
                 a["filter"] + ":" + a["action"] for a in compliance_meta["guardrail_actions"]
             ],
+        )
+        emit_telemetry_event(
+            "agent.query",
+            uid=uid,
+            collection_name=request.collection_name,
+            model_name=request.model_name,
+            embedding_model=request.embedding_model,
+            stream=False,
+            query_sha256=query_digest,
+            query_chars=query_len,
+            answer_chars=len(final_answer),
+            grounded=compliance_meta["grounded"],
+            citation_count=compliance_meta["citation_count"],
         )
 
         return {

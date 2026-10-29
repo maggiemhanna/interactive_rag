@@ -22,6 +22,7 @@ from src.core.compliance.audit import emit_audit_event
 from src.core.compliance.residency import validate_gcp_region
 from src.core.compliance.state import record_guardrail_action
 from src.core.logger import setup_logging
+from src.core.observability.telemetry import record_llm_usage
 from src.core.observability.tracing import start_span
 
 logger = setup_logging(name="agent.graph")
@@ -157,6 +158,8 @@ def build_agent(
         with start_span("agent.model_call", stage="llm", model_name=safe_model_name) as span:
             system_prompt = SystemMessage(content=SYSTEM_PROMPT)
             response = model_with_tools.invoke([system_prompt] + list(state["messages"]))
+            usage = record_llm_usage(response)
+            span["attributes"].update(usage)
 
             has_tools = bool(getattr(response, "tool_calls", None))
             span["attributes"]["has_tool_calls"] = has_tools

@@ -29,27 +29,41 @@ if TYPE_CHECKING:
         record_tool_call,
         record_ttft,
     )
+    from src.core.observability.telemetry import (
+        DEFAULT_TELEMETRY_LOG_NAME,
+        emit_telemetry_event,
+        get_telemetry_log_name,
+        record_llm_usage,
+        record_retrieval_metrics,
+        register_telemetry_listener,
+    )
     from src.core.observability.tracing import (
         register_span_listener,
         start_span,
     )
 
 _EXPORT_MAP: dict[str, str] = {
+    "DEFAULT_TELEMETRY_LOG_NAME": "src.core.observability.telemetry",
     "GCPJsonFormatter": "src.core.observability.logging",
     "RequestContextLogFilter": "src.core.observability.logging",
+    "emit_telemetry_event": "src.core.observability.telemetry",
     "get_elapsed_latency_ms": "src.core.observability.state",
     "get_recorded_spans": "src.core.observability.state",
     "get_retrieval_scores_summary": "src.core.observability.state",
     "get_stage_latency_ms": "src.core.observability.state",
+    "get_telemetry_log_name": "src.core.observability.telemetry",
     "get_token_usage_summary": "src.core.observability.state",
     "get_tool_calls_count": "src.core.observability.state",
     "get_ttft_ms": "src.core.observability.state",
+    "record_llm_usage": "src.core.observability.telemetry",
+    "record_retrieval_metrics": "src.core.observability.telemetry",
     "record_retrieval_scores": "src.core.observability.state",
     "record_span": "src.core.observability.state",
     "record_token_usage": "src.core.observability.state",
     "record_tool_call": "src.core.observability.state",
     "record_ttft": "src.core.observability.state",
     "register_span_listener": "src.core.observability.tracing",
+    "register_telemetry_listener": "src.core.observability.telemetry",
     "start_span": "src.core.observability.tracing",
 }
 

@@ -676,6 +676,269 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
+    """Phase 4 unit tests: token usage extraction, similarity score tracking, SSE TTFT, and `interactiverag-telemetry`."""
+
+    def test_record_llm_usage_and_retrieval_metrics_accumulation(self) -> None:
+        """Verifies `record_llm_usage()` and `record_retrieval_metrics()` accumulate across multi-step turns."""
+        from langchain_core.documents import Document
+        from langchain_core.messages import AIMessage
+
+        from src.core.observability import (
+            record_llm_usage,
+            record_retrieval_metrics,
+        )
+
+        ctx = RequestContext(
+            request_id="req-phase4-unit",
+            trace_id="405445aa7843bc8bf206b12000100000",
+            service_name="agent-api",
+        )
+        token = bind_request_context(ctx)
+        try:
+            # 1. First LLM call (tool-calling turn) via usage_metadata
+            msg_1 = AIMessage(
+                content="",
+                usage_metadata={"input_tokens": 180, "output_tokens": 35, "total_tokens": 215},
+            )
+            u1 = record_llm_usage(msg_1)
+            self.assertEqual(u1, {"input_tokens": 180, "output_tokens": 35, "total_tokens": 215})
+
+            # 2. Second LLM call (synthesis turn) via response_metadata.usage_metadata
+            msg_2 = AIMessage(
+                content="Grounded synthesis [report.pdf, p.1]",
+                response_metadata={
+                    "usage_metadata": {
+                        "prompt_token_count": 420,
+                        "candidates_token_count": 95,
+                        "total_token_count": 515,
+                    }
+                },
+            )
+            u2 = record_llm_usage(msg_2)
+            self.assertEqual(u2, {"input_tokens": 420, "output_tokens": 95, "total_tokens": 515})
+
+            summary = get_token_usage_summary()
+            self.assertEqual(summary["input_tokens"], 600)
+            self.assertEqual(summary["output_tokens"], 130)
+            self.assertEqual(summary["total_tokens"], 730)
+            self.assertEqual(summary["llm_calls"], 2)
+
+            # 3. Retrieval metrics across 2 tool calls
+            d1 = Document(page_content="Chunk A", metadata={"source": "report.pdf", "page": 0})
+            d2 = Document(page_content="Chunk B", metadata={"source": "report.pdf", "page": 1})
+            m1 = record_retrieval_metrics([(d1, 0.90), (d2, 0.70)], is_tool_call=True)
+            self.assertEqual(m1["tool_calls_count"], 1)
+            self.assertAlmostEqual(m1["top_similarity_score"], 0.90, places=4)
+            self.assertAlmostEqual(m1["mean_similarity_score"], 0.80, places=4)
+
+            d3 = Document(page_content="Chunk C", metadata={"source": "report.pdf", "page": 2})
+            m2 = record_retrieval_metrics([(d3, 0.80)], is_tool_call=True)
+            self.assertEqual(m2["tool_calls_count"], 2)
+            self.assertAlmostEqual(m2["top_similarity_score"], 0.90, places=4)
+            self.assertAlmostEqual(m2["mean_similarity_score"], 0.80, places=4)
+        finally:
+            reset_request_context(token)
+
+    def test_end_to_end_ingest_query_agent_and_sse_telemetry_emission(self) -> None:
+        """Verifies `/ingest`, `/query`, `/agent`, and `/agent/stream` emit complete `interactiverag-telemetry` records."""
+        import shutil
+        import tempfile
+        from unittest.mock import MagicMock, patch
+
+        from src.agent import app as agent_app_module
+        from src.agent import graph as agent_graph_module
+        from src.core.compliance.policy import reset_rate_limiters
+        from src.core.observability import (
+            DEFAULT_TELEMETRY_LOG_NAME,
+            get_telemetry_log_name,
+            register_telemetry_listener,
+        )
+        from src.core.observability import telemetry as telemetry_module
+        from src.core.storage import chroma as chroma_module
+        from src.core.storage import release_client_cache
+        from src.ingestion import app as ingestion_app_module
+        from tests.ai_security import (
+            DeterministicFakeEmbeddings,
+            GroundedCitingChatModel,
+            make_test_pdf,
+        )
+
+        self.assertEqual(get_telemetry_log_name(), DEFAULT_TELEMETRY_LOG_NAME)
+
+        chroma_tmp = tempfile.mkdtemp(prefix="obs_p4_chroma_")
+        uploads_tmp = tempfile.mkdtemp(prefix="obs_p4_uploads_")
+        agent_graph_module.MEMORY_SAVER.storage.clear()
+        reset_rate_limiters()
+
+        ingest_client = TestClient(ingestion_app_module.app)
+        agent_client = TestClient(agent_app_module.app)
+        telemetry_events = []
+        unregister = register_telemetry_listener(telemetry_events.append)
+
+        env = {
+            "AUTH_DISABLED": "true",
+            "K_SERVICE": "",
+            "DEV_USER_ID": "obs_user",
+            "GOOGLE_CLOUD_PROJECT": "interactive-rag",
+            "GOOGLE_CLOUD_LOCATION": "us-central1",
+            "ALLOWED_LLM_MODELS": "gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite",
+            "ALLOWED_EMBEDDING_MODELS": "gemini-embedding-001,text-embedding-005",
+            "LOCAL_CHROMA_ROOT": chroma_tmp,
+            "UPLOAD_TMP_ROOT": uploads_tmp,
+            "GCS_BUCKET_NAME": "",
+            "ARCHIVE_UPLOADS_TO_GCS": "false",
+            "MODEL_ARMOR_TEMPLATE_ID": "",
+        }
+
+        try:
+            with patch.dict(os.environ, env, clear=False), patch.object(
+                chroma_module,
+                "get_embeddings",
+                side_effect=lambda *args, **kwargs: DeterministicFakeEmbeddings(),
+            ), patch.object(
+                agent_graph_module,
+                "ChatGoogleGenerativeAI",
+                side_effect=lambda *args, **kwargs: GroundedCitingChatModel(*args, **kwargs),
+            ):
+                # 1. POST /ingest -> document.ingest
+                res_ingest = ingest_client.post(
+                    "/ingest",
+                    headers={
+                        "X-Request-Id": "req-obs-ingest-001",
+                        "X-Cloud-Trace-Context": "105445aa7843bc8bf206b12000100000/1;o=1",
+                    },
+                    data={"collection_name": "financial_reports"},
+                    files=[
+                        (
+                            "files",
+                            ("report.pdf", make_test_pdf("Q4 revenue reached 120 million USD."), "application/pdf"),
+                        )
+                    ],
+                )
+                self.assertEqual(res_ingest.status_code, 200)
+                ingest_tel = [e for e in telemetry_events if e["event_type"] == "document.ingest"]
+                self.assertEqual(len(ingest_tel), 1)
+                self.assertEqual(ingest_tel[0]["request_id"], "req-obs-ingest-001")
+                self.assertEqual(ingest_tel[0]["trace_id"], "105445aa7843bc8bf206b12000100000")
+                self.assertEqual(ingest_tel[0]["collection_name"], "financial_reports")
+                self.assertGreaterEqual(ingest_tel[0]["chunks_added"], 1)
+                self.assertIn("chunking_ms", ingest_tel[0]["stage_latency_ms"])
+                self.assertIn("embedding_ms", ingest_tel[0]["stage_latency_ms"])
+
+                # 2. POST /query -> vectorstore.query
+                telemetry_events.clear()
+                res_query = ingest_client.post(
+                    "/query",
+                    headers={
+                        "X-Request-Id": "req-obs-query-001",
+                        "X-Cloud-Trace-Context": "205445aa7843bc8bf206b12000100000/2;o=1",
+                    },
+                    json={"query": "What was Q4 revenue?", "collection_name": "financial_reports", "k": 2},
+                )
+                self.assertEqual(res_query.status_code, 200)
+                query_tel = [e for e in telemetry_events if e["event_type"] == "vectorstore.query"]
+                self.assertEqual(len(query_tel), 1)
+                self.assertEqual(query_tel[0]["request_id"], "req-obs-query-001")
+                self.assertEqual(query_tel[0]["retrieved_passages"], 1)
+                self.assertIsNotNone(query_tel[0]["top_similarity_score"])
+                self.assertIsNotNone(query_tel[0]["mean_similarity_score"])
+                self.assertIn("retrieval_ms", query_tel[0]["stage_latency_ms"])
+                self.assertNotIn("What was Q4 revenue?", json_dump := str(query_tel[0]))
+                self.assertIn("query_sha256", query_tel[0])
+
+                # 3. POST /agent (stream=False) -> agent.query
+                telemetry_events.clear()
+                res_agent = agent_client.post(
+                    "/agent",
+                    headers={
+                        "X-Request-Id": "req-obs-agent-001",
+                        "X-Cloud-Trace-Context": "305445aa7843bc8bf206b12000100000/3;o=1",
+                    },
+                    json={
+                        "query": "Summarize Q4 revenue.",
+                        "collection_name": "financial_reports",
+                        "model_name": "gemini-2.5-flash",
+                        "thread_id": "t-sync",
+                        "stream": False,
+                    },
+                )
+                self.assertEqual(res_agent.status_code, 200)
+                agent_tel = [e for e in telemetry_events if e["event_type"] == "agent.query"]
+                self.assertEqual(len(agent_tel), 1)
+                rec = agent_tel[0]
+                self.assertEqual(rec["request_id"], "req-obs-agent-001")
+                self.assertEqual(rec["trace_id"], "305445aa7843bc8bf206b12000100000")
+                self.assertEqual(rec["model_name"], "gemini-2.5-flash")
+                self.assertEqual(rec["input_tokens"], 470)
+                self.assertEqual(rec["output_tokens"], 105)
+                self.assertEqual(rec["total_tokens"], 575)
+                self.assertEqual(rec["llm_calls"], 2)
+                self.assertEqual(rec["tool_calls_count"], 1)
+                self.assertEqual(rec["retrieved_passages"], 1)
+                self.assertIsNotNone(rec["top_similarity_score"])
+                self.assertIsNotNone(rec["mean_similarity_score"])
+                self.assertTrue(rec["grounded"])
+                self.assertGreaterEqual(rec["citation_count"], 1)
+                for stage_key in ("input_guard_ms", "llm_ms", "retrieval_ms", "output_guard_ms"):
+                    self.assertIn(stage_key, rec["stage_latency_ms"])
+
+                # 4. POST /agent/stream (stream=True) -> agent.query with ttft_ms
+                telemetry_events.clear()
+                res_stream = agent_client.post(
+                    "/agent/stream",
+                    headers={
+                        "X-Request-Id": "req-obs-stream-001",
+                        "X-Cloud-Trace-Context": "405445aa7843bc8bf206b12000100000/4;o=1",
+                    },
+                    json={
+                        "query": "Stream Q4 revenue summary.",
+                        "collection_name": "financial_reports",
+                        "model_name": "gemini-2.5-flash",
+                        "thread_id": "t-stream",
+                    },
+                )
+                self.assertEqual(res_stream.status_code, 200)
+                stream_tel = [e for e in telemetry_events if e["event_type"] == "agent.query"]
+                self.assertEqual(len(stream_tel), 1)
+                srec = stream_tel[0]
+                self.assertTrue(srec["stream"])
+                self.assertIn("ttft_ms", srec)
+                self.assertIsNotNone(srec["ttft_ms"])
+                self.assertGreaterEqual(srec["ttft_ms"], 0.0)
+                self.assertLessEqual(srec["ttft_ms"], srec["total_latency_ms"])
+
+                # 5. Verify Cloud Logging log_struct transport when TELEMETRY_CLOUD_LOGGING_ENABLED=true
+                mock_cloud_logger = MagicMock()
+                telemetry_module._cloud_loggers.clear()
+                with patch.dict(
+                    os.environ,
+                    {"TELEMETRY_CLOUD_LOGGING_ENABLED": "true"},
+                    clear=False,
+                ), patch.object(
+                    telemetry_module,
+                    "_get_cloud_logger",
+                    return_value=mock_cloud_logger,
+                ):
+                    telemetry_module.emit_telemetry_event(
+                        "agent.query",
+                        uid="obs_user",
+                        model_name="gemini-2.5-flash",
+                        grounded=True,
+                    )
+                    mock_cloud_logger.log_struct.assert_called_once()
+        finally:
+            unregister()
+            if os.path.exists(chroma_tmp):
+                for entry in os.scandir(chroma_tmp):
+                    if entry.is_dir():
+                        release_client_cache(entry.path)
+                shutil.rmtree(chroma_tmp, ignore_errors=True)
+            shutil.rmtree(uploads_tmp, ignore_errors=True)
+            reset_rate_limiters()
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

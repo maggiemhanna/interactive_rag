@@ -56,7 +56,12 @@ class GroundedCitingChatModel:
         last = messages[-1]
         if getattr(last, "type", "") == "tool":
             return AIMessage(
-                content=f"Based on retrieved chunk [report.pdf, p.1]: {last.content}"
+                content=f"Based on retrieved chunk [report.pdf, p.1]: {last.content}",
+                usage_metadata={
+                    "input_tokens": 350,
+                    "output_tokens": 80,
+                    "total_tokens": 430,
+                },
             )
         query_text = getattr(last, "content", "query")
         return AIMessage(
@@ -68,6 +73,11 @@ class GroundedCitingChatModel:
                     "args": {"query": str(query_text)},
                 }
             ],
+            usage_metadata={
+                "input_tokens": 120,
+                "output_tokens": 25,
+                "total_tokens": 145,
+            },
         )
 
 

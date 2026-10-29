@@ -183,6 +183,7 @@ InteractiveRAG/
 │   │   ├── observability/              # Observability & AI monitoring package
 │   │   │   ├── logging.py              # Structured GCP JSON formatter & request correlation filter
 │   │   │   ├── state.py                # Per-request latency, TTFT, token, score & span state accumulators
+│   │   │   ├── telemetry.py            # AI-specific monitoring & interactiverag-telemetry publisher
 │   │   │   └── tracing.py              # Hierarchical per-stage span tracer & Cloud Trace exporter
 │   │   ├── storage/                    # Multi-tenant ChromaDB & Cloud Storage persistence
 │   │   │   ├── chroma.py               # Regional Vertex AI embeddings & ChromaDB client factory

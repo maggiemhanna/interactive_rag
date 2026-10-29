@@ -14,7 +14,9 @@ from langchain_core.documents import Document
 from src.core.ai_security.armor import sanitize_retrieved_documents
 from src.core.compliance.audit import hash_query
 from src.core.compliance.policy import enforce_collection_quota
+from src.core.compliance.state import record_retrieved_chunks
 from src.core.logger import setup_logging
+from src.core.observability.telemetry import record_retrieval_metrics
 from src.core.observability.tracing import start_span
 from src.core.storage import (
     get_vectorstore,
@@ -145,12 +147,23 @@ def search_collection(
                 persist_directory=persist_directory,
                 embedding_model=embedding_model,
             )
-            retriever = vectorstore.as_retriever(
-                search_type="similarity", search_kwargs={"k": k}
-            )
-            docs = retriever.invoke(query)
+            if hasattr(vectorstore, "similarity_search_with_score"):
+                raw_pairs = vectorstore.similarity_search_with_score(query, k=k)
+                docs = [doc for doc, _ in raw_pairs]
+                scored = [
+                    (doc, round(1.0 / (1.0 + max(0.0, float(dist))), 4))
+                    for doc, dist in raw_pairs
+                ]
+            else:
+                retriever = vectorstore.as_retriever(
+                    search_type="similarity", search_kwargs={"k": k}
+                )
+                docs = retriever.invoke(query)
+                scored = docs
+            metrics = record_retrieval_metrics(scored, is_tool_call=False)
 
             safe_docs = sanitize_retrieved_documents(docs)
+            record_retrieved_chunks(len(safe_docs))
             results = [
                 {
                     "page_content": doc.page_content,
@@ -159,6 +172,8 @@ def search_collection(
                 for doc in safe_docs
             ]
             span["attributes"]["results_count"] = len(results)
+            if metrics.get("top_similarity_score") is not None:
+                span["attributes"]["top_similarity_score"] = metrics["top_similarity_score"]
 
     query_digest = hash_query(query)
     logger.info(

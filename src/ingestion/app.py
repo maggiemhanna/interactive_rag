@@ -21,6 +21,7 @@ from src.core.compliance.audit import emit_audit_event, hash_query
 from src.core.compliance.policy import enforce_query_rate_limit
 from src.core.config import INGESTION_PORT, is_reload_enabled
 from src.core.logger import setup_logging
+from src.core.observability.telemetry import emit_telemetry_event
 from src.core.storage import LockTimeoutError
 from src.ingestion.schemas import QueryRequest
 from src.ingestion.service import ingest_documents, search_collection
@@ -68,6 +69,14 @@ async def ingest(
             chunks_added=len(payload.chunks),
             file_count=len(payload.processed_files),
             processed_files=payload.processed_files,
+        )
+        emit_telemetry_event(
+            "document.ingest",
+            uid=uid,
+            collection_name=payload.collection_name,
+            embedding_model=payload.embedding_model,
+            chunks_added=len(payload.chunks),
+            file_count=len(payload.processed_files),
         )
 
         return {
@@ -150,6 +159,16 @@ def query(
             embedding_model=request.embedding_model,
         )
         emit_audit_event(
+            "vectorstore.query",
+            uid=uid,
+            collection_name=request.collection_name,
+            embedding_model=request.embedding_model,
+            k=request.k,
+            results_count=len(results),
+            query_sha256=query_digest,
+            query_chars=query_len,
+        )
+        emit_telemetry_event(
             "vectorstore.query",
             uid=uid,
             collection_name=request.collection_name,
