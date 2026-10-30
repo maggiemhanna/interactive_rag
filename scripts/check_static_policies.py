@@ -200,6 +200,106 @@ def _check_cloud_run_tf(infra_dir: str) -> List[str]:
                 f'infra/cloud_run.tf service "{backend_svc}" must not disable MODEL_ARMOR_FAIL_CLOSED ({fail_closed_val}).'
             )
 
+        for obs_env, expected_val in (
+            ("TELEMETRY_LOG_NAME", "interactiverag-telemetry"),
+            ("STRUCTURED_LOGGING", "true"),
+            ("CLOUD_TRACE_ENABLED", "true"),
+        ):
+            raw_obs = env_map.get(obs_env)
+            if not raw_obs:
+                violations.append(
+                    f'infra/cloud_run.tf service "{backend_svc}" must set {obs_env}.'
+                )
+            elif raw_obs.strip('"') != expected_val:
+                violations.append(
+                    f'infra/cloud_run.tf service "{backend_svc}" must set {obs_env}="{expected_val}" (found {raw_obs}).'
+                )
+
+    return violations
+
+
+def _check_observability_tf(infra_dir: str) -> List[str]:
+    """Checks `infra/observability.tf` for regional log bucket pinning, sink routing, log metrics, and dashboard.
+
+    Args:
+        infra_dir: Path to the `infra/` Terraform directory.
+
+    Returns:
+        List of policy violation messages (empty when compliant).
+    """
+    violations: List[str] = []
+    obs_path = os.path.join(infra_dir, "observability.tf")
+    if not os.path.isfile(obs_path):
+        return [f"Missing required Terraform file: {obs_path}"]
+
+    with open(obs_path, encoding="utf-8") as fh:
+        content = fh.read()
+
+    bucket_match = re.search(
+        r'resource\s+"google_logging_project_bucket_config"\s+"observability_telemetry"\s*\{(?P<body>.*?)\n\}',
+        content,
+        re.DOTALL,
+    )
+    if not bucket_match:
+        violations.append(
+            'infra/observability.tf is missing google_logging_project_bucket_config "observability_telemetry".'
+        )
+    else:
+        bucket_body = bucket_match.group("body")
+        loc_match = re.search(r"^\s*location\s*=\s*(.+?)\s*$", bucket_body, re.MULTILINE)
+        if not loc_match or loc_match.group(1).strip() != "var.region":
+            violations.append(
+                'infra/observability.tf "observability_telemetry" bucket must set location = var.region.'
+            )
+        if not re.search(r"precondition\s*\{.*?regex\(", bucket_body, re.DOTALL):
+            violations.append(
+                'infra/observability.tf "observability_telemetry" bucket must enforce a single-region regex precondition.'
+            )
+
+    sink_match = re.search(
+        r'resource\s+"google_logging_project_sink"\s+"observability_sink"\s*\{(?P<body>.*?)\n\}',
+        content,
+        re.DOTALL,
+    )
+    if not sink_match:
+        violations.append(
+            'infra/observability.tf is missing google_logging_project_sink "observability_sink".'
+        )
+    else:
+        sink_body = sink_match.group("body")
+        if "interactiverag-telemetry" not in sink_body:
+            violations.append(
+                'infra/observability.tf "observability_sink" filter must include interactiverag-telemetry.'
+            )
+
+    for metric_name in (
+        "agent_turn_latency_ms",
+        "agent_ttft_ms",
+        "agent_llm_stage_latency_ms",
+        "agent_retrieval_stage_latency_ms",
+        "agent_input_tokens",
+        "agent_output_tokens",
+        "agent_total_tokens",
+        "retrieval_mean_similarity_score",
+        "agent_ungrounded_answers",
+        "ingestion_chunks_added",
+    ):
+        if not re.search(
+            rf'resource\s+"google_logging_metric"\s+"{metric_name}"\s*\{{',
+            content,
+        ):
+            violations.append(
+                f'infra/observability.tf is missing google_logging_metric "{metric_name}".'
+            )
+
+    if not re.search(
+        r'resource\s+"google_monitoring_dashboard"\s+"observability_dashboard"\s*\{',
+        content,
+    ):
+        violations.append(
+            'infra/observability.tf is missing google_monitoring_dashboard "observability_dashboard".'
+        )
+
     return violations
 
 
@@ -260,7 +360,7 @@ def _check_all_tf_locations_and_tfvars(infra_dir: str) -> List[str]:
 
 
 def evaluate_repo_static_policies(repo_root: str) -> Tuple[bool, List[str]]:
-    """Evaluates all static residency, fail-closed screening, and deletion-protection policies for `repo_root`.
+    """Evaluates all static residency, fail-closed screening, observability, and deletion-protection policies for `repo_root`.
 
     Args:
         repo_root: Root directory of the InteractiveRAG repository.
@@ -273,6 +373,7 @@ def evaluate_repo_static_policies(repo_root: str) -> Tuple[bool, List[str]]:
     violations.extend(_check_python_config(repo_root))
     violations.extend(_check_terraform_variables(infra_dir))
     violations.extend(_check_cloud_run_tf(infra_dir))
+    violations.extend(_check_observability_tf(infra_dir))
     violations.extend(_check_all_tf_locations_and_tfvars(infra_dir))
     return len(violations) == 0, violations
 

@@ -112,3 +112,27 @@ output "application_audit_log_name" {
   description = "Full GCP Cloud Logging logName for structured InteractiveRAG compliance events."
   value       = "projects/${var.project_id}/logs/interactiverag-audit"
 }
+
+# ==============================================================================
+# 6. Observability & AI Monitoring Outputs
+# ==============================================================================
+
+output "observability_log_bucket_id" {
+  description = "Regional Cloud Logging bucket storing operational container logs and interactiverag-telemetry events."
+  value       = google_logging_project_bucket_config.observability_telemetry.id
+}
+
+output "observability_log_sink_name" {
+  description = "Project-level Cloud Logging sink routing telemetry and container logs into the regional observability bucket."
+  value       = google_logging_project_sink.observability_sink.name
+}
+
+output "application_telemetry_log_name" {
+  description = "Full GCP Cloud Logging logName for structured InteractiveRAG AI & performance telemetry events."
+  value       = "projects/${var.project_id}/logs/interactiverag-telemetry"
+}
+
+output "observability_dashboard_id" {
+  description = "Google Cloud Monitoring dashboard resource ID for InteractiveRAG Observability & AI Monitoring."
+  value       = google_monitoring_dashboard.observability_dashboard.id
+}

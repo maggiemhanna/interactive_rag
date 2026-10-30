@@ -38,7 +38,7 @@ InteractiveRAG separates document ingestion from multi-turn agentic retrieval so
 
 ## 🏗️ Cloud Architecture & Defense-in-Depth Blueprints
 
-InteractiveRAG is engineered for reproducible deployment on **Google Cloud Platform (GCP)** across four defense-in-depth layers documented in [`docs/`](docs/):
+InteractiveRAG is engineered for reproducible deployment on **Google Cloud Platform (GCP)** across five defense-in-depth layers documented in [`docs/`](docs/):
 
 | Layer | Blueprint Document | Focus Area |
 | :--- | :--- | :--- |
@@ -46,6 +46,7 @@ InteractiveRAG is engineered for reproducible deployment on **Google Cloud Platf
 | **2. Network Security** | [`docs/NETWORK_SECURITY_PLAN.md`](docs/NETWORK_SECURITY_PLAN.md) | Global External HTTPS Load Balancer (`sslip.io` TLS), locked-down Cloud Run ingress, zero-internet custom VPC, Private Google Access, and Regional Private Service Connect |
 | **3. AI-Specific Security** | [`docs/AI_SECURITY_PLAN.md`](docs/AI_SECURITY_PLAN.md) | Prompt injection mitigation (Model Armor & XML spotlighting), model allowlists, grounding & upload guardrails, Cloud DLP redaction, and dual-layer content safety |
 | **4. Compliance, Privacy & Governance** | [`docs/COMPLIANCE_GOVERNANCE_PLAN.md`](docs/COMPLIANCE_GOVERNANCE_PLAN.md) | Single-region data residency, end-to-end audit & data-access logging, GDPR self-service rights, EU AI Act provenance transparency, fail-closed screening, and rate/quota enforcement |
+| **5. Observability & AI Monitoring** | [`docs/OBSERVABILITY_PLAN.md`](docs/OBSERVABILITY_PLAN.md) | Structured GCP JSON operational logging, Cloud Monitoring log-based metrics & dashboards, distributed per-stage tracing, and AI-specific latency, token & retrieval quality telemetry |
 
 ---
 
@@ -162,6 +163,30 @@ Enterprise governance controls ensure that all data and AI calls stay within app
 
 ---
 
+### 5. Observability & AI Monitoring ([`docs/OBSERVABILITY_PLAN.md`](docs/OBSERVABILITY_PLAN.md))
+
+While compliance audit logging records *who* performed *what* action and *when* for regulatory accountability, the observability layer gives operators real-time visibility into *how fast*, *at what token cost*, and *with what retrieval and grounding quality* every request executed—all while keeping user queries private and staying strictly inside our single-region, zero-internet network perimeter:
+
+- **5.1 Pillar 1 — Structured Logging & Privacy-Safe Correlation**
+  - **Dual-Mode Application Logging:** In Cloud Run (`K_SERVICE` set or `STRUCTURED_LOGGING="true"`), all operational logs are emitted to `stdout` as single-line JSON records formatted with Google Cloud's native `severity`, `message`, `timestamp`, `logging.googleapis.com/trace`, `logging.googleapis.com/spanId`, and `logging.googleapis.com/sourceLocation` fields, while preserving human-readable `coloredlogs` formatting for local terminal development. — *See [`src/core/observability/logging.py`](src/core/observability/logging.py), [`src/core/logger.py`](src/core/logger.py) & [`src/core/config.py`](src/core/config.py)*
+  - **Neutral Request Context & Automatic Query Scrubbing:** A shared request correlation context (`src/core/context.py`) decouples compliance auditing from operational logging. Every log record is automatically enriched with `request_id`, `trace_id`, `span_id`, `service`, and `uid`, while any accidental raw query text is scrubbed into SHA-256 hashes and character counts so user prompts never leak into operational logs. — *See [`src/core/context.py`](src/core/context.py) & [`src/core/observability/logging.py`](src/core/observability/logging.py)*
+  - **Dedicated Regional Observability Log Bucket:** Terraform provisions a regional Cloud Logging bucket (`observability_telemetry`) pinned to `var.region` (30-day default retention, with a single-region regex precondition) and routes both `interactiverag-telemetry` and Cloud Run container logs into it. — *See [`infra/observability.tf`](infra/observability.tf)*
+
+- **5.2 Pillar 2 — Cloud Monitoring Metrics & Unified Dashboard**
+  - **Zero-Overhead Log-Based Metrics (`google_logging_metric`):** Instead of adding synchronous monitoring API calls to the request hot path, Google Cloud's Log Router automatically extracts 10 log-based metrics directly from `interactiverag-telemetry` events: turn latency (`agent_turn_latency_ms`), streaming TTFT (`agent_ttft_ms`), Gemini vs. retrieval stage latencies (`agent_llm_stage_latency_ms`, `agent_retrieval_stage_latency_ms`), prompt/completion/total token usage (`agent_input_tokens`, `agent_output_tokens`, `agent_total_tokens`), retrieval similarity scores (`retrieval_mean_similarity_score`), ungrounded response counts (`agent_ungrounded_answers`), and ingested chunk counts (`ingestion_chunks_added`). — *See [`infra/observability.tf`](infra/observability.tf)*
+  - **Unified Cloud Monitoring Dashboard (`google_monitoring_dashboard`):** Terraform provisions an 8-panel observability dashboard charting `p50`/`p95` agent turn latency, `p50`/`p95` streaming TTFT, Gemini LLM vs. vector retrieval stage latencies, input/output/total token consumption by model, vector similarity score distributions, ungrounded/blocked response counts, document ingestion throughput, and Cloud Run request volume by HTTP response code class. — *See [`infra/observability.tf`](infra/observability.tf)*
+
+- **5.3 Pillar 3 — Distributed Tracing & Stage-Level Latency Breakdown**
+  - **Hierarchical Per-Stage Spans (`start_span`):** Every stage of document ingestion, vector search, and LangGraph agent execution—including Cloud Storage snapshot sync (`gcs_sync`), PDF splitting (`chunking`), Vertex AI embedding indexing (`embedding`), Model Armor input screening (`input_guard`), each Gemini reasoning call (`llm`), ChromaDB retriever tool execution (`retrieval`), and output screening (`output_guard`)—is timed as a child span with parent-child `span_id` linkage. — *See [`src/core/observability/tracing.py`](src/core/observability/tracing.py), [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py), [`src/ingestion/splitter.py`](src/ingestion/splitter.py), [`src/ingestion/service.py`](src/ingestion/service.py), [`src/agent/graph.py`](src/agent/graph.py) & [`src/agent/tools.py`](src/agent/tools.py)*
+  - **Cloud Trace Export:** When `CLOUD_TRACE_ENABLED="true"` on Cloud Run, completed spans are exported to **Google Cloud Trace** over Private Google Access so operators can inspect end-to-end request waterfalls alongside correlated logs. — *See [`src/core/observability/tracing.py`](src/core/observability/tracing.py) & [`infra/cloud_run.tf`](infra/cloud_run.tf)*
+
+- **5.4 Pillar 4 — AI-Specific Monitoring (Latency, Token Usage & Retrieval Quality)**
+  - **Turn Latency, Stage Breakdown & Streaming TTFT:** Every completed request (`document.ingest`, `vectorstore.query`, `agent.query`) emits a structured telemetry record to `interactiverag-telemetry` containing total wall-clock latency (`total_latency_ms`), per-stage millisecond rollups (`stage_latency_ms`), and—on `/agent/stream`—Time-to-First-Token (`ttft_ms`). — *See [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py), [`src/core/observability/state.py`](src/core/observability/state.py) & [`src/agent/stream.py`](src/agent/stream.py)*
+  - **Multi-Step Gemini Token Accounting:** Across all tool-calling iterations in a conversation turn, `record_llm_usage()` extracts prompt, completion, and total token counts from `AIMessage.usage_metadata` and accumulates `input_tokens`, `output_tokens`, `total_tokens`, and `llm_calls` per turn. — *See [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py) & [`src/agent/graph.py`](src/agent/graph.py)*
+  - **Deterministic Retrieval & Grounding Quality Signals:** Every search and agent turn records normalized ChromaDB similarity scores (`top_similarity_score` and `mean_similarity_score`), retriever tool call counts (`tool_calls_count`), retrieved passage counts (`retrieved_passages`), inline `[filename.pdf, p.X]` citation counts (`citation_count`), and grounding status (`grounded`) without making extra LLM judge calls. — *See [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py), [`src/agent/tools.py`](src/agent/tools.py) & [`src/ingestion/service.py`](src/ingestion/service.py)*
+
+---
+
 ## 📁 Repository Structure
 
 ```text
@@ -225,6 +250,7 @@ InteractiveRAG/
 │   ├── ai_security.tf                  # Cloud DLP inspect/de-identify templates & Model Armor
 │   ├── cloud_run.tf                    # Frontend, Ingestion API & Agent API Cloud Run services
 │   ├── compliance.tf                   # Cloud Audit Logs, 365-day regional audit bucket & log sink
+│   ├── observability.tf                # Regional telemetry log bucket, sink, log metrics & dashboard
 │   ├── variables.tf                    # Parameterized infrastructure, security & compliance settings
 │   ├── outputs.tf                      # Deployed URLs, IPs, bucket names & template identifiers
 │   ├── terraform.tfvars.example        # Template for environment-specific variable values
@@ -236,13 +262,15 @@ InteractiveRAG/
 │   ├── GCP_DEPLOYMENT_PLAN.md          # Layer 1: Cloud Deployment & Multi-Tenant Persistence
 │   ├── NETWORK_SECURITY_PLAN.md        # Layer 2: Zero-Internet VPC & Network Security
 │   ├── AI_SECURITY_PLAN.md             # Layer 3: AI-Specific Security (5 Pillars)
-│   └── COMPLIANCE_GOVERNANCE_PLAN.md   # Layer 4: Compliance, Data Privacy & Governance
+│   ├── COMPLIANCE_GOVERNANCE_PLAN.md   # Layer 4: Compliance, Data Privacy & Governance
+│   └── OBSERVABILITY_PLAN.md           # Layer 5: Observability & AI Monitoring (4 Pillars)
 ├── tests/                              # Automated unit suites & live smoke scripts
 │   ├── auth.py                         # Token verification, tenant UID validation & bypass tests
 │   ├── storage.py                      # Per-user GCS sync, distributed lock & LRU cache tests
 │   ├── multi_tenant_api.py             # Cross-tenant isolation tests across REST & SSE APIs
 │   ├── ai_security.py                  # Unit tests for all 5 AI security pillars
 │   ├── compliance.py                   # Unit tests for residency, audit logs, DSAR, provenance & quotas
+│   ├── observability.py                # Unit tests for structured logs, spans, tokens, TTFT & telemetry
 │   ├── ingestion.py                    # Live local PDF ingestion & similarity search smoke test
 │   └── agent.py                        # Live local JSON & SSE agent streaming smoke test
 ├── docker/                             # Backend & frontend Dockerfiles + Nginx startup scripts
@@ -355,11 +383,11 @@ The root [`Makefile`](Makefile) automates the complete deployment lifecycle. It 
 
 ## 🧪 Testing & Verification
 
-### 1. Offline Unit, Multi-Tenant, AI Security & Compliance Test Suites
+### 1. Offline Unit, Multi-Tenant, AI Security, Compliance & Observability Test Suites
 Run the full offline test suite and static policy verifier (no live cloud resources required):
 ```bash
 make check-static-policy
-python -m unittest tests.auth tests.storage tests.multi_tenant_api tests.ai_security tests.compliance -v
+python -m unittest tests.auth tests.storage tests.multi_tenant_api tests.ai_security tests.compliance tests.observability -v
 ```
 
 ### 2. Live Local Smoke Scripts

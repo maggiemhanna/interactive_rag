@@ -3,12 +3,13 @@
 # ==============================================================================
 
 locals {
-  # Complete set of Google Cloud APIs required across all four architectural layers:
+  # Complete set of Google Cloud APIs required across all five architectural layers:
   # - Layer 1 (Compute, Storage & Auth): Cloud Run, Artifact Registry, Cloud Build, Cloud Storage,
   #   IAM, Identity Platform (`identitytoolkit`), API Keys, and Secret Manager.
   # - Layer 2 (Network Security): Compute Engine (VPC/Load Balancer), Cloud DNS, and Network Connectivity (PSC).
   # - Layer 3 (AI & Security): Vertex AI (`aiplatform`), Cloud Model Armor, and Sensitive Data Protection (`dlp`).
   # - Layer 4 (Compliance & Audit): Cloud Logging (`logging`).
+  # - Layer 5 (Observability & AI Monitoring): Cloud Monitoring (`monitoring`) and Cloud Trace (`cloudtrace`).
   required_services = toset([
     "run.googleapis.com",
     "artifactregistry.googleapis.com",
@@ -25,6 +26,8 @@ locals {
     "apikeys.googleapis.com",
     "secretmanager.googleapis.com",
     "logging.googleapis.com",
+    "monitoring.googleapis.com",
+    "cloudtrace.googleapis.com",
   ])
 
   # Base URL for pushing and pulling regional backend and frontend Docker images.

@@ -312,3 +312,18 @@ variable "max_collections_per_user" {
     error_message = "max_collections_per_user must be a positive integer (>= 1)."
   }
 }
+
+# ==============================================================================
+# 7. Observability & AI Monitoring
+# ==============================================================================
+
+variable "observability_log_retention_days" {
+  description = "Retention period in days for the regional Cloud Logging observability & telemetry bucket (1 to 3650 days)."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.observability_log_retention_days >= 1 && var.observability_log_retention_days <= 3650
+    error_message = "observability_log_retention_days must be between 1 and 3650 days."
+  }
+}

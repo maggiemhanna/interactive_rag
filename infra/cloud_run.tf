@@ -169,6 +169,18 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
         name  = "AUDIT_CLOUD_LOGGING_ENABLED"
         value = "true"
       }
+      env {
+        name  = "TELEMETRY_LOG_NAME"
+        value = "interactiverag-telemetry"
+      }
+      env {
+        name  = "STRUCTURED_LOGGING"
+        value = "true"
+      }
+      env {
+        name  = "CLOUD_TRACE_ENABLED"
+        value = "true"
+      }
     }
   }
 
@@ -177,10 +189,14 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
   depends_on = [
     google_project_service.required_apis["run.googleapis.com"],
     google_project_service.required_apis["logging.googleapis.com"],
+    google_project_service.required_apis["monitoring.googleapis.com"],
+    google_project_service.required_apis["cloudtrace.googleapis.com"],
     google_project_iam_member.backend_vertex_ai_user,
     google_project_iam_member.backend_model_armor_user,
     google_project_iam_member.backend_dlp_user,
     google_project_iam_member.backend_log_writer,
+    google_project_iam_member.backend_metric_writer,
+    google_project_iam_member.backend_trace_agent,
     google_storage_bucket_iam_member.backend_chroma_bucket_object_user,
     google_model_armor_template.rag_guard,
     google_compute_route.private_googleapis,
@@ -321,16 +337,32 @@ resource "google_cloud_run_v2_service" "agent_api" {
         name  = "AUDIT_CLOUD_LOGGING_ENABLED"
         value = "true"
       }
+      env {
+        name  = "TELEMETRY_LOG_NAME"
+        value = "interactiverag-telemetry"
+      }
+      env {
+        name  = "STRUCTURED_LOGGING"
+        value = "true"
+      }
+      env {
+        name  = "CLOUD_TRACE_ENABLED"
+        value = "true"
+      }
     }
   }
 
   depends_on = [
     google_project_service.required_apis["run.googleapis.com"],
     google_project_service.required_apis["logging.googleapis.com"],
+    google_project_service.required_apis["monitoring.googleapis.com"],
+    google_project_service.required_apis["cloudtrace.googleapis.com"],
     google_project_iam_member.backend_vertex_ai_user,
     google_project_iam_member.backend_model_armor_user,
     google_project_iam_member.backend_dlp_user,
     google_project_iam_member.backend_log_writer,
+    google_project_iam_member.backend_metric_writer,
+    google_project_iam_member.backend_trace_agent,
     google_storage_bucket_iam_member.backend_chroma_bucket_object_user,
     google_model_armor_template.rag_guard,
     google_compute_route.private_googleapis,

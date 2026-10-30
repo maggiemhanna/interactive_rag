@@ -46,3 +46,6 @@ rate_limit_ingest_per_minute = 10
 rate_limit_query_per_minute  = 30
 max_collections_per_user     = 20
 
+# Observability & AI Monitoring
+observability_log_retention_days = 30
+

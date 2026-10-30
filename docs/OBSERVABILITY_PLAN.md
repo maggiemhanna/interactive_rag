@@ -133,14 +133,14 @@ A common question is: *If we already generate an `X-Request-Id` on every call, w
 ### Phase 5: Regional Observability Infrastructure, Offline Test Suite & Documentation (`infra/observability.tf`, `tests/observability.py`, `README.md`)
 **Goal:** Provision the regional observability log bucket, Cloud Monitoring log-based metrics, and dashboard in Terraform, and verify all observability behavior offline with `unittest`.
 
-- [ ] **Terraform Observability Infrastructure (`infra/observability.tf`, `infra/apis.tf`, `infra/iam.tf`, `infra/cloud_run.tf`, `infra/outputs.tf`):**
+- [x] **Terraform Observability Infrastructure (`infra/observability.tf`, `infra/apis.tf`, `infra/iam.tf`, `infra/cloud_run.tf`, `infra/outputs.tf`):**
   - **`infra/apis.tf` & `infra/iam.tf`:** Enable `monitoring.googleapis.com` and `cloudtrace.googleapis.com`; grant `roles/monitoring.metricWriter` and `roles/cloudtrace.agent` to `backend_sa`.
   - **`infra/cloud_run.tf`:** Set `TELEMETRY_LOG_NAME = "interactiverag-telemetry"`, `STRUCTURED_LOGGING = "true"`, and `CLOUD_TRACE_ENABLED = "true"` on `ingestion_api` and `agent_api`.
   - **`infra/observability.tf`:**
     - Provision a regional Cloud Logging bucket (`google_logging_project_bucket_config.observability_telemetry`) pinned to `var.region` (30-day default retention, with single-region precondition).
     - Provision a log sink (`google_logging_project_sink.observability_sink`) routing `interactiverag-telemetry` and Cloud Run `stdout`/`stderr` container logs into the regional `observability_telemetry` bucket.
-    - Provision `google_logging_metric` resources over `interactiverag-telemetry` (`agent_turn_latency_ms`, `agent_total_tokens`, `agent_ungrounded_answers`) and a `google_monitoring_dashboard`.
-- [ ] **Automated Offline Test Suite (`tests/observability.py`) & Documentation (`README.md`):**
+    - Provision `google_logging_metric` resources over `interactiverag-telemetry` (`agent_turn_latency_ms`, `agent_ttft_ms`, `agent_llm_stage_latency_ms`, `agent_retrieval_stage_latency_ms`, `agent_input_tokens`, `agent_output_tokens`, `agent_total_tokens`, `retrieval_mean_similarity_score`, `agent_ungrounded_answers`, `ingestion_chunks_added`) and a unified 8-widget `google_monitoring_dashboard`.
+- [x] **Automated Offline Test Suite (`tests/observability.py`) & Documentation (`README.md`):**
   - Verify `src/core/context.py` request isolation, structured JSON log formatting and query scrubbing, hierarchical span timings across LangGraph nodes, multi-turn token accumulation, similarity score tracking, SSE `ttft_ms`, and `interactiverag-telemetry` event emission.
 
 ---

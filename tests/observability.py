@@ -938,6 +938,120 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
             reset_rate_limiters()
 
 
+class TestPhase5ObservabilityInfrastructureAndStaticPolicies(unittest.TestCase):
+    """Phase 5: Regional Observability Infrastructure in Terraform & Static Policy Checks."""
+
+    def test_terraform_observability_infrastructure_definitions(self) -> None:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        infra_dir = os.path.join(repo_root, "infra")
+
+        with open(os.path.join(infra_dir, "apis.tf"), encoding="utf-8") as fh:
+            apis_tf = fh.read()
+        self.assertIn('"monitoring.googleapis.com"', apis_tf)
+        self.assertIn('"cloudtrace.googleapis.com"', apis_tf)
+
+        with open(os.path.join(infra_dir, "iam.tf"), encoding="utf-8") as fh:
+            iam_tf = fh.read()
+        self.assertIn('resource "google_project_iam_member" "backend_metric_writer"', iam_tf)
+        self.assertIn('role    = "roles/monitoring.metricWriter"', iam_tf)
+        self.assertIn('resource "google_project_iam_member" "backend_trace_agent"', iam_tf)
+        self.assertIn('role    = "roles/cloudtrace.agent"', iam_tf)
+
+        with open(os.path.join(infra_dir, "cloud_run.tf"), encoding="utf-8") as fh:
+            cloud_run_tf = fh.read()
+        self.assertEqual(cloud_run_tf.count('name  = "TELEMETRY_LOG_NAME"'), 2)
+        self.assertEqual(cloud_run_tf.count('value = "interactiverag-telemetry"'), 2)
+        self.assertEqual(cloud_run_tf.count('name  = "STRUCTURED_LOGGING"'), 2)
+        self.assertEqual(cloud_run_tf.count('name  = "CLOUD_TRACE_ENABLED"'), 2)
+
+        with open(os.path.join(infra_dir, "observability.tf"), encoding="utf-8") as fh:
+            obs_tf = fh.read()
+        self.assertIn('resource "google_logging_project_bucket_config" "observability_telemetry"', obs_tf)
+        self.assertIn("retention_days   = var.observability_log_retention_days", obs_tf)
+        self.assertIn('resource "google_logging_project_sink" "observability_sink"', obs_tf)
+        for metric_name in (
+            "agent_turn_latency_ms",
+            "agent_ttft_ms",
+            "agent_llm_stage_latency_ms",
+            "agent_retrieval_stage_latency_ms",
+            "agent_input_tokens",
+            "agent_output_tokens",
+            "agent_total_tokens",
+            "retrieval_mean_similarity_score",
+            "agent_ungrounded_answers",
+            "ingestion_chunks_added",
+        ):
+            self.assertIn(f'resource "google_logging_metric" "{metric_name}"', obs_tf)
+        self.assertIn('resource "google_monitoring_dashboard" "observability_dashboard"', obs_tf)
+
+        with open(os.path.join(infra_dir, "variables.tf"), encoding="utf-8") as fh:
+            vars_tf = fh.read()
+        self.assertIn('variable "observability_log_retention_days"', vars_tf)
+
+        with open(os.path.join(infra_dir, "outputs.tf"), encoding="utf-8") as fh:
+            outputs_tf = fh.read()
+        for out_name in (
+            "observability_log_bucket_id",
+            "observability_log_sink_name",
+            "application_telemetry_log_name",
+            "observability_dashboard_id",
+        ):
+            self.assertIn(f'output "{out_name}"', outputs_tf)
+
+    def test_static_policy_verifier_enforces_observability_and_regional_rules(self) -> None:
+        import shutil
+        import tempfile
+
+        from scripts.check_static_policies import evaluate_repo_static_policies
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        ok, violations = evaluate_repo_static_policies(repo_root)
+        self.assertTrue(ok, f"Expected static policy check to pass, got: {violations}")
+        self.assertEqual(violations, [])
+
+        syn_root = tempfile.mkdtemp(prefix="obs_static_policy_")
+        try:
+            os.makedirs(os.path.join(syn_root, "src", "core"), exist_ok=True)
+            shutil.copytree(os.path.join(repo_root, "infra"), os.path.join(syn_root, "infra"))
+            shutil.copy2(
+                os.path.join(repo_root, "src", "core", "config.py"),
+                os.path.join(syn_root, "src", "core", "config.py"),
+            )
+            syn_tfvars = os.path.join(syn_root, "infra", "terraform.tfvars")
+            if os.path.exists(syn_tfvars):
+                os.remove(syn_tfvars)
+
+            # Mutate observability.tf bucket location to "global" -> must fail static check
+            obs_path = os.path.join(syn_root, "infra", "observability.tf")
+            with open(obs_path, encoding="utf-8") as fh:
+                orig_obs = fh.read()
+            with open(obs_path, "w", encoding="utf-8") as fh:
+                fh.write(orig_obs.replace("location         = var.region", 'location         = "global"', 1))
+            ok_obs, v_obs = evaluate_repo_static_policies(syn_root)
+            self.assertFalse(ok_obs)
+            self.assertTrue(any("observability_telemetry" in m for m in v_obs), v_obs)
+            with open(obs_path, "w", encoding="utf-8") as fh:
+                fh.write(orig_obs)
+
+            # Mutate cloud_run.tf STRUCTURED_LOGGING to "false" -> must fail static check
+            cr_path = os.path.join(syn_root, "infra", "cloud_run.tf")
+            with open(cr_path, encoding="utf-8") as fh:
+                orig_cr = fh.read()
+            with open(cr_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    orig_cr.replace(
+                        'name  = "STRUCTURED_LOGGING"\n        value = "true"',
+                        'name  = "STRUCTURED_LOGGING"\n        value = "false"',
+                        1,
+                    )
+                )
+            ok_cr, v_cr = evaluate_repo_static_policies(syn_root)
+            self.assertFalse(ok_cr)
+            self.assertTrue(any("STRUCTURED_LOGGING" in m for m in v_cr), v_cr)
+        finally:
+            shutil.rmtree(syn_root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
 

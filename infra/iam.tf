@@ -75,10 +75,28 @@ resource "google_project_iam_member" "backend_dlp_user" {
 }
 
 # 5. Cloud Logging (`roles/logging.logWriter`):
-#    Allows `emit_audit_event()` (`src/core/compliance/audit.py`) to publish structured JSON
-#    compliance audit records directly to `projects/<project>/logs/interactiverag-audit`.
+#    Allows `emit_audit_event()` (`src/core/compliance/audit.py`) and `emit_telemetry_event()`
+#    (`src/core/observability/telemetry.py`) to publish structured JSON audit and telemetry
+#    records directly to `interactiverag-audit` and `interactiverag-telemetry`.
 resource "google_project_iam_member" "backend_log_writer" {
   project = var.project_id
   role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.backend_sa.email}"
+}
+
+# 6. Cloud Monitoring (`roles/monitoring.metricWriter`):
+#    Allows backend services to write custom monitoring metrics when needed.
+resource "google_project_iam_member" "backend_metric_writer" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.backend_sa.email}"
+}
+
+# 7. Cloud Trace (`roles/cloudtrace.agent`):
+#    Allows `start_span()` (`src/core/observability/tracing.py`) to export hierarchical per-stage
+#    latency spans directly to Google Cloud Trace when `CLOUD_TRACE_ENABLED = "true"`.
+resource "google_project_iam_member" "backend_trace_agent" {
+  project = var.project_id
+  role    = "roles/cloudtrace.agent"
   member  = "serviceAccount:${google_service_account.backend_sa.email}"
 }
