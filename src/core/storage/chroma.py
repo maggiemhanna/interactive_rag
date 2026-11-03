@@ -159,7 +159,12 @@ def list_collections(persist_directory: str) -> Dict[str, Any]:
             count = col.count()
         except Exception:
             count = 0
-        details.append({"name": col.name, "count": count})
+        col_meta = getattr(col, "metadata", None) or {}
+        emb_model = col_meta.get("embedding_model") if isinstance(col_meta, dict) else None
+        entry: Dict[str, Any] = {"name": col.name, "count": count}
+        if isinstance(emb_model, str) and emb_model.strip():
+            entry["embedding_model"] = emb_model.strip()
+        details.append(entry)
     return {"collections": collection_names, "details": details}
 
 

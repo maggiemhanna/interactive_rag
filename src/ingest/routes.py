@@ -80,6 +80,7 @@ async def ingest(
             "message": f"Successfully added {len(payload.chunks)} document chunks to collection '{payload.collection_name}'.",
             "chunks_added": len(payload.chunks),
             "collection_name": payload.collection_name,
+            "embedding_model": payload.embedding_model,
             "processed_files": payload.processed_files,
         }
     except SecurityScreeningUnavailableError as e:

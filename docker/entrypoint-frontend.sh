@@ -12,7 +12,9 @@ window.__ENV__ = {
   FIREBASE_API_KEY: "$(escape_js "${FIREBASE_API_KEY:-}")",
   FIREBASE_AUTH_DOMAIN: "$(escape_js "${FIREBASE_AUTH_DOMAIN:-}")",
   FIREBASE_PROJECT_ID: "$(escape_js "${FIREBASE_PROJECT_ID:-}")",
-  FIREBASE_APP_ID: "$(escape_js "${FIREBASE_APP_ID:-}")"
+  FIREBASE_APP_ID: "$(escape_js "${FIREBASE_APP_ID:-}")",
+  ALLOWED_LLM_MODELS: "$(escape_js "${ALLOWED_LLM_MODELS:-}")",
+  ALLOWED_EMBEDDING_MODELS: "$(escape_js "${ALLOWED_EMBEDDING_MODELS:-}")"
 };
 EOF
 

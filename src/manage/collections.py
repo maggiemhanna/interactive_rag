@@ -14,6 +14,12 @@ from src.core.ai_security.guardrails import validate_collection_name
 from src.core.ai_security.safety import INTERNAL_ERROR_MESSAGE
 from src.core.auth import get_current_user
 from src.core.compliance.audit import emit_audit_event
+from src.core.config import (
+    get_allowed_embedding_models,
+    get_allowed_llm_models,
+    get_default_embedding_model,
+    get_default_llm_model,
+)
 from src.core.logger import setup_logging
 from src.core.storage.chroma import list_collections, remove_collection
 from src.core.storage.locks import LockTimeoutError, user_read_lock, user_write_lock
@@ -37,6 +43,14 @@ def get_collections(uid: str = Depends(get_current_user)) -> Dict[str, Any]:
         with user_read_lock(uid) as persist_directory:
             payload = list_collections(persist_directory)
         collections = payload.get("collections", []) if isinstance(payload, dict) else []
+        if isinstance(payload, dict):
+            payload = {
+                **payload,
+                "allowed_llm_models": list(get_allowed_llm_models()),
+                "allowed_embedding_models": list(get_allowed_embedding_models()),
+                "default_llm_model": get_default_llm_model(),
+                "default_embedding_model": get_default_embedding_model(),
+            }
         emit_audit_event(
             "collection.list",
             uid=uid,

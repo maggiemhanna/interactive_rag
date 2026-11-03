@@ -40,6 +40,8 @@ import {
 import {
   API_BASE,
   AGENT_API_BASE,
+  DEFAULT_ALLOWED_LLM_MODELS,
+  DEFAULT_ALLOWED_EMBEDDING_MODELS,
   subscribeToAuthChanges,
   logoutUser,
 } from './firebase';
@@ -2370,6 +2372,24 @@ export default function App() {
 
   const [activeTab, setActiveTab] = useState('ingest'); // 'ingest' | 'query' | 'agent' | 'manage'
 
+  // Available & selected Vertex AI models (from window.__ENV__ / Vite .env / backend /collections)
+  const [availableLlmModels, setAvailableLlmModels] = useState(DEFAULT_ALLOWED_LLM_MODELS);
+  const [availableEmbeddingModels, setAvailableEmbeddingModels] = useState(
+    DEFAULT_ALLOWED_EMBEDDING_MODELS
+  );
+  const [ingestEmbeddingModel, setIngestEmbeddingModel] = useState(
+    DEFAULT_ALLOWED_EMBEDDING_MODELS[0] || 'gemini-embedding-001'
+  );
+  const [queryEmbeddingModel, setQueryEmbeddingModel] = useState(
+    DEFAULT_ALLOWED_EMBEDDING_MODELS[0] || 'gemini-embedding-001'
+  );
+  const [agentLlmModel, setAgentLlmModel] = useState(
+    DEFAULT_ALLOWED_LLM_MODELS[0] || 'gemini-2.5-flash'
+  );
+  const [agentEmbeddingModel, setAgentEmbeddingModel] = useState(
+    DEFAULT_ALLOWED_EMBEDDING_MODELS[0] || 'gemini-embedding-001'
+  );
+
   const [collections, setCollections] = useState([]);
   const [collectionDetails, setCollectionDetails] = useState([]);
   const [deletingCol, setDeletingCol] = useState(null);
@@ -2427,6 +2447,15 @@ export default function App() {
 
   const activeThread =
     agentThreads.find((t) => t.id === activeThreadId) || agentThreads[0] || null;
+
+  const getCollectionEmbeddingModel = (colName, detailsList = collectionDetails, embModels = availableEmbeddingModels) => {
+    if (!colName || !Array.isArray(detailsList)) return null;
+    const found = detailsList.find((d) => d && d.name === colName);
+    if (found?.embedding_model && embModels.includes(found.embedding_model)) {
+      return found.embedding_model;
+    }
+    return null;
+  };
 
   const resetTenantState = () => {
     if (abortControllerRef.current) {
@@ -2526,13 +2555,59 @@ export default function App() {
       const data = await res.json();
       const colList = data.collections || [];
       const details = data.details || colList.map(c => ({ name: c, count: 0 }));
+
+      let nextLlmModels = availableLlmModels;
+      if (Array.isArray(data.allowed_llm_models) && data.allowed_llm_models.length > 0) {
+        nextLlmModels = data.allowed_llm_models;
+        setAvailableLlmModels(nextLlmModels);
+        setAgentLlmModel((prev) =>
+          nextLlmModels.includes(prev) ? prev : nextLlmModels[0]
+        );
+      }
+
+      let nextEmbModels = availableEmbeddingModels;
+      if (
+        Array.isArray(data.allowed_embedding_models) &&
+        data.allowed_embedding_models.length > 0
+      ) {
+        nextEmbModels = data.allowed_embedding_models;
+        setAvailableEmbeddingModels(nextEmbModels);
+        setIngestEmbeddingModel((prev) =>
+          nextEmbModels.includes(prev) ? prev : nextEmbModels[0]
+        );
+        setQueryEmbeddingModel((prev) =>
+          nextEmbModels.includes(prev) ? prev : nextEmbModels[0]
+        );
+        setAgentEmbeddingModel((prev) =>
+          nextEmbModels.includes(prev) ? prev : nextEmbModels[0]
+        );
+      }
+
       setCollections(colList);
       setCollectionDetails(details);
       setApiStatus('online');
       
       if (colList.length > 0) {
-        if (!selectedCollection || !colList.includes(selectedCollection)) setSelectedCollection(colList[0]);
-        if (!queryCollection || !colList.includes(queryCollection)) setQueryCollection(colList[0]);
+        const nextIngestCol =
+          !selectedCollection || !colList.includes(selectedCollection)
+            ? colList[0]
+            : selectedCollection;
+        setSelectedCollection(nextIngestCol);
+        const ingestColEmb = getCollectionEmbeddingModel(nextIngestCol, details, nextEmbModels);
+        if (collectionMode === 'existing' && ingestColEmb) {
+          setIngestEmbeddingModel(ingestColEmb);
+        }
+
+        const nextQueryCol =
+          !queryCollection || !colList.includes(queryCollection)
+            ? colList[0]
+            : queryCollection;
+        setQueryCollection(nextQueryCol);
+        const queryColEmb = getCollectionEmbeddingModel(nextQueryCol, details, nextEmbModels);
+        if (queryColEmb) {
+          setQueryEmbeddingModel(queryColEmb);
+        }
+
         const candidateAgentCol =
           typeof preferredAgentCol === 'string' && preferredAgentCol
             ? preferredAgentCol
@@ -2542,6 +2617,10 @@ export default function App() {
             ? candidateAgentCol
             : colList[0];
         setAgentCollection(resolvedAgentCol);
+        const agentColEmb = getCollectionEmbeddingModel(resolvedAgentCol, details, nextEmbModels);
+        if (agentColEmb) {
+          setAgentEmbeddingModel(agentColEmb);
+        }
         setAgentThreads((prev) =>
           prev.map((t) =>
             t.turns.length === 0 && (!t.collection || !colList.includes(t.collection))
@@ -2714,6 +2793,9 @@ export default function App() {
     try {
       const formData = new FormData();
       formData.append('collection_name', targetCollection);
+      if (ingestEmbeddingModel) {
+        formData.append('embedding_model', ingestEmbeddingModel);
+      }
 
       if (uploadMode === 'files') {
         files.forEach((file) => {
@@ -2796,7 +2878,8 @@ export default function App() {
         body: JSON.stringify({
           query: trimmedQuery,
           collection_name: queryCollection,
-          k: Number(topK)
+          k: Number(topK),
+          embedding_model: queryEmbeddingModel,
         }),
       });
 
@@ -2822,6 +2905,10 @@ export default function App() {
 
   const selectAgentCollection = (nextCol) => {
     setAgentCollection(nextCol);
+    const colEmb = getCollectionEmbeddingModel(nextCol);
+    if (colEmb) {
+      setAgentEmbeddingModel(colEmb);
+    }
     if (!nextCol) return;
 
     const current =
@@ -2903,6 +2990,10 @@ export default function App() {
     setActiveThreadId(thread.id);
     if (thread.collection && collections.includes(thread.collection)) {
       setAgentCollection(thread.collection);
+      const colEmb = getCollectionEmbeddingModel(thread.collection);
+      if (colEmb) {
+        setAgentEmbeddingModel(colEmb);
+      }
     }
     setAgentViewMode('chat');
     setFocusedStepTurnId('latest');
@@ -3056,12 +3147,16 @@ export default function App() {
               query: trimmedQuestion,
               collection_name: targetCollection,
               thread_id: targetThreadId,
+              model_name: agentLlmModel,
+              embedding_model: agentEmbeddingModel,
               stream: false,
             }
           : {
               query: trimmedQuestion,
               collection_name: targetCollection,
               thread_id: targetThreadId,
+              model_name: agentLlmModel,
+              embedding_model: agentEmbeddingModel,
             };
 
       const response = await authFetch(endpointUrl, {
@@ -3408,7 +3503,11 @@ export default function App() {
               <p style={{ fontSize: '0.8rem', marginTop: '4px', opacity: 0.9 }}>
                 Indexed {notification.details.chunks_added}{' '}
                 {notification.details.chunks_added === 1 ? 'chunk' : 'chunks'} from{' '}
-                {notification.details.processed_files?.length || 0} file(s).
+                {notification.details.processed_files?.length || 0} file(s)
+                {notification.details.embedding_model
+                  ? ` using ${notification.details.embedding_model}`
+                  : ''}
+                .
               </p>
             )}
           </div>
@@ -3440,7 +3539,13 @@ export default function App() {
                   <button
                     type="button"
                     className={`tab-btn ${collectionMode === 'existing' ? 'active' : ''}`}
-                    onClick={() => setCollectionMode('existing')}
+                    onClick={() => {
+                      setCollectionMode('existing');
+                      const colEmb = getCollectionEmbeddingModel(selectedCollection);
+                      if (colEmb) {
+                        setIngestEmbeddingModel(colEmb);
+                      }
+                    }}
                   >
                     <Layers size={16} />
                     Existing Collection
@@ -3461,7 +3566,14 @@ export default function App() {
                       <select
                         className="form-select"
                         value={selectedCollection}
-                        onChange={(e) => setSelectedCollection(e.target.value)}
+                        onChange={(e) => {
+                          const nextCol = e.target.value;
+                          setSelectedCollection(nextCol);
+                          const colEmb = getCollectionEmbeddingModel(nextCol);
+                          if (colEmb) {
+                            setIngestEmbeddingModel(colEmb);
+                          }
+                        }}
                       >
                         {collections.map((col) => (
                           <option key={col} value={col}>
@@ -3484,6 +3596,23 @@ export default function App() {
                     onChange={(e) => setNewCollectionName(e.target.value)}
                   />
                 )}
+              </div>
+
+              {/* Embedding Model Selection */}
+              <div className="form-group">
+                <label className="form-label">Embedding Model</label>
+                <select
+                  className="form-select"
+                  value={ingestEmbeddingModel}
+                  onChange={(e) => setIngestEmbeddingModel(e.target.value)}
+                  aria-label="Embedding model for document indexing"
+                >
+                  {availableEmbeddingModels.map((model) => (
+                    <option key={model} value={model}>
+                      {model}
+                    </option>
+                  ))}
+                </select>
               </div>
 
               {/* Step 2: Document Source */}
@@ -3604,7 +3733,14 @@ export default function App() {
                   <select
                     className="form-select"
                     value={queryCollection}
-                    onChange={(e) => setQueryCollection(e.target.value)}
+                    onChange={(e) => {
+                      const nextCol = e.target.value;
+                      setQueryCollection(nextCol);
+                      const colEmb = getCollectionEmbeddingModel(nextCol);
+                      if (colEmb) {
+                        setQueryEmbeddingModel(colEmb);
+                      }
+                    }}
                   >
                     {collections.map((col) => (
                       <option key={col} value={col}>
@@ -3617,6 +3753,23 @@ export default function App() {
                     No collections yet. Upload documents first to create one.
                   </p>
                 )}
+              </div>
+
+              {/* Embedding Model Selection */}
+              <div className="form-group">
+                <label className="form-label">Embedding Model</label>
+                <select
+                  className="form-select"
+                  value={queryEmbeddingModel}
+                  onChange={(e) => setQueryEmbeddingModel(e.target.value)}
+                  aria-label="Embedding model for similarity search"
+                >
+                  {availableEmbeddingModels.map((model) => (
+                    <option key={model} value={model}>
+                      {model}
+                    </option>
+                  ))}
+                </select>
               </div>
 
               {/* Query Text */}
@@ -3901,7 +4054,7 @@ export default function App() {
                   remembers your conversation and cites the exact pages it used.
                 </p>
 
-                {/* Session Config Bar: Collection + Response Mode */}
+                {/* Session Config Bar: Collection + Models + Response Mode */}
                 <div className="agent-session-bar">
                   <div className="agent-collection-picker">
                     <span className="agent-picker-label">
@@ -3930,6 +4083,46 @@ export default function App() {
                   </div>
 
                   <div className="agent-session-bar-right">
+                    <div className="agent-model-picker">
+                      <span className="agent-picker-label">
+                        <Sparkles size={13} color="var(--primary)" />
+                        <span>LLM</span>
+                      </span>
+                      <select
+                        className="form-select agent-compact-select"
+                        value={agentLlmModel}
+                        onChange={(e) => setAgentLlmModel(e.target.value)}
+                        disabled={agentLoading}
+                        aria-label="Choose LLM model"
+                      >
+                        {availableLlmModels.map((model) => (
+                          <option key={model} value={model}>
+                            {model}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="agent-model-picker">
+                      <span className="agent-picker-label">
+                        <Layers size={13} color="var(--accent-cyan)" />
+                        <span>Embedding</span>
+                      </span>
+                      <select
+                        className="form-select agent-compact-select"
+                        value={agentEmbeddingModel}
+                        onChange={(e) => setAgentEmbeddingModel(e.target.value)}
+                        disabled={agentLoading}
+                        aria-label="Choose embedding model"
+                      >
+                        {availableEmbeddingModels.map((model) => (
+                          <option key={model} value={model}>
+                            {model}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
                     <div
                       className="chunk-view-segmented"
                       role="group"
@@ -4249,6 +4442,7 @@ export default function App() {
                               {col.count !== undefined
                                 ? `${col.count} ${col.count === 1 ? 'chunk' : 'chunks'} indexed`
                                 : 'Document collection'}
+                              {col.embedding_model ? ` · ${col.embedding_model}` : ''}
                             </p>
                           </div>
                         </div>
@@ -4261,6 +4455,10 @@ export default function App() {
                               style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem' }}
                               onClick={() => {
                                 setQueryCollection(col.name);
+                                const colEmb = getCollectionEmbeddingModel(col.name);
+                                if (colEmb) {
+                                  setQueryEmbeddingModel(colEmb);
+                                }
                                 setActiveTab('query');
                               }}
                             >
@@ -4396,6 +4594,13 @@ export default function App() {
                     onClick={() => {
                       setSelectedCollection(col);
                       setQueryCollection(col);
+                      const colEmb = getCollectionEmbeddingModel(col);
+                      if (colEmb) {
+                        if (collectionMode === 'existing') {
+                          setIngestEmbeddingModel(colEmb);
+                        }
+                        setQueryEmbeddingModel(colEmb);
+                      }
                       if (!agentLoading) {
                         selectAgentCollection(col);
                       }

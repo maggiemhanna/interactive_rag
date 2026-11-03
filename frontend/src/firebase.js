@@ -35,6 +35,32 @@ export const AGENT_API_BASE = pickEnv(
   'http://localhost:8001'
 ).replace(/\/+$/, '');
 
+export function parseModelCsv(rawCsv, fallbackModels = []) {
+  if (typeof rawCsv !== 'string' || !rawCsv.trim()) {
+    return [...fallbackModels];
+  }
+  const seen = new Set();
+  const parsed = [];
+  for (const item of rawCsv.split(',')) {
+    const cleaned = item.trim();
+    if (cleaned && !seen.has(cleaned)) {
+      seen.add(cleaned);
+      parsed.push(cleaned);
+    }
+  }
+  return parsed.length > 0 ? parsed : [...fallbackModels];
+}
+
+export const DEFAULT_ALLOWED_LLM_MODELS = parseModelCsv(
+  pickEnv('ALLOWED_LLM_MODELS', 'VITE_ALLOWED_LLM_MODELS', ''),
+  ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash-lite']
+);
+
+export const DEFAULT_ALLOWED_EMBEDDING_MODELS = parseModelCsv(
+  pickEnv('ALLOWED_EMBEDDING_MODELS', 'VITE_ALLOWED_EMBEDDING_MODELS', ''),
+  ['gemini-embedding-001', 'text-embedding-004', 'text-embedding-005']
+);
+
 export const firebaseConfig = {
   apiKey: pickEnv('FIREBASE_API_KEY', 'VITE_FIREBASE_API_KEY', ''),
   authDomain: pickEnv(

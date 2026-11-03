@@ -495,6 +495,14 @@ resource "google_cloud_run_v2_service" "frontend" {
         name  = "FIREBASE_PROJECT_ID"
         value = var.project_id
       }
+      env {
+        name  = "ALLOWED_LLM_MODELS"
+        value = var.allowed_llm_models
+      }
+      env {
+        name  = "ALLOWED_EMBEDDING_MODELS"
+        value = var.allowed_embedding_models
+      }
     }
   }
 

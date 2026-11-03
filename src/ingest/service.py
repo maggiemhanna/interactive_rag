@@ -9,6 +9,7 @@ from typing import List, Optional
 
 from langchain_core.documents import Document
 
+from src.core.ai_security.guardrails import validate_embedding_model
 from src.core.compliance.policy import enforce_collection_quota
 from src.core.logger import setup_logging
 from src.core.observability.tracing import start_span
@@ -38,6 +39,7 @@ def ingest_documents(
         collection_name: Validated target Chroma collection identifier.
         embedding_model: Optional approved Vertex AI embedding model identifier.
     """
+    safe_embedding_model = validate_embedding_model(embedding_model)
     with user_write_lock(uid) as persist_directory:
         enforce_collection_quota(
             uid=uid,
@@ -58,7 +60,7 @@ def ingest_documents(
                 vectorstore = get_vectorstore(
                     collection_name=collection_name,
                     persist_directory=persist_directory,
-                    embedding_model=embedding_model,
+                    embedding_model=safe_embedding_model,
                 )
 
                 batch_size = 100
@@ -70,6 +72,19 @@ def ingest_documents(
                         f"Ingested batch {i // batch_size + 1} / {(total_chunks - 1) // batch_size + 1} "
                         f"({len(batch)} chunks) into collection '{collection_name}'."
                     )
+
+                try:
+                    raw_col = getattr(vectorstore, "_collection", None)
+                    if raw_col is not None and hasattr(raw_col, "modify"):
+                        existing_meta = getattr(raw_col, "metadata", None) or {}
+                        raw_col.modify(
+                            metadata={
+                                **(existing_meta if isinstance(existing_meta, dict) else {}),
+                                "embedding_model": safe_embedding_model,
+                            }
+                        )
+                except Exception:
+                    pass
 
                 logger.info(
                     f"Successfully added {total_chunks} documents to collection '{collection_name}' in '{persist_directory}'."
