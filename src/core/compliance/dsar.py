@@ -1,11 +1,13 @@
 """GDPR Art. 15 Data Inventory & Art. 17 Complete Versioned Erasure (Pillar 4: Compliance & Governance).
 
-Implements tenant-scoped Data Subject Access Request (DSAR) storage operations:
-- `get_user_data_inventory(uid)`: Enumerates collections, passage counts, archived PDF uploads,
-  live and noncurrent GCS object generations, and disk/cloud byte totals.
-- `purge_all_user_data(uid)`: Acquires the user's distributed GCS write lock, wipes local
-  `/tmp/chroma_db/{uid}` and `/tmp/uploads/{uid}` directories, and permanently deletes every
-  live and noncurrent object revision (`versions=True`) under `gs://<bucket>/users/{uid}/`.
+Implements tenant-scoped Data Subject Access Request (DSAR) storage and memory operations:
+- `list_user_memory_threads(uid, checkpointer)`: Enumerates user-scoped `{uid}:*` conversation threads in `checkpointer`.
+- `clear_user_memory(uid, checkpointer)`: Purges all `{uid}:*` conversation checkpoints, writes, and blobs from `checkpointer`.
+- `get_user_data_inventory(uid, checkpointer)`: Enumerates collections, passage counts, archived PDF uploads,
+  live and noncurrent GCS object generations, disk/cloud byte totals, and active memory thread count.
+- `purge_all_user_data(uid, checkpointer)`: Acquires the user's distributed GCS write lock, wipes local
+  `/tmp/chroma_db/{uid}` and `/tmp/uploads/{uid}` directories, permanently deletes every live and
+  noncurrent object revision (`versions=True`) under `gs://<bucket>/users/{uid}/`, and purges in-memory threads.
 """
 
 import contextlib
@@ -13,12 +15,14 @@ from datetime import datetime, timezone
 import os
 import re
 import shutil
-from typing import Any, Dict, List
+import threading
+from typing import Any, Dict, List, Optional, Set
 
 from google.api_core import exceptions as gcs_exceptions
 
 from src.core.auth import validate_uid
 from src.core.compliance.residency import validate_gcp_region
+from src.core.context import get_request_id
 from src.core.logger import setup_logging
 from src.core.storage import gcs_sync
 from src.core.storage.chroma import list_collections
@@ -42,6 +46,77 @@ from src.core.storage.paths import (
 logger = setup_logging(name="compliance.dsar")
 
 _ARCHIVE_PREFIX_RE = re.compile(r"^\d{8}T\d{6}Z_[0-9a-f]{6}_")
+_memory_lock = threading.RLock()
+
+
+def _collect_matching_thread_ids(prefix: str, checkpointer: Any) -> Set[str]:
+    """Collects all internal `checkpointer` thread keys matching `prefix` (`'{uid}:'`).
+
+    Args:
+        prefix: Tenant namespace prefix ending with `':'`.
+        checkpointer: LangGraph checkpointer (`InMemorySaver`) instance to inspect.
+
+    Returns:
+        Set of full `{uid}:{thread_id}` checkpoint keys present across storage, writes, and blobs.
+    """
+    if checkpointer is None:
+        return set()
+    matched: Set[str] = set()
+    for tid in list(getattr(checkpointer, "storage", {}).keys()):
+        if isinstance(tid, str) and tid.startswith(prefix):
+            matched.add(tid)
+    for key in list(getattr(checkpointer, "writes", {}).keys()):
+        if isinstance(key, tuple) and key and isinstance(key[0], str) and key[0].startswith(prefix):
+            matched.add(key[0])
+    for key in list(getattr(checkpointer, "blobs", {}).keys()):
+        if isinstance(key, tuple) and key and isinstance(key[0], str) and key[0].startswith(prefix):
+            matched.add(key[0])
+    return matched
+
+
+def list_user_memory_threads(uid: str, checkpointer: Optional[Any] = None) -> List[str]:
+    """Returns sorted user-local thread identifiers stored in `checkpointer` for `uid`.
+
+    Args:
+        uid: Verified tenant user identifier.
+        checkpointer: LangGraph checkpointer (`InMemorySaver`) holding thread history.
+
+    Returns:
+        Sorted list of unprefixed client `thread_id` strings belonging to `uid`.
+    """
+    safe_uid = validate_uid(uid)
+    if checkpointer is None:
+        return []
+    prefix = f"{safe_uid}:"
+    with _memory_lock:
+        matched = _collect_matching_thread_ids(prefix, checkpointer)
+    return sorted(tid[len(prefix) :] for tid in matched)
+
+
+def clear_user_memory(uid: str, checkpointer: Optional[Any] = None) -> int:
+    """Purges all `{uid}:*` conversation checkpoints, writes, and blobs from `checkpointer`.
+
+    Args:
+        uid: Verified tenant user identifier.
+        checkpointer: LangGraph checkpointer (`InMemorySaver`) holding thread history.
+
+    Returns:
+        Number of distinct conversation threads permanently erased for `uid`.
+    """
+    safe_uid = validate_uid(uid)
+    if checkpointer is None:
+        return 0
+    prefix = f"{safe_uid}:"
+    with _memory_lock:
+        matched = _collect_matching_thread_ids(prefix, checkpointer)
+        for tid in matched:
+            checkpointer.delete_thread(tid)
+
+    if matched:
+        logger.info(
+            f"Purged {len(matched)} conversation thread(s) from checkpointer for uid='{safe_uid}'."
+        )
+    return len(matched)
 
 
 def _list_bucket_blobs(bucket: Any, prefix: str, versions: bool = False) -> List[Any]:
@@ -78,15 +153,17 @@ def _delete_blob_revision(bucket: Any, blob: Any) -> None:
             blob.delete()
 
 
-def get_user_data_inventory(uid: str) -> Dict[str, Any]:
-    """Builds a GDPR Art. 15 personal data inventory for `uid` across ChromaDB and GCS.
+def get_user_data_inventory(uid: str, checkpointer: Optional[Any] = None) -> Dict[str, Any]:
+    """Builds a GDPR Art. 15 personal data inventory for `uid` across ChromaDB, GCS, and agent memory.
 
     Args:
         uid: Verified tenant user identifier.
+        checkpointer: Optional LangGraph checkpointer (`InMemorySaver`) to count user memory threads.
 
     Returns:
         Structured inventory dictionary detailing collections, total passages, archived PDF
-        filenames/timestamps, live vs. noncurrent GCS object counts, and storage byte totals.
+        filenames/timestamps, live vs. noncurrent GCS object counts, storage byte totals,
+        and active conversation memory thread count.
     """
     safe_uid = validate_uid(uid)
     region = validate_gcp_region()
@@ -149,6 +226,7 @@ def get_user_data_inventory(uid: str) -> Dict[str, Any]:
 
     uploaded_pdfs.sort(key=lambda item: (item["filename"].lower(), item["blob_name"]))
     total_bytes = gcs_total_bytes if bucket_name else local_cache_bytes
+    memory_threads = list_user_memory_threads(safe_uid, checkpointer=checkpointer)
 
     return {
         "uid": safe_uid,
@@ -166,22 +244,27 @@ def get_user_data_inventory(uid: str) -> Dict[str, Any]:
         "gcs_total_bytes": gcs_total_bytes,
         "local_cache_bytes": local_cache_bytes,
         "total_bytes": total_bytes,
+        "memory_thread_count": len(memory_threads),
+        "request_id": get_request_id(),
     }
 
 
-def purge_all_user_data(uid: str) -> Dict[str, Any]:
-    """Executes GDPR Art. 17 hard erasure of all stored data for `uid`.
+def purge_all_user_data(uid: str, checkpointer: Optional[Any] = None) -> Dict[str, Any]:
+    """Executes GDPR Art. 17 hard erasure of all stored data and conversation memory for `uid`.
 
     Permanently deletes:
     1. Every live and noncurrent GCS object generation under `users/{uid}/` (`versions=True`).
     2. Local `/tmp/chroma_db/{uid}` (or local working Chroma directory) after releasing Chroma handles.
     3. Local `/tmp/uploads/{uid}` temporary upload staging directory.
+    4. All `{uid}:*` multi-turn conversation checkpoints in `checkpointer` (when provided).
 
     Args:
         uid: Verified tenant user identifier.
+        checkpointer: Optional LangGraph checkpointer (`InMemorySaver`) whose `{uid}:*` threads should be erased.
 
     Returns:
-        Erasure summary dictionary containing deleted live/noncurrent object counts and local flags.
+        Erasure summary dictionary containing deleted live/noncurrent object counts, local flags,
+        and `deleted_memory_threads`.
     """
     safe_uid = validate_uid(uid)
     user_thread_lock = get_user_thread_lock(safe_uid)
@@ -207,9 +290,11 @@ def purge_all_user_data(uid: str) -> Dict[str, Any]:
         bucket_name = get_bucket_name()
         if not bucket_name:
             had_chroma, had_uploads = _wipe_local_user_dirs()
+            deleted_memory_threads = clear_user_memory(safe_uid, checkpointer=checkpointer)
             logger.info(
                 f"Purged local user data for uid='{safe_uid}' "
-                f"(deleted_local_chroma={had_chroma}, deleted_local_uploads={had_uploads})."
+                f"(deleted_local_chroma={had_chroma}, deleted_local_uploads={had_uploads}, "
+                f"deleted_memory_threads={deleted_memory_threads})."
             )
             return {
                 "uid": safe_uid,
@@ -218,6 +303,7 @@ def purge_all_user_data(uid: str) -> Dict[str, Any]:
                 "deleted_gcs_noncurrent_versions": 0,
                 "deleted_local_chroma": had_chroma,
                 "deleted_local_uploads": had_uploads,
+                "deleted_memory_threads": deleted_memory_threads,
             }
 
         bucket = gcs_sync._get_bucket()
@@ -258,10 +344,12 @@ def purge_all_user_data(uid: str) -> Dict[str, Any]:
             for lock_ver in _list_bucket_blobs(bucket, prefix=locks_prefix, versions=True):
                 _delete_blob_revision(bucket, lock_ver)
 
+        deleted_memory_threads = clear_user_memory(safe_uid, checkpointer=checkpointer)
         logger.info(
             f"Purged all GCS + local data for uid='{safe_uid}' "
             f"(live_objects={deleted_live}, noncurrent_versions={deleted_noncurrent}, "
-            f"local_chroma={had_chroma}, local_uploads={had_uploads})."
+            f"local_chroma={had_chroma}, local_uploads={had_uploads}, "
+            f"deleted_memory_threads={deleted_memory_threads})."
         )
         return {
             "uid": safe_uid,
@@ -270,7 +358,15 @@ def purge_all_user_data(uid: str) -> Dict[str, Any]:
             "deleted_gcs_noncurrent_versions": deleted_noncurrent,
             "deleted_local_chroma": had_chroma,
             "deleted_local_uploads": had_uploads,
+            "deleted_memory_threads": deleted_memory_threads,
         }
 
 
-__all__ = ["get_user_data_inventory", "purge_all_user_data"]
+__all__ = [
+    "clear_user_memory",
+    "get_user_data_inventory",
+    "list_user_memory_threads",
+    "purge_all_user_data",
+]
+
+

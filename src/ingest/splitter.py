@@ -1,47 +1,20 @@
-"""PDF filename sanitization and document chunk splitting utilities (`src.ingest.splitter`).
+"""PDF document loading and text chunk splitting utilities (`src.ingest.splitter`).
 
-Provides pure document-processing helpers independent of FastAPI HTTP request objects:
-- `sanitize_filename`: Strips path traversal components and enforces `.pdf` extensions.
-- `split_pdfs`: Loads PDF pages via `PyPDFLoader` and chunks text with `RecursiveCharacterTextSplitter`.
+Loads PDF pages via `PyPDFLoader` and chunks text with `RecursiveCharacterTextSplitter`.
 """
 
 import os
 from typing import List, Union
 
-from fastapi import HTTPException
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from src.core.ai_security.guardrails import sanitize_filename
 from src.core.logger import setup_logging
 from src.core.observability.tracing import start_span
-from src.core.storage.paths import SAFE_FILENAME_RE
 
 logger = setup_logging(name="ingest.splitter")
-
-
-def sanitize_filename(raw_filename: str) -> str:
-    """Strips directory components and enforces a safe `.pdf` filename.
-
-    Args:
-        raw_filename: Client-supplied multipart upload filename.
-
-    Returns:
-        Sanitized basename containing only safe characters and ending with `.pdf`.
-
-    Raises:
-        HTTPException: HTTP 400 if the filename does not have a `.pdf` extension.
-    """
-    basename = os.path.basename((raw_filename or "").replace("\\", "/")).strip()
-    cleaned = SAFE_FILENAME_RE.sub("_", basename).strip("._")
-    if not cleaned:
-        cleaned = "document.pdf"
-    if not cleaned.lower().endswith(".pdf"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Only PDF uploads are supported (received '{basename or raw_filename}').",
-        )
-    return cleaned
 
 
 def split_pdfs(

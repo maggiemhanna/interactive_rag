@@ -923,7 +923,8 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
     def test_gdpr_dsar_inventory_and_hard_erasure_wipes_all_gcs_versions_and_memory_with_tenant_isolation(
         self,
     ) -> None:
-        from src.agent.memory import list_user_memory_threads
+        from src.agent.memory import MEMORY_SAVER
+        from src.core.compliance.dsar import list_user_memory_threads
 
         # 1. Alice ingests two batches into 'finance_docs' so versioned GCS accumulates noncurrent generations
         r1 = self.ingest_client.post(
@@ -998,8 +999,10 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         )
         self.assertEqual(rb.status_code, 200)
 
-        self.assertEqual(list_user_memory_threads("alice_gdpr"), ["chat-a1", "chat-a2"])
-        self.assertEqual(list_user_memory_threads("bob_gdpr"), ["chat-b1"])
+        self.assertEqual(
+            list_user_memory_threads("alice_gdpr", MEMORY_SAVER), ["chat-a1", "chat-a2"]
+        )
+        self.assertEqual(list_user_memory_threads("bob_gdpr", MEMORY_SAVER), ["chat-b1"])
 
         # Confirm GCS actually has noncurrent object versions for Alice due to the second ingest overwriting SQLite/version.json
         alice_all_versions_before = self.fake_bucket.list_blobs(
@@ -1064,7 +1067,7 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.chroma_root, "alice_gdpr")))
         self.assertFalse(os.path.exists(os.path.join(self.uploads_root, "alice_gdpr")))
         # Verify Alice's MEMORY_SAVER checkpoints are 0
-        self.assertEqual(list_user_memory_threads("alice_gdpr"), [])
+        self.assertEqual(list_user_memory_threads("alice_gdpr", MEMORY_SAVER), [])
 
         erase_events = [
             e for e in self.captured_events if e["event_type"] == "dsar.erase_user_data"
@@ -1084,7 +1087,7 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         self.assertEqual(inv_after["memory_thread_count"], 0)
 
         # 6. Verify Bob's GCS data, Chroma collection, and MEMORY_SAVER thread are 100% intact!
-        self.assertEqual(list_user_memory_threads("bob_gdpr"), ["chat-b1"])
+        self.assertEqual(list_user_memory_threads("bob_gdpr", MEMORY_SAVER), ["chat-b1"])
         bob_inv = self.agent_client.get(
             "/compliance/my-data",
             headers={"X-Dev-User-Id": "bob_gdpr"},

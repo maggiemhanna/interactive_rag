@@ -20,10 +20,13 @@ from fastapi import HTTPException, Request
 from langchain_core.documents import Document
 
 from src.core.ai_security.guardrails import (
+    sanitize_filename,
     validate_chunk_count,
     validate_collection_name,
     validate_embedding_model,
     validate_file_count,
+    validate_pdf_bytes,
+    validate_server_pdf_paths,
 )
 from src.core.compliance.policy import (
     enforce_collection_quota,
@@ -32,15 +35,12 @@ from src.core.compliance.policy import (
 from src.core.config import (
     get_max_upload_mb,
     is_archive_uploads_enabled,
-    is_cloud_run,
 )
 from src.core.logger import setup_logging
 from src.core.storage import archive_upload, get_bucket_name, get_upload_user_dir
-from src.ingest.splitter import sanitize_filename, split_pdfs
+from src.ingest.splitter import split_pdfs
 
 logger = setup_logging(name="ingest.upload_parser")
-
-_PDF_MAGIC_PREFIX = b"%PDF-"
 
 
 @dataclass
@@ -137,8 +137,7 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
     collection_name: str = ""
     embedding_model: str = ""
 
-    max_upload_mb = get_max_upload_mb()
-    max_upload_bytes = max_upload_mb * 1024 * 1024
+    max_upload_bytes = get_max_upload_mb() * 1024 * 1024
 
     user_upload_dir = get_upload_user_dir(uid)
     request_upload_dir: Optional[str] = None
@@ -195,25 +194,10 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                         used_names.add(save_name)
 
                         # Bounded read: read at most max_upload_bytes + 1 so oversized uploads fail fast
-                        content = await file_item.read(max_upload_bytes + 1)
-                        if not content:
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Uploaded PDF '{safe_name}' is empty.",
-                            )
-                        if len(content) > max_upload_bytes:
-                            raise HTTPException(
-                                status_code=413,
-                                detail=(
-                                    f"Uploaded PDF '{safe_name}' exceeds the maximum allowed size "
-                                    f"of {max_upload_mb} MB."
-                                ),
-                            )
-                        if not content.lstrip().startswith(_PDF_MAGIC_PREFIX):
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Uploaded file '{safe_name}' is not a valid PDF document.",
-                            )
+                        content = validate_pdf_bytes(
+                            await file_item.read(max_upload_bytes + 1),
+                            safe_name,
+                        )
 
                         save_path = os.path.join(request_upload_dir, save_name)
                         with open(save_path, "wb") as f:
@@ -240,16 +224,7 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                 uid, raw_col, raw_emb
             )
 
-        # Security guard: never allow arbitrary container filesystem reads in Cloud Run
-        if raw_server_paths and is_cloud_run():
-            logger.warning(
-                f"Blocked server-filesystem pdf_paths ingestion attempt in Cloud Run by uid='{uid}'."
-            )
-            raise HTTPException(
-                status_code=403,
-                detail="Server-side filesystem 'pdf_paths' ingestion is disabled in Cloud Run. Please upload PDF files directly.",
-            )
-
+        validate_server_pdf_paths(raw_server_paths, uid)
         validate_file_count(len(raw_server_paths))
 
         if not uploaded_files_info and not raw_server_paths:

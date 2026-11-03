@@ -20,7 +20,12 @@ if TYPE_CHECKING:
         hash_query,
         register_audit_listener,
     )
-    from src.core.compliance.dsar import get_user_data_inventory, purge_all_user_data
+    from src.core.compliance.dsar import (
+        clear_user_memory,
+        get_user_data_inventory,
+        list_user_memory_threads,
+        purge_all_user_data,
+    )
     from src.core.compliance.policy import (
         DEFAULT_WINDOW_SECONDS,
         SlidingWindowRateLimiter,
@@ -54,7 +59,9 @@ _EXPORT_MAP: dict[str, str] = {
     "get_audit_log_name": "src.core.compliance.audit",
     "hash_query": "src.core.compliance.audit",
     "register_audit_listener": "src.core.compliance.audit",
+    "clear_user_memory": "src.core.compliance.dsar",
     "get_user_data_inventory": "src.core.compliance.dsar",
+    "list_user_memory_threads": "src.core.compliance.dsar",
     "purge_all_user_data": "src.core.compliance.dsar",
     "DEFAULT_WINDOW_SECONDS": "src.core.compliance.policy",
     "SlidingWindowRateLimiter": "src.core.compliance.policy",

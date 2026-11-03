@@ -9,7 +9,7 @@ from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from src.agent.memory import clear_user_memory, list_user_memory_threads
+from src.agent.memory import MEMORY_SAVER
 from src.core.ai_security.safety import INTERNAL_ERROR_MESSAGE
 from src.core.auth import get_current_user
 from src.core.compliance.audit import emit_audit_event
@@ -34,10 +34,7 @@ def export_my_data_inventory(uid: str = Depends(get_current_user)) -> Dict[str, 
         JSON inventory dictionary containing collection counts, passages, GCS object counts, and memory threads.
     """
     try:
-        inventory = get_user_data_inventory(uid)
-        memory_threads = list_user_memory_threads(uid)
-        inventory["memory_thread_count"] = len(memory_threads)
-        inventory["request_id"] = get_request_id()
+        inventory = get_user_data_inventory(uid, checkpointer=MEMORY_SAVER)
 
         emit_audit_event(
             "dsar.export_inventory",
@@ -48,7 +45,7 @@ def export_my_data_inventory(uid: str = Depends(get_current_user)) -> Dict[str, 
             gcs_live_object_count=inventory["gcs_live_object_count"],
             gcs_noncurrent_version_count=inventory["gcs_noncurrent_version_count"],
             total_bytes=inventory["total_bytes"],
-            memory_thread_count=len(memory_threads),
+            memory_thread_count=inventory["memory_thread_count"],
         )
         return inventory
     except HTTPException:
@@ -76,9 +73,7 @@ def erase_my_data(uid: str = Depends(get_current_user)) -> Dict[str, Any]:
         Confirmation JSON dictionary detailing erased GCS objects, local caches, and memory threads.
     """
     try:
-        purge_result = purge_all_user_data(uid)
-        deleted_memory_threads = clear_user_memory(uid)
-        request_id = get_request_id()
+        purge_result = purge_all_user_data(uid, checkpointer=MEMORY_SAVER)
 
         emit_audit_event(
             "dsar.erase_user_data",
@@ -88,7 +83,7 @@ def erase_my_data(uid: str = Depends(get_current_user)) -> Dict[str, Any]:
             deleted_gcs_noncurrent_versions=purge_result["deleted_gcs_noncurrent_versions"],
             deleted_local_chroma=purge_result["deleted_local_chroma"],
             deleted_local_uploads=purge_result["deleted_local_uploads"],
-            deleted_memory_threads=deleted_memory_threads,
+            deleted_memory_threads=purge_result["deleted_memory_threads"],
         )
         return {
             "status": "success",
@@ -96,9 +91,8 @@ def erase_my_data(uid: str = Depends(get_current_user)) -> Dict[str, Any]:
                 "All personal data, vector collections, archived PDFs, and conversation "
                 "history have been permanently erased."
             ),
-            "request_id": request_id,
+            "request_id": get_request_id(),
             **purge_result,
-            "deleted_memory_threads": deleted_memory_threads,
         }
     except LockTimeoutError as e:
         emit_audit_event(
