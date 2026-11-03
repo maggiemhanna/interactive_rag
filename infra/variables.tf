@@ -160,7 +160,7 @@ variable "frontend_max_instances" {
   default     = 5
 }
 
-# Ephemeral `/tmp/chroma_db` LRU cache eviction quotas
+# Ephemeral `/tmp/chroma_db` LRU cache eviction quotas & GCS distributed write-lock settings
 variable "chroma_tmp_max_bytes" {
   description = "Maximum total bytes allowed in /tmp/chroma_db before LRU tenant cache eviction runs (default 512 MiB)."
   type        = number
@@ -181,6 +181,34 @@ variable "chroma_tmp_min_free_bytes" {
     condition     = var.chroma_tmp_min_free_bytes >= 67108864 && floor(var.chroma_tmp_min_free_bytes) == var.chroma_tmp_min_free_bytes
     error_message = "chroma_tmp_min_free_bytes must be an integer >= 67108864 (64 MiB)."
   }
+}
+
+variable "chroma_lock_ttl_seconds" {
+  description = "Distributed GCS ChromaDB write-lock lease TTL in seconds before stale-lock recovery is allowed."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.chroma_lock_ttl_seconds > 0
+    error_message = "chroma_lock_ttl_seconds must be greater than 0."
+  }
+}
+
+variable "chroma_lock_timeout_seconds" {
+  description = "Maximum seconds to wait when acquiring a per-user distributed GCS ChromaDB write lock."
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.chroma_lock_timeout_seconds > 0
+    error_message = "chroma_lock_timeout_seconds must be greater than 0."
+  }
+}
+
+variable "archive_uploads_to_gcs" {
+  description = "Archive original uploaded PDF files to gs://<bucket>/users/<uid>/uploads/ during ingestion."
+  type        = bool
+  default     = true
 }
 
 variable "bucket_force_destroy" {

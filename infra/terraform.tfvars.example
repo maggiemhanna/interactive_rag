@@ -22,9 +22,12 @@ frontend_memory            = "512Mi"
 frontend_concurrency       = 80
 frontend_min_instances     = 0
 frontend_max_instances     = 5
-chroma_tmp_max_bytes       = 536870912
-chroma_tmp_min_free_bytes  = 268435456
-bucket_force_destroy       = false
+chroma_tmp_max_bytes        = 536870912
+chroma_tmp_min_free_bytes   = 268435456
+chroma_lock_ttl_seconds     = 300
+chroma_lock_timeout_seconds = 60
+archive_uploads_to_gcs      = true
+bucket_force_destroy        = false
 
 # Google OAuth Sign-In (credentials loaded dynamically from GCP Secret Manager)
 enable_google_oauth                = true

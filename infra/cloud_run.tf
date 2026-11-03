@@ -104,12 +104,32 @@ resource "google_cloud_run_v2_service" "ingest_api" {
         value = var.region
       }
       env {
+        name  = "FIREBASE_PROJECT_ID"
+        value = var.project_id
+      }
+      env {
         name  = "GCS_BUCKET_NAME"
         value = google_storage_bucket.chroma_persistence.name
       }
       env {
         name  = "LOCAL_CHROMA_ROOT"
         value = "/tmp/chroma_db"
+      }
+      env {
+        name  = "UPLOAD_TMP_ROOT"
+        value = "/tmp/uploads"
+      }
+      env {
+        name  = "ARCHIVE_UPLOADS_TO_GCS"
+        value = tostring(var.archive_uploads_to_gcs)
+      }
+      env {
+        name  = "CHROMA_LOCK_TTL_SECONDS"
+        value = tostring(var.chroma_lock_ttl_seconds)
+      }
+      env {
+        name  = "CHROMA_LOCK_TIMEOUT_SECONDS"
+        value = tostring(var.chroma_lock_timeout_seconds)
       }
       env {
         name  = "CHROMA_TMP_MAX_BYTES"
@@ -174,6 +194,10 @@ resource "google_cloud_run_v2_service" "ingest_api" {
       env {
         name  = "TELEMETRY_LOG_NAME"
         value = "interactiverag-telemetry"
+      }
+      env {
+        name  = "TELEMETRY_CLOUD_LOGGING_ENABLED"
+        value = "true"
       }
       env {
         name  = "STRUCTURED_LOGGING"
@@ -279,12 +303,28 @@ resource "google_cloud_run_v2_service" "agent_api" {
         value = var.region
       }
       env {
+        name  = "FIREBASE_PROJECT_ID"
+        value = var.project_id
+      }
+      env {
         name  = "GCS_BUCKET_NAME"
         value = google_storage_bucket.chroma_persistence.name
       }
       env {
         name  = "LOCAL_CHROMA_ROOT"
         value = "/tmp/chroma_db"
+      }
+      env {
+        name  = "UPLOAD_TMP_ROOT"
+        value = "/tmp/uploads"
+      }
+      env {
+        name  = "CHROMA_LOCK_TTL_SECONDS"
+        value = tostring(var.chroma_lock_ttl_seconds)
+      }
+      env {
+        name  = "CHROMA_LOCK_TIMEOUT_SECONDS"
+        value = tostring(var.chroma_lock_timeout_seconds)
       }
       env {
         name  = "CHROMA_TMP_MAX_BYTES"
@@ -353,6 +393,10 @@ resource "google_cloud_run_v2_service" "agent_api" {
       env {
         name  = "TELEMETRY_LOG_NAME"
         value = "interactiverag-telemetry"
+      }
+      env {
+        name  = "TELEMETRY_CLOUD_LOGGING_ENABLED"
+        value = "true"
       }
       env {
         name  = "STRUCTURED_LOGGING"
