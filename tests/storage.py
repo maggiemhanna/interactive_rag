@@ -1,164 +1,49 @@
-import base64
-import hashlib
+"""Automated offline unit test suite for Per-User GCS <-> ChromaDB Storage (`src.core.storage`).
+
+Verifies:
+- Strict per-tenant directory and GCS prefix isolation (`users/<uid>/chroma_db/`).
+- Cross-service `version.json` invalidation and Chroma `PersistentClient` cache refresh.
+- Remote GCS blob cleanup upon collection deletion.
+- Distributed GCS write-lock TTL recovery (`users/<uid>/locks/chroma.lock`) and contention timeouts.
+- `/tmp` LRU cache eviction preserving actively locked readers.
+"""
+
 import json
 import os
-import shutil
 import tempfile
-import threading
 import time
+from typing import Dict
 import unittest
-from typing import Dict, List, Optional
 from unittest.mock import patch
 
 import chromadb
-from google.api_core import exceptions as gcs_exceptions
 
-from src.core.storage import gcs_sync as gcs_sync_module
 from src.core.logger import setup_logging
 from src.core.storage import (
     LockTimeoutError,
     evict_tmp_cache,
-    release_client_cache,
+    gcs_sync as gcs_sync_module,
     sync_user_dir,
     user_read_lock,
     user_write_lock,
 )
+from tests.helpers import FakeGCSBlob, FakeGCSBucket, cleanup_chroma_tmpdir
 
-logger = setup_logging(name="test_storage")
-
-
-class FakeGCSBlob:
-    """In-memory GCS Blob double supporting atomic `if_generation_match` preconditions."""
-
-    def __init__(self, bucket: "FakeGCSBucket", name: str):
-        self.bucket = bucket
-        self.name = name
-        self._generation: Optional[int] = None
-
-    @property
-    def generation(self) -> Optional[int]:
-        if self._generation is not None:
-            return self._generation
-        entry = self.bucket._objects.get(self.name)
-        return entry["generation"] if entry else None
-
-    @property
-    def md5_hash(self) -> Optional[str]:
-        entry = self.bucket._objects.get(self.name)
-        if not entry:
-            return None
-        return base64.b64encode(hashlib.md5(entry["data"]).digest()).decode("ascii")
-
-    @property
-    def size(self) -> int:
-        entry = self.bucket._objects.get(self.name)
-        return len(entry["data"]) if entry else 0
-
-    def exists(self) -> bool:
-        return self.name in self.bucket._objects
-
-    def upload_from_string(
-        self,
-        data: str | bytes,
-        content_type: str = "application/octet-stream",
-        if_generation_match: Optional[int] = None,
-    ) -> None:
-        raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
-        self._generation = self.bucket._put(self.name, raw, if_generation_match=if_generation_match)
-
-    def upload_from_filename(
-        self,
-        filename: str,
-        content_type: str = "application/octet-stream",
-        if_generation_match: Optional[int] = None,
-    ) -> None:
-        with open(filename, "rb") as f:
-            raw = f.read()
-        self._generation = self.bucket._put(self.name, raw, if_generation_match=if_generation_match)
-
-    def download_as_text(self) -> str:
-        entry = self.bucket._get(self.name)
-        self._generation = entry["generation"]
-        return entry["data"].decode("utf-8")
-
-    def download_to_filename(self, filename: str) -> None:
-        entry = self.bucket._get(self.name)
-        self._generation = entry["generation"]
-        with open(filename, "wb") as f:
-            f.write(entry["data"])
-
-    def delete(self, if_generation_match: Optional[int] = None) -> None:
-        self.bucket._delete(self.name, if_generation_match=if_generation_match)
-
-
-class FakeGCSBucket:
-    """Thread-safe in-memory GCS Bucket double."""
-
-    def __init__(self, name: str = "test-chroma-bucket"):
-        self.name = name
-        self._lock = threading.Lock()
-        self._next_gen = 1
-        self._objects: Dict[str, Dict] = {}
-
-    def blob(self, name: str) -> FakeGCSBlob:
-        return FakeGCSBlob(self, name)
-
-    def list_blobs(self, prefix: str = "") -> List[FakeGCSBlob]:
-        with self._lock:
-            names = [k for k in sorted(self._objects.keys()) if k.startswith(prefix)]
-            blobs = []
-            for n in names:
-                b = FakeGCSBlob(self, n)
-                b._generation = self._objects[n]["generation"]
-                blobs.append(b)
-            return blobs
-
-    def _put(self, name: str, data: bytes, if_generation_match: Optional[int] = None) -> int:
-        with self._lock:
-            existing = self._objects.get(name)
-            current_gen = existing["generation"] if existing else 0
-            if if_generation_match is not None and current_gen != if_generation_match:
-                raise gcs_exceptions.PreconditionFailed(
-                    f"Precondition failed on {name}: expected gen {if_generation_match}, got {current_gen}"
-                )
-            gen = self._next_gen
-            self._next_gen += 1
-            self._objects[name] = {"data": data, "generation": gen}
-            return gen
-
-    def _get(self, name: str) -> Dict:
-        with self._lock:
-            if name not in self._objects:
-                raise gcs_exceptions.NotFound(f"Object {name} not found")
-            return dict(self._objects[name])
-
-    def _delete(self, name: str, if_generation_match: Optional[int] = None) -> None:
-        with self._lock:
-            if name not in self._objects:
-                raise gcs_exceptions.NotFound(f"Object {name} not found")
-            current_gen = self._objects[name]["generation"]
-            if if_generation_match is not None and current_gen != if_generation_match:
-                raise gcs_exceptions.PreconditionFailed(
-                    f"Delete precondition failed on {name}: expected {if_generation_match}, got {current_gen}"
-                )
-            del self._objects[name]
+logger = setup_logging(name="tests.storage")
 
 
 class TestPerUserChromaStorage(unittest.TestCase):
-    def setUp(self):
+    """Unit tests for per-user GCS synchronization, distributed locking, and `/tmp` LRU cache eviction."""
+
+    def setUp(self) -> None:
         self.container1_tmp = tempfile.mkdtemp(prefix="chroma_c1_")
         self.container2_tmp = tempfile.mkdtemp(prefix="chroma_c2_")
         self.fake_bucket = FakeGCSBucket("interactive-rag-chroma-test")
 
-    def tearDown(self):
-        for root in (self.container1_tmp, self.container2_tmp):
-            if os.path.exists(root):
-                for entry in os.scandir(root):
-                    if entry.is_dir():
-                        release_client_cache(entry.path)
-                shutil.rmtree(root, ignore_errors=True)
+    def tearDown(self) -> None:
+        cleanup_chroma_tmpdir(self.container1_tmp, self.container2_tmp)
 
-    def _env(self, local_root: str, **overrides) -> Dict[str, str]:
+    def _env(self, local_root: str, **overrides: str) -> Dict[str, str]:
         base = {
             "GCS_BUCKET_NAME": self.fake_bucket.name,
             "LOCAL_CHROMA_ROOT": local_root,
@@ -170,7 +55,8 @@ class TestPerUserChromaStorage(unittest.TestCase):
         base.update(overrides)
         return base
 
-    def test_01_strict_per_user_isolation_same_collection_name(self):
+    def test_01_strict_per_user_isolation_same_collection_name(self) -> None:
+        """Verifies two users creating identically named collections stay completely isolated across containers."""
         with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container1_tmp), clear=False
         ):
@@ -194,7 +80,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
                     embeddings=[[0.0, 1.0, 0.0]],
                 )
 
-            # Verify isolated reads on a completely fresh container (container 2)
+        # Verify isolated reads on a completely fresh container (container 2)
         with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container2_tmp), clear=False
         ):
@@ -211,8 +97,9 @@ class TestPerUserChromaStorage(unittest.TestCase):
             self.assertEqual(bob_col.count(), 1)
             self.assertEqual(bob_col.get()["documents"], ["Bob private portfolio"])
 
-    def test_02_cross_service_version_invalidation_refreshes_cached_chroma_client(self):
-        # Step 1: Container 1 (ingestion-api) writes 1 doc
+    def test_02_cross_service_version_invalidation_refreshes_cached_chroma_client(self) -> None:
+        """Verifies remote `version.json` increments invalidate stale Chroma client caches on other containers."""
+        # Step 1: Container 1 (ingest-api) writes 1 doc
         with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container1_tmp), clear=False
         ):
@@ -245,7 +132,8 @@ class TestPerUserChromaStorage(unittest.TestCase):
                 2,
             )
 
-    def test_03_deleted_collection_cleans_up_remote_gcs_blobs(self):
+    def test_03_deleted_collection_cleans_up_remote_gcs_blobs(self) -> None:
+        """Verifies deleting a Chroma collection removes stale segment files from GCS on write-lock exit."""
         with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container1_tmp), clear=False
         ):
@@ -273,8 +161,8 @@ class TestPerUserChromaStorage(unittest.TestCase):
             cols = [c.name for c in chromadb.PersistentClient(path=restored_dir).list_collections()]
             self.assertEqual(cols, ["keep_me"])
 
-    def test_04_stale_gcs_lock_ttl_recovery_and_active_lock_contention(self):
-        # Plant a crashed container's expired lock in GCS
+    def test_04_stale_gcs_lock_ttl_recovery_and_active_lock_contention(self) -> None:
+        """Verifies expired GCS write locks are reclaimed automatically while active locks raise `LockTimeoutError`."""
         expired_lock = json.dumps(
             {
                 "uid": "user_alice",
@@ -290,7 +178,6 @@ class TestPerUserChromaStorage(unittest.TestCase):
         with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container1_tmp), clear=False
         ):
-            # Should recover expired lock automatically and release it afterward
             with user_write_lock("user_alice") as alice_dir:
                 chromadb.PersistentClient(path=alice_dir).create_collection("recovered_col")
 
@@ -299,7 +186,6 @@ class TestPerUserChromaStorage(unittest.TestCase):
                 "Lock must be deleted after write context exits",
             )
 
-        # Plant a LIVE non-expired lock held by another container -> verify timeout raises cleanly
         active_lock = json.dumps(
             {
                 "uid": "user_bob",
@@ -321,7 +207,8 @@ class TestPerUserChromaStorage(unittest.TestCase):
                 with user_write_lock("user_bob"):
                     pass
 
-    def test_05_lru_tmp_eviction_preserves_active_users_and_evicts_oldest_inactive(self):
+    def test_05_lru_tmp_eviction_preserves_active_users_and_evicts_oldest_inactive(self) -> None:
+        """Verifies `evict_tmp_cache` skips active read-locked tenants and evicts the oldest inactive tenant first."""
         with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container1_tmp), clear=False
         ):
@@ -331,14 +218,12 @@ class TestPerUserChromaStorage(unittest.TestCase):
                     col.add(ids=["1"], documents=[f"Data for {uid}"], embeddings=[[0.2, 0.3, 0.5]])
                 time.sleep(0.02)
 
-            # Pin `u_oldest` as actively reading so LRU must skip `u_oldest` and evict `u_middle` first!
             with user_read_lock("u_oldest"):
                 with patch.dict(os.environ, {"CHROMA_TMP_MAX_BYTES": "1"}, clear=False):
                     evicted_while_pinned = evict_tmp_cache(exclude_uid="u_newest")
                     self.assertNotIn("u_oldest", evicted_while_pinned)
                     self.assertIn("u_middle", evicted_while_pinned)
 
-            # Evicted `u_middle` still restores cleanly from GCS whenever requested again
             restored_middle = sync_user_dir("u_middle")
             self.assertEqual(
                 chromadb.PersistentClient(path=restored_middle).get_collection("notes").count(),
@@ -347,5 +232,5 @@ class TestPerUserChromaStorage(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    logger.info("Running Phase 3 Per-User GCS <-> ChromaDB Storage test suite...")
+    logger.info("Running Per-User GCS <-> ChromaDB Storage unit test suite...")
     unittest.main(verbosity=2)

@@ -1,63 +1,99 @@
+"""Automated offline unit test suite for Layer 4: Compliance & Governance (`src.core.compliance`).
+
+Verifies:
+- Phase 1: Single-region data residency (`validate_gcp_region`, `get_google_cloud_location`,
+  `get_model_armor_location`), Vertex AI & Model Armor regional endpoint pinning,
+  and GCP `constraints/gcp.resourceLocations` Organization Policy evaluation.
+- Phase 2: `X-Request-Id` and `X-Cloud-Trace-Context` request correlation, structured
+  `interactiverag-audit` Cloud Logging emission, and zero-plaintext query scrubbing (`query_sha256`).
+- Phase 3: GDPR Art. 15/17 DSAR inventory (`GET /compliance/my-data`) and hard versioned
+  erasure (`DELETE /compliance/my-data`), plus EU AI Act Art. 50 `compliance` provenance metadata.
+- Phase 4: Fail-closed Model Armor screening (`HTTP 503`), per-user sliding-window rate limits
+  (`HTTP 429` + `Retry-After`), collection quotas (`HTTP 403`), and static pre-deploy policy checks.
+"""
+
+from contextlib import redirect_stdout
 import io
+import json
 import logging
 import os
 import shutil
 import tempfile
-from contextlib import redirect_stdout
-from typing import Optional
 import unittest
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 from google.cloud import modelarmor_v1
+from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 
 from scripts.check_region_policy import evaluate_effective_location_policy
+from scripts.check_static_policies import evaluate_repo_static_policies
 from src.agent import app as agent_app_module
 from src.agent import graph as agent_graph_module
+from src.agent.memory import MEMORY_SAVER
 from src.core import config as config_module
 from src.core.ai_security import armor as armor_module
 from src.core.ai_security import guardrails as guardrails_module
-from src.core.compliance import audit as audit_module
-from src.core.compliance.audit import hash_query, register_audit_listener
-from src.core.compliance.residency import validate_gcp_region
-from src.core.config import get_google_cloud_location, get_model_armor_location
+from src.core.ai_security.safety import SCREENING_UNAVAILABLE_MESSAGE
+from src.core.compliance import (
+    audit as audit_module,
+    hash_query,
+    list_user_memory_threads,
+    register_audit_listener,
+    validate_gcp_region,
+)
+from src.core.compliance.policy import SlidingWindowRateLimiter, reset_rate_limiters
+from src.core.config import (
+    get_google_cloud_location,
+    get_model_armor_location,
+)
+from src.core.logger import setup_logging
 from src.core.storage import chroma as chroma_module
-from src.core.storage import release_client_cache
-from src.ingest import app as ingestion_app_module
-from tests.ai_security import (
+from src.core.storage import gcs_sync as gcs_sync_module
+from src.ingest import app as ingest_app_module
+from tests.helpers import (
     DeterministicFakeEmbeddings,
+    FakeGCSBucket,
     GroundedCitingChatModel,
-    _blocked_pi_prompt_response,
-    _clean_prompt_response,
-    _dlp_redacted_output_response,
+    REPO_ROOT,
+    cleanup_chroma_tmpdir,
+    create_synthetic_repo_copy,
+    make_blocked_pi_prompt_response,
+    make_clean_output_response,
+    make_clean_prompt_response,
+    make_dlp_redacted_output_response,
     make_test_pdf,
+    parse_sse_frames,
+    reset_memory_saver,
 )
 
+logger = setup_logging(name="tests.compliance")
 
-@tool
+
+@tool("retriever")
 def _noop_retriever_tool(query: str) -> str:
-    """No-op retriever tool for graph construction unit tests."""
-    return query
+    """No-op retriever tool for offline graph build tests."""
+    return f"chunk for {query}"
 
 
 class TestPhase1DataResidency(unittest.TestCase):
-    """Phase 1 unit tests: single GOOGLE_CLOUD_LOCATION unification, regional pinning, and Org Policy gate."""
+    """Phase 1 unit tests: single-region validation, Vertex AI & Model Armor pinning, and Org Policy check."""
 
-    def test_default_location_constant_removed_and_unified_on_google_cloud_location(self):
+    def test_default_location_constant_removed_and_unified_on_google_cloud_location(self) -> None:
+        """Verifies legacy `DEFAULT_LOCATION` is removed and `GOOGLE_CLOUD_LOCATION` defaults to `'us-central1'`."""
         self.assertFalse(
             hasattr(config_module, "DEFAULT_LOCATION"),
-            "Legacy DEFAULT_LOCATION constant must not exist on src.core.config",
+            "DEFAULT_LOCATION must be removed from src.core.config in favor of GOOGLE_CLOUD_LOCATION",
         )
-        self.assertTrue(hasattr(config_module, "GOOGLE_CLOUD_LOCATION"))
-
         with patch.dict(os.environ, {"GOOGLE_CLOUD_LOCATION": ""}, clear=False):
             self.assertEqual(get_google_cloud_location(), "us-central1")
 
-        with patch.dict(os.environ, {"GOOGLE_CLOUD_LOCATION": "us-west2"}, clear=False):
-            self.assertEqual(get_google_cloud_location(), "us-west2")
+        with patch.dict(os.environ, {"GOOGLE_CLOUD_LOCATION": "us-west1"}, clear=False):
+            self.assertEqual(get_google_cloud_location(), "us-west1")
 
-    def test_model_armor_location_defaults_to_google_cloud_location(self):
+    def test_model_armor_location_defaults_to_google_cloud_location(self) -> None:
+        """Verifies `get_model_armor_location()` inherits `GOOGLE_CLOUD_LOCATION` unless explicitly overridden."""
         with patch.dict(
             os.environ,
             {"GOOGLE_CLOUD_LOCATION": "us-west3", "MODEL_ARMOR_LOCATION": ""},
@@ -67,12 +103,16 @@ class TestPhase1DataResidency(unittest.TestCase):
 
         with patch.dict(
             os.environ,
-            {"GOOGLE_CLOUD_LOCATION": "us-west3", "MODEL_ARMOR_LOCATION": "us-central1"},
+            {
+                "GOOGLE_CLOUD_LOCATION": "us-west3",
+                "MODEL_ARMOR_LOCATION": "us-central1",
+            },
             clear=False,
         ):
             self.assertEqual(get_model_armor_location(), "us-central1")
 
-    def test_validate_gcp_region_accepts_concrete_single_regions(self):
+    def test_validate_gcp_region_accepts_concrete_single_regions(self) -> None:
+        """Verifies `validate_gcp_region` accepts and normalizes concrete single GCP regions."""
         for valid_region in (
             "us-central1",
             "us-west1",
@@ -85,7 +125,8 @@ class TestPhase1DataResidency(unittest.TestCase):
 
         self.assertEqual(validate_gcp_region("  US-CENTRAL1 "), "us-central1")
 
-    def test_validate_gcp_region_rejects_global_and_multi_regions(self):
+    def test_validate_gcp_region_rejects_global_and_multi_regions(self) -> None:
+        """Verifies `validate_gcp_region` raises `ValueError` for `'global'` and multi-region identifiers."""
         for invalid_location in (
             "global",
             "GLOBAL",
@@ -102,7 +143,8 @@ class TestPhase1DataResidency(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_gcp_region(invalid_location)
 
-    def test_model_armor_target_resolution_rejects_global_location(self):
+    def test_model_armor_target_resolution_rejects_global_location(self) -> None:
+        """Verifies `_resolve_model_armor_target` rejects `'global'` in both full template paths and short IDs."""
         with patch.dict(
             os.environ,
             {
@@ -126,7 +168,8 @@ class TestPhase1DataResidency(unittest.TestCase):
             with self.assertRaises(ValueError):
                 armor_module._resolve_model_armor_target()
 
-    def test_get_embeddings_pins_google_cloud_location_and_rejects_global(self):
+    def test_get_embeddings_pins_google_cloud_location_and_rejects_global(self) -> None:
+        """Verifies `get_embeddings` passes `location=get_google_cloud_location()` to Vertex AI and rejects `'global'`."""
         mock_embeddings_cls = MagicMock()
         with patch.object(chroma_module, "GoogleGenerativeAIEmbeddings", mock_embeddings_cls):
             with patch.dict(
@@ -151,7 +194,8 @@ class TestPhase1DataResidency(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     chroma_module.get_embeddings("gemini-embedding-001")
 
-    def test_build_agent_pins_google_cloud_location_and_rejects_global(self):
+    def test_build_agent_pins_google_cloud_location_and_rejects_global(self) -> None:
+        """Verifies `build_agent` passes `location=get_google_cloud_location()` to `ChatGoogleGenerativeAI` and rejects `'global'`."""
         captured = {}
 
         def fake_chat_factory(*args, **kwargs):
@@ -185,7 +229,8 @@ class TestPhase1DataResidency(unittest.TestCase):
                         model_name="gemini-2.5-flash",
                     )
 
-    def test_org_policy_evaluator_enforces_effective_resource_locations(self):
+    def test_org_policy_evaluator_enforces_effective_resource_locations(self) -> None:
+        """Verifies `evaluate_effective_location_policy` validates `constraints/gcp.resourceLocations` policies."""
         sample_policy = {
             "constraint": "constraints/gcp.resourceLocations",
             "listPolicy": {
@@ -241,7 +286,8 @@ class TestPhase1DataResidency(unittest.TestCase):
         self.assertFalse(ok_denied)
         self.assertIn("explicitly denied", msg_denied)
 
-    def test_single_source_of_truth_model_allowlists_and_required_collection_name(self):
+    def test_single_source_of_truth_model_allowlists_and_required_collection_name(self) -> None:
+        """Verifies model allowlists fail closed when unset and align between `.env` and `infra/variables.tf`."""
         for removed_const in (
             "DEFAULT_COLLECTION",
             "DEFAULT_LLM_MODEL",
@@ -254,7 +300,6 @@ class TestPhase1DataResidency(unittest.TestCase):
                 f"Redundant constant {removed_const} must not exist on src.core.config",
             )
 
-        # Fail closed when env allowlists are missing or blank
         with patch.dict(os.environ, {"ALLOWED_LLM_MODELS": " , "}, clear=False):
             with self.assertRaises(ValueError):
                 config_module.get_allowed_llm_models()
@@ -267,7 +312,6 @@ class TestPhase1DataResidency(unittest.TestCase):
             with self.assertRaises(ValueError):
                 guardrails_module.validate_embedding_model(None)
 
-        # Default selection dynamically tracks the first configured model in each allowlist
         with patch.dict(
             os.environ,
             {
@@ -281,21 +325,18 @@ class TestPhase1DataResidency(unittest.TestCase):
             self.assertEqual(guardrails_module.validate_embedding_model(None), "text-embedding-005")
             self.assertEqual(guardrails_module.validate_embedding_model(""), "text-embedding-005")
 
-        # collection_name is mandatory (no fallback default collection)
         for missing_col in (None, "", "   "):
             with self.assertRaises(ValueError):
                 guardrails_module.validate_collection_name(missing_col)  # type: ignore[arg-type]
 
-        # Verify .env and Terraform variables stay aligned on the regional model catalogs
         expected_llms = "gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite"
         expected_embeddings = "gemini-embedding-001,text-embedding-005"
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        with open(os.path.join(repo_root, "infra", "variables.tf"), encoding="utf-8") as fh:
+        with open(os.path.join(REPO_ROOT, "infra", "variables.tf"), encoding="utf-8") as fh:
             variables_tf = fh.read()
         self.assertIn(f'default     = "{expected_llms}"', variables_tf)
         self.assertIn(f'default     = "{expected_embeddings}"', variables_tf)
 
-        with open(os.path.join(repo_root, ".env"), encoding="utf-8") as fh:
+        with open(os.path.join(REPO_ROOT, ".env"), encoding="utf-8") as fh:
             dotenv_content = fh.read()
         self.assertIn(f'ALLOWED_LLM_MODELS="{expected_llms}"', dotenv_content)
         self.assertIn(f'ALLOWED_EMBEDDING_MODELS="{expected_embeddings}"', dotenv_content)
@@ -313,29 +354,26 @@ class _ListLogHandler(logging.Handler):
 
 
 class TestPhase2AuditLogging(unittest.TestCase):
-    """Phase 2 unit tests: X-Request-Id / X-Cloud-Trace-Context correlation, Cloud Logging, and PII-free query scrubbing."""
+    """Phase 2 unit tests: `X-Request-Id` / `X-Cloud-Trace-Context` correlation, Cloud Logging, and PII-free query scrubbing."""
 
     def setUp(self) -> None:
         self.chroma_tmp = tempfile.mkdtemp(prefix="comp_audit_chroma_")
         self.uploads_tmp = tempfile.mkdtemp(prefix="comp_audit_uploads_")
-        agent_graph_module.MEMORY_SAVER.storage.clear()
+        reset_memory_saver()
         armor_module._model_armor_clients.clear()
         audit_module._cloud_loggers.clear()
 
         self.captured_events: list[dict] = []
         self._unsub = register_audit_listener(self.captured_events.append)
 
-        self.ingestion_client = TestClient(ingestion_app_module.app)
+        self.ingest_client = TestClient(ingest_app_module.app)
         self.agent_client = TestClient(agent_app_module.app)
 
     def tearDown(self) -> None:
         self._unsub()
-        if os.path.exists(self.chroma_tmp):
-            for entry in os.scandir(self.chroma_tmp):
-                if entry.is_dir():
-                    release_client_cache(entry.path)
-            shutil.rmtree(self.chroma_tmp, ignore_errors=True)
+        cleanup_chroma_tmpdir(self.chroma_tmp)
         shutil.rmtree(self.uploads_tmp, ignore_errors=True)
+        reset_memory_saver()
         armor_module._model_armor_clients.clear()
         audit_module._cloud_loggers.clear()
 
@@ -361,6 +399,7 @@ class TestPhase2AuditLogging(unittest.TestCase):
         return env
 
     def test_request_id_and_cloud_trace_correlation_across_rest_and_sse(self) -> None:
+        """Verifies `X-Request-Id` and `X-Cloud-Trace-Context` propagate into response headers and audit events."""
         trace_hex = "105445aa7843bc8bf206b12000100000"
         trace_header = f"{trace_hex}/1;o=1"
 
@@ -369,7 +408,6 @@ class TestPhase2AuditLogging(unittest.TestCase):
         ), patch.object(
             agent_graph_module, "ChatGoogleGenerativeAI", side_effect=GroundedCitingChatModel
         ):
-            # 1. Auto-generated X-Request-Id when omitted, and unsafe X-Request-Id header sanitized
             r_auto = self.agent_client.get("/collections")
             self.assertEqual(r_auto.status_code, 200)
             self.assertTrue(r_auto.headers.get("x-request-id", "").startswith("req-"))
@@ -381,13 +419,12 @@ class TestPhase2AuditLogging(unittest.TestCase):
             self.assertEqual(r_unsafe.status_code, 200)
             self.assertTrue(r_unsafe.headers.get("x-request-id", "").startswith("req-"))
 
-            # 2. Propagate client X-Request-Id and X-Cloud-Trace-Context across ingest -> query -> agent -> SSE -> delete
             self.captured_events.clear()
             corr_headers = {
                 "X-Request-Id": "req-audit-e2e-001",
                 "X-Cloud-Trace-Context": trace_header,
             }
-            r_ing = self.ingestion_client.post(
+            r_ing = self.ingest_client.post(
                 "/ingest",
                 headers=corr_headers,
                 data={"collection_name": "audit_col"},
@@ -440,6 +477,7 @@ class TestPhase2AuditLogging(unittest.TestCase):
                 self.assertEqual(evt["region"], "us-central1")
 
     def test_zero_plaintext_query_leakage_in_logs_and_stdout(self) -> None:
+        """Verifies raw user queries never appear in application logs, stdout, or audit records (`query_sha256` only)."""
         canary = "SSN-987-65-4321-CONFIDENTIAL-PATIENT-CANARY"
         expected_digest = hash_query(canary)
 
@@ -471,7 +509,7 @@ class TestPhase2AuditLogging(unittest.TestCase):
             ), patch.object(
                 agent_graph_module, "ChatGoogleGenerativeAI", side_effect=GroundedCitingChatModel
             ), redirect_stdout(stdout_buf):
-                self.ingestion_client.post(
+                self.ingest_client.post(
                     "/ingest",
                     data={"collection_name": "scrub_col"},
                     files=[("files", ("doc.pdf", make_test_pdf("Neutral financial overview"), "application/pdf"))],
@@ -497,7 +535,6 @@ class TestPhase2AuditLogging(unittest.TestCase):
                 )
                 self.assertEqual(r_s.status_code, 200)
 
-                # Also verify emit_audit_event auto-scrubs accidental `query=` kwargs
                 scrubbed_record = audit_module.emit_audit_event("custom.test", query=canary)
                 self.assertNotIn("query", scrubbed_record)
                 self.assertEqual(scrubbed_record["query_sha256"], expected_digest)
@@ -520,6 +557,7 @@ class TestPhase2AuditLogging(unittest.TestCase):
                 self.assertEqual(evt["query_chars"], len(canary))
 
     def test_cloud_logging_client_publishes_to_interactiverag_audit_with_trace_and_fallback(self) -> None:
+        """Verifies `emit_audit_event` writes structured payloads to Cloud Logging and falls back gracefully on errors."""
         mock_cloud_logger = MagicMock()
         mock_client_instance = MagicMock()
         mock_client_instance.logger.return_value = mock_cloud_logger
@@ -541,19 +579,21 @@ class TestPhase2AuditLogging(unittest.TestCase):
             mock_cls.assert_called_once_with(project="interactive-rag")
             mock_client_instance.logger.assert_called_once_with("interactiverag-audit")
             mock_cloud_logger.log_struct.assert_called_once()
-            logged_payload, logged_kwargs = mock_cloud_logger.log_struct.call_args[0][0], mock_cloud_logger.log_struct.call_args[1]
+            logged_payload, logged_kwargs = (
+                mock_cloud_logger.log_struct.call_args[0][0],
+                mock_cloud_logger.log_struct.call_args[1],
+            )
             self.assertEqual(logged_payload["event_type"], "collection.list")
             self.assertEqual(logged_payload["request_id"], "req-gcp-log-01")
             self.assertEqual(logged_kwargs["severity"], "INFO")
             self.assertEqual(logged_kwargs["trace"], f"projects/interactive-rag/traces/{trace_hex}")
 
-            # Transient Cloud Logging error falls back gracefully without failing user requests
             mock_cloud_logger.log_struct.side_effect = RuntimeError("Logging API unavailable")
             res_fallback = self.agent_client.get("/collections")
             self.assertEqual(res_fallback.status_code, 200)
 
     def test_auth_failures_and_security_guardrails_emit_structured_audit_events(self) -> None:
-        # 1. Unauthenticated request -> 401 + auth.failure audit event + X-Request-Id echoed
+        """Verifies HTTP 401 auth failures, Model Armor blocks, and Cloud DLP chunk masking emit correlated audit events."""
         with patch.dict(
             os.environ,
             self._env(AUTH_DISABLED="false", K_SERVICE="interactive-rag-agent-prod"),
@@ -571,9 +611,8 @@ class TestPhase2AuditLogging(unittest.TestCase):
             self.assertEqual(self.captured_events[0]["reason"], "missing_authorization_header")
             self.assertEqual(self.captured_events[0]["request_id"], "req-unauth-401")
 
-        # 2. Model Armor prompt block & DLP chunk/output redaction emit audit events with request_id preserved across worker threads
         mock_armor_client = MagicMock()
-        mock_armor_client.sanitize_user_prompt.return_value = _blocked_pi_prompt_response()
+        mock_armor_client.sanitize_user_prompt.return_value = make_blocked_pi_prompt_response()
 
         armor_env = self._env(
             MODEL_ARMOR_TEMPLATE_ID="projects/interactive-rag/locations/us-central1/templates/rag-guard"
@@ -585,7 +624,7 @@ class TestPhase2AuditLogging(unittest.TestCase):
         ), patch.object(
             armor_module.modelarmor_v1, "ModelArmorClient", return_value=mock_armor_client
         ):
-            self.ingestion_client.post(
+            self.ingest_client.post(
                 "/ingest",
                 data={"collection_name": "sec_audit_col"},
                 files=[
@@ -611,10 +650,9 @@ class TestPhase2AuditLogging(unittest.TestCase):
             self.assertEqual(pi_events[0]["request_id"], "req-pi-block")
             self.assertNotIn("Ignore rules", str(pi_events[0]))
 
-            # Now test DLP chunk masking across multiple chunks (ThreadPoolExecutor) + output redaction
             self.captured_events.clear()
-            mock_armor_client.sanitize_user_prompt.return_value = _clean_prompt_response()
-            mock_armor_client.sanitize_model_response.return_value = _dlp_redacted_output_response(
+            mock_armor_client.sanitize_user_prompt.return_value = make_clean_prompt_response()
+            mock_armor_client.sanitize_model_response.return_value = make_dlp_redacted_output_response(
                 "Redacted [EMAIL_ADDRESS] [p1.pdf, p.1]."
             )
             r_redacted = self.agent_client.post(
@@ -634,9 +672,9 @@ class TestPhase2AuditLogging(unittest.TestCase):
                 self.assertEqual(ce["uid"], "audit_user")
 
     def test_governance_terraform_audit_configs_bucket_sink_and_lb_logs(self) -> None:
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        gov_path = os.path.join(repo_root, "infra", "compliance.tf")
-        lb_path = os.path.join(repo_root, "infra", "load_balancer.tf")
+        """Verifies `infra/compliance.tf` and `infra/load_balancer.tf` configure audit log buckets, sinks, and LB sampling."""
+        gov_path = os.path.join(REPO_ROOT, "infra", "compliance.tf")
+        lb_path = os.path.join(REPO_ROOT, "infra", "load_balancer.tf")
 
         with open(gov_path, encoding="utf-8") as fh:
             gov_tf = fh.read()
@@ -658,206 +696,17 @@ class TestPhase2AuditLogging(unittest.TestCase):
         self.assertGreaterEqual(lb_tf.count("sample_rate = var.lb_log_sample_rate"), 2)
 
 
-class _VersionedFakeGCSBlob:
-    """GCS Blob double supporting object versioning (`generation`, `size`, `updated`, `time_deleted`)."""
-
-    def __init__(
-        self,
-        bucket: "_VersionedFakeGCSBucket",
-        name: str,
-        generation: Optional[int] = None,
-        size: int = 0,
-        updated=None,
-        time_deleted=None,
-    ):
-        self.bucket = bucket
-        self.name = name
-        self._generation = generation
-        self.size = size
-        self.updated = updated
-        self.time_deleted = time_deleted
-
-    @property
-    def generation(self) -> Optional[int]:
-        if self._generation is not None:
-            return self._generation
-        live = self.bucket._live.get(self.name)
-        return live["generation"] if live else None
-
-    def exists(self) -> bool:
-        return self.name in self.bucket._live
-
-    def upload_from_string(
-        self,
-        data: str | bytes,
-        content_type: str = "application/octet-stream",
-        if_generation_match: Optional[int] = None,
-    ) -> None:
-        raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
-        self._generation = self.bucket._put(self.name, raw, if_generation_match=if_generation_match)
-        self.size = len(raw)
-
-    def upload_from_filename(
-        self,
-        filename: str,
-        content_type: str = "application/octet-stream",
-        if_generation_match: Optional[int] = None,
-    ) -> None:
-        with open(filename, "rb") as fh:
-            raw = fh.read()
-        self._generation = self.bucket._put(self.name, raw, if_generation_match=if_generation_match)
-        self.size = len(raw)
-
-    def download_as_text(self) -> str:
-        entry = self.bucket._get_live(self.name)
-        self._generation = entry["generation"]
-        return entry["data"].decode("utf-8")
-
-    def download_to_filename(self, filename: str) -> None:
-        entry = self.bucket._get_live(self.name)
-        self._generation = entry["generation"]
-        with open(filename, "wb") as fh:
-            fh.write(entry["data"])
-
-    def delete(self, if_generation_match: Optional[int] = None) -> None:
-        self.bucket._soft_delete_live(self.name, if_generation_match=if_generation_match)
-
-
-class _VersionedFakeGCSBucket:
-    """In-memory GCS Bucket double with true object versioning (`versions=True` & `delete_blob(..., generation=...)`)."""
-
-    def __init__(self, name: str = "versioned-compliance-bucket"):
-        import threading
-        from datetime import datetime, timezone
-
-        self.name = name
-        self._lock = threading.Lock()
-        self._next_gen = 1
-        self._live: dict[str, dict] = {}
-        self._noncurrent: list[dict] = []
-        self._now = lambda: datetime.now(timezone.utc)
-
-    def blob(self, name: str) -> _VersionedFakeGCSBlob:
-        return _VersionedFakeGCSBlob(self, name)
-
-    def _put(self, name: str, data: bytes, if_generation_match=None) -> int:
-        from google.api_core import exceptions as gcs_exceptions
-
-        with self._lock:
-            existing = self._live.get(name)
-            current_gen = existing["generation"] if existing else 0
-            if if_generation_match is not None and current_gen != if_generation_match:
-                raise gcs_exceptions.PreconditionFailed(
-                    f"Precondition failed on {name}: expected {if_generation_match}, got {current_gen}"
-                )
-            now = self._now()
-            if existing is not None:
-                archived = dict(existing)
-                archived["time_deleted"] = now
-                self._noncurrent.append(archived)
-            gen = self._next_gen
-            self._next_gen += 1
-            self._live[name] = {
-                "name": name,
-                "data": data,
-                "size": len(data),
-                "generation": gen,
-                "updated": now,
-                "time_deleted": None,
-            }
-            return gen
-
-    def _get_live(self, name: str) -> dict:
-        from google.api_core import exceptions as gcs_exceptions
-
-        with self._lock:
-            if name not in self._live:
-                raise gcs_exceptions.NotFound(f"Live object {name} not found")
-            return dict(self._live[name])
-
-    def _soft_delete_live(self, name: str, if_generation_match=None) -> None:
-        from google.api_core import exceptions as gcs_exceptions
-
-        with self._lock:
-            if name not in self._live:
-                raise gcs_exceptions.NotFound(f"Live object {name} not found")
-            existing = self._live[name]
-            if if_generation_match is not None and existing["generation"] != if_generation_match:
-                raise gcs_exceptions.PreconditionFailed("Generation mismatch on delete")
-            archived = dict(existing)
-            archived["time_deleted"] = self._now()
-            self._noncurrent.append(archived)
-            del self._live[name]
-
-    def delete_blob(self, blob_name: str, generation: Optional[int] = None, **kwargs) -> None:
-        from google.api_core import exceptions as gcs_exceptions
-
-        if generation is None:
-            self._soft_delete_live(blob_name)
-            return
-
-        with self._lock:
-            live = self._live.get(blob_name)
-            if live is not None and live["generation"] == generation:
-                del self._live[blob_name]
-                return
-            for idx, ver in enumerate(self._noncurrent):
-                if ver["name"] == blob_name and ver["generation"] == generation:
-                    self._noncurrent.pop(idx)
-                    return
-            raise gcs_exceptions.NotFound(
-                f"Object {blob_name} generation={generation} not found"
-            )
-
-    def list_blobs(self, prefix: str = "", versions: bool = False):
-        with self._lock:
-            results = []
-            for name in sorted(self._live.keys()):
-                if name.startswith(prefix):
-                    entry = self._live[name]
-                    results.append(
-                        _VersionedFakeGCSBlob(
-                            self,
-                            name=name,
-                            generation=entry["generation"],
-                            size=entry["size"],
-                            updated=entry["updated"],
-                            time_deleted=None,
-                        )
-                    )
-            if versions:
-                for entry in self._noncurrent:
-                    if entry["name"].startswith(prefix):
-                        results.append(
-                            _VersionedFakeGCSBlob(
-                                self,
-                                name=entry["name"],
-                                generation=entry["generation"],
-                                size=entry["size"],
-                                updated=entry["updated"],
-                                time_deleted=entry["time_deleted"],
-                            )
-                        )
-            return results
-
-
 class TestPhase3RegulatoryCompliance(unittest.TestCase):
     """Phase 3 unit tests: GDPR Art. 15/17 DSAR inventory & complete versioned erasure, and EU AI Act Art. 50 provenance."""
 
     def setUp(self) -> None:
-        from src.agent.memory import MEMORY_SAVER
-
         self.chroma_root = tempfile.mkdtemp(prefix="comp_p3_chroma_")
         self.uploads_root = tempfile.mkdtemp(prefix="comp_p3_uploads_")
-        self.fake_bucket = _VersionedFakeGCSBucket("interactive-rag-p3-bucket")
+        self.fake_bucket = FakeGCSBucket("interactive-rag-p3-bucket")
         self.captured_events: list[dict] = []
         self._unsubscribe = register_audit_listener(self.captured_events.append)
 
-        MEMORY_SAVER.storage.clear()
-        MEMORY_SAVER.writes.clear()
-        MEMORY_SAVER.blobs.clear()
-
-        from src.core.storage import gcs_sync as gcs_sync_module
+        reset_memory_saver()
 
         self._env_patcher = patch.dict(
             os.environ,
@@ -899,34 +748,23 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         )
         self._llm_patcher.start()
 
-        self.ingest_client = TestClient(ingestion_app_module.app)
+        self.ingest_client = TestClient(ingest_app_module.app)
         self.agent_client = TestClient(agent_app_module.app)
 
     def tearDown(self) -> None:
-        from src.agent.memory import MEMORY_SAVER
-
         self._unsubscribe()
         self._llm_patcher.stop()
         self._emb_patcher.stop()
         self._bucket_patcher.stop()
         self._env_patcher.stop()
-        MEMORY_SAVER.storage.clear()
-        MEMORY_SAVER.writes.clear()
-        MEMORY_SAVER.blobs.clear()
-        if os.path.exists(self.chroma_root):
-            for entry in os.scandir(self.chroma_root):
-                if entry.is_dir():
-                    release_client_cache(entry.path)
-            shutil.rmtree(self.chroma_root, ignore_errors=True)
+        reset_memory_saver()
+        cleanup_chroma_tmpdir(self.chroma_root)
         shutil.rmtree(self.uploads_root, ignore_errors=True)
 
     def test_gdpr_dsar_inventory_and_hard_erasure_wipes_all_gcs_versions_and_memory_with_tenant_isolation(
         self,
     ) -> None:
-        from src.agent.memory import MEMORY_SAVER
-        from src.core.compliance.dsar import list_user_memory_threads
-
-        # 1. Alice ingests two batches into 'finance_docs' so versioned GCS accumulates noncurrent generations
+        """Verifies `GET /compliance/my-data` and `DELETE /compliance/my-data` erase all live/noncurrent GCS versions and memory threads for the caller only."""
         r1 = self.ingest_client.post(
             "/ingest",
             headers={"X-Dev-User-Id": "alice_gdpr"},
@@ -953,13 +791,11 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         )
         self.assertEqual(r2.status_code, 200)
 
-        # Create a residual temp upload file under /tmp/uploads/alice_gdpr to verify local upload cleanup
         alice_stale_upload = os.path.join(self.uploads_root, "alice_gdpr", "stale.tmp")
         os.makedirs(os.path.dirname(alice_stale_upload), exist_ok=True)
         with open(alice_stale_upload, "wb") as fh:
             fh.write(b"temp")
 
-        # 2. Bob also ingests a collection and chats on his own thread (must remain untouched!)
         r_bob_ingest = self.ingest_client.post(
             "/ingest",
             headers={"X-Dev-User-Id": "bob_gdpr"},
@@ -973,7 +809,6 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         )
         self.assertEqual(r_bob_ingest.status_code, 200)
 
-        # 3. Both Alice (2 threads) and Bob (1 thread) chat with the agent to populate MEMORY_SAVER
         for tid in ("chat-a1", "chat-a2"):
             ra = self.agent_client.post(
                 "/agent",
@@ -1004,7 +839,6 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         )
         self.assertEqual(list_user_memory_threads("bob_gdpr", MEMORY_SAVER), ["chat-b1"])
 
-        # Confirm GCS actually has noncurrent object versions for Alice due to the second ingest overwriting SQLite/version.json
         alice_all_versions_before = self.fake_bucket.list_blobs(
             prefix="users/alice_gdpr/", versions=True
         )
@@ -1013,7 +847,6 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         ]
         self.assertGreaterEqual(len(alice_noncurrent_before), 2)
 
-        # 4. GDPR Art. 15 — GET /compliance/my-data for Alice
         self.captured_events.clear()
         inv_resp = self.agent_client.get(
             "/compliance/my-data",
@@ -1043,7 +876,6 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         self.assertEqual(inv_events[0]["uid"], "alice_gdpr")
         self.assertEqual(inv_events[0]["memory_thread_count"], 2)
 
-        # 5. GDPR Art. 17 — DELETE /compliance/my-data for Alice
         self.captured_events.clear()
         del_resp = self.agent_client.delete(
             "/compliance/my-data",
@@ -1058,15 +890,12 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         self.assertGreater(del_json["deleted_gcs_noncurrent_versions"], 0)
         self.assertEqual(del_json["deleted_memory_threads"], 2)
 
-        # Verify ZERO live OR noncurrent GCS objects remain under users/alice_gdpr/
         self.assertEqual(
             self.fake_bucket.list_blobs(prefix="users/alice_gdpr/", versions=True),
             [],
         )
-        # Verify Alice's local /tmp/chroma_db/alice_gdpr and /tmp/uploads/alice_gdpr are gone
         self.assertFalse(os.path.exists(os.path.join(self.chroma_root, "alice_gdpr")))
         self.assertFalse(os.path.exists(os.path.join(self.uploads_root, "alice_gdpr")))
-        # Verify Alice's MEMORY_SAVER checkpoints are 0
         self.assertEqual(list_user_memory_threads("alice_gdpr", MEMORY_SAVER), [])
 
         erase_events = [
@@ -1076,7 +905,6 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         self.assertEqual(erase_events[0]["uid"], "alice_gdpr")
         self.assertEqual(erase_events[0]["deleted_memory_threads"], 2)
 
-        # Verify post-erasure inventory for Alice is completely empty
         inv_after = self.agent_client.get(
             "/compliance/my-data",
             headers={"X-Dev-User-Id": "alice_gdpr"},
@@ -1086,7 +914,6 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         self.assertEqual(inv_after["total_bytes"], 0)
         self.assertEqual(inv_after["memory_thread_count"], 0)
 
-        # 6. Verify Bob's GCS data, Chroma collection, and MEMORY_SAVER thread are 100% intact!
         self.assertEqual(list_user_memory_threads("bob_gdpr", MEMORY_SAVER), ["chat-b1"])
         bob_inv = self.agent_client.get(
             "/compliance/my-data",
@@ -1099,8 +926,7 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
     def test_eu_ai_act_art50_compliance_provenance_in_json_and_sse_including_pii_filtered(
         self,
     ) -> None:
-        import json
-
+        """Verifies EU AI Act Art. 50 `compliance` provenance metadata on both JSON `/agent` and SSE `/agent/stream`."""
         self.ingest_client.post(
             "/ingest",
             headers={"X-Dev-User-Id": "alice_gdpr"},
@@ -1113,7 +939,6 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
             ],
         )
 
-        # 1. Clean grounded JSON /agent response (offline dev without Model Armor)
         r_json = self.agent_client.post(
             "/agent",
             headers={"X-Dev-User-Id": "alice_gdpr", "X-Request-Id": "req-eu-json-1"},
@@ -1145,10 +970,9 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
             },
         )
 
-        # 2. SSE /agent/stream response with DLP PII redaction active -> pii_filtered=True & sdp:redacted actions
         mock_armor_client = MagicMock()
-        mock_armor_client.sanitize_user_prompt.return_value = _clean_prompt_response()
-        mock_armor_client.sanitize_model_response.return_value = _dlp_redacted_output_response(
+        mock_armor_client.sanitize_user_prompt.return_value = make_clean_prompt_response()
+        mock_armor_client.sanitize_model_response.return_value = make_dlp_redacted_output_response(
             "Contact [EMAIL_ADDRESS] for AI transparency [policy.pdf, p.1]."
         )
         with patch.dict(
@@ -1168,12 +992,7 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
             )
             self.assertEqual(r_sse.status_code, 200)
 
-        sse_frames = []
-        for raw_line in r_sse.text.splitlines():
-            line = raw_line.strip()
-            if line.startswith("data: ") and line != "data: [DONE]":
-                sse_frames.append(json.loads(line[6:]))
-
+        sse_frames = parse_sse_frames(r_sse.text)
         compliance_frames = [f for f in sse_frames if f.get("event") == "compliance"]
         self.assertEqual(len(compliance_frames), 1)
         sse_comp = compliance_frames[0]["compliance"]
@@ -1196,7 +1015,6 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         )
         self.assertEqual(sse_comp["request_id"], "req-eu-sse-pii")
 
-        # 3. Subsequent clean request resets pii_filtered and guardrail_actions
         r_clean_after = self.agent_client.post(
             "/agent",
             headers={"X-Dev-User-Id": "alice_gdpr", "X-Request-Id": "req-eu-clean-after"},
@@ -1211,8 +1029,7 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         self.assertEqual(r_clean_after.json()["compliance"]["guardrail_actions"], [])
 
     def test_grounding_status_and_all_model_armor_filter_actions_reported(self) -> None:
-        from langchain_core.messages import AIMessage
-
+        """Verifies `guardrail_actions` and `grounded` flags across prompt injection, malicious URI, RAI safety, and abstaining answers."""
         self.ingest_client.post(
             "/ingest",
             headers={"X-Dev-User-Id": "alice_gdpr"},
@@ -1229,9 +1046,8 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
             "MODEL_ARMOR_TEMPLATE_ID": "projects/interactive-rag/locations/us-central1/templates/guard",
         }
 
-        # 1. Prompt Injection / Jailbreak blocked -> grounded=False, ai_generated=False, pi_and_jailbreak:blocked
         pi_client = MagicMock()
-        pi_client.sanitize_user_prompt.return_value = _blocked_pi_prompt_response()
+        pi_client.sanitize_user_prompt.return_value = make_blocked_pi_prompt_response()
         with patch.dict(os.environ, armor_env, clear=False), patch.object(
             armor_module, "_get_model_armor_client", return_value=pi_client
         ):
@@ -1258,7 +1074,6 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
             ],
         )
 
-        # 2. Malicious URI filter blocked -> malicious_uri:blocked
         uri_client = MagicMock()
         uri_client.sanitize_user_prompt.return_value = modelarmor_v1.SanitizeUserPromptResponse(
             sanitization_result=modelarmor_v1.SanitizationResult(
@@ -1297,14 +1112,9 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
             ],
         )
 
-        # 3. RAI filter blocked on output with matched subcategories (HARASSMENT + DANGEROUS)
         rai_client = MagicMock()
-        rai_client.sanitize_user_prompt.return_value = _clean_prompt_response()
-        rai_clean_chunk = modelarmor_v1.SanitizeModelResponseResponse(
-            sanitization_result=modelarmor_v1.SanitizationResult(
-                filter_match_state=modelarmor_v1.FilterMatchState.NO_MATCH_FOUND,
-            )
-        )
+        rai_client.sanitize_user_prompt.return_value = make_clean_prompt_response()
+        rai_clean_chunk = make_clean_output_response()
         rai_blocked_output = modelarmor_v1.SanitizeModelResponseResponse(
             sanitization_result=modelarmor_v1.SanitizationResult(
                 filter_match_state=modelarmor_v1.FilterMatchState.MATCH_FOUND,
@@ -1313,8 +1123,6 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
                         rai_filter_result=modelarmor_v1.RaiFilterResult(
                             match_state=modelarmor_v1.FilterMatchState.MATCH_FOUND,
                             rai_filter_type_results={
-                                # Live Model Armor wire format omits filter_type (defaults to RAI_FILTER_TYPE_UNSPECIFIED)
-                                # and carries the subcategory identifier in the map key:
                                 "harassment": modelarmor_v1.RaiFilterResult.RaiFilterTypeResult(
                                     match_state=modelarmor_v1.FilterMatchState.MATCH_FOUND,
                                 ),
@@ -1357,7 +1165,6 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
             ],
         )
 
-        # 4. Abstaining / uncited LLM answer -> ai_generated=True, grounded=False, citation_count=0
         class UncitedAbstainingChatModel:
             def bind_tools(self, tools):
                 return self
@@ -1386,19 +1193,13 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
     """Phase 4 unit tests: fail-closed Model Armor (HTTP 503), per-UID rate limits (HTTP 429), collection quotas (HTTP 403), and static policy checks."""
 
     def setUp(self) -> None:
-        from src.agent.memory import MEMORY_SAVER
-        from src.core.compliance.policy import reset_rate_limiters
-        from src.core.storage import gcs_sync as gcs_sync_module
-
         self.chroma_root = tempfile.mkdtemp(prefix="comp_p4_chroma_")
         self.uploads_root = tempfile.mkdtemp(prefix="comp_p4_uploads_")
-        self.fake_bucket = _VersionedFakeGCSBucket("interactive-rag-p4-bucket")
+        self.fake_bucket = FakeGCSBucket("interactive-rag-p4-bucket")
         self.captured_events: list[dict] = []
         self._unsubscribe = register_audit_listener(self.captured_events.append)
 
-        MEMORY_SAVER.storage.clear()
-        MEMORY_SAVER.writes.clear()
-        MEMORY_SAVER.blobs.clear()
+        reset_memory_saver()
         armor_module._model_armor_clients.clear()
         reset_rate_limiters()
 
@@ -1454,39 +1255,25 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
         )
         self._llm_patcher.start()
 
-        self.ingest_client = TestClient(ingestion_app_module.app)
+        self.ingest_client = TestClient(ingest_app_module.app)
         self.agent_client = TestClient(agent_app_module.app)
 
     def tearDown(self) -> None:
-        from src.agent.memory import MEMORY_SAVER
-        from src.core.compliance.policy import reset_rate_limiters
-
         self._unsubscribe()
         self._llm_patcher.stop()
         self._emb_patcher.stop()
         self._bucket_patcher.stop()
         self._env_patcher.stop()
-        MEMORY_SAVER.storage.clear()
-        MEMORY_SAVER.writes.clear()
-        MEMORY_SAVER.blobs.clear()
+        reset_memory_saver()
         armor_module._model_armor_clients.clear()
         reset_rate_limiters()
-        if os.path.exists(self.chroma_root):
-            for entry in os.scandir(self.chroma_root):
-                if entry.is_dir():
-                    release_client_cache(entry.path)
-            shutil.rmtree(self.chroma_root, ignore_errors=True)
+        cleanup_chroma_tmpdir(self.chroma_root)
         shutil.rmtree(self.uploads_root, ignore_errors=True)
 
     def test_fail_closed_model_armor_returns_503_and_audits_vs_local_fail_open_fallback(
         self,
     ) -> None:
-        import json
-
-        from src.core.ai_security.safety import SCREENING_UNAVAILABLE_MESSAGE
-        from tests.ai_security import _clean_output_response
-
-        # Seed a collection under local fail-open mode (MODEL_ARMOR_FAIL_CLOSED="false", template unset)
+        """Verifies `MODEL_ARMOR_FAIL_CLOSED=true` returns HTTP 503 (or SSE 503 error frame) when Model Armor is unconfigured or errors."""
         r_seed = self.ingest_client.post(
             "/ingest",
             data={"collection_name": "policy_docs"},
@@ -1503,7 +1290,6 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
         )
         self.assertEqual(r_seed.status_code, 200)
 
-        # 1. Local fail-open mode (MODEL_ARMOR_FAIL_CLOSED="false", template unset) -> HTTP 200
         r_local_q = self.agent_client.post(
             "/query",
             json={"query": "revenue summary", "collection_name": "policy_docs"},
@@ -1516,7 +1302,6 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
         self.assertEqual(r_local_a.status_code, 200)
         self.created_llms.clear()
 
-        # 2. Fail-closed mode with missing MODEL_ARMOR_TEMPLATE_ID -> HTTP 503 on /agent, /agent/stream, and /query
         with patch.dict(
             os.environ,
             {"MODEL_ARMOR_FAIL_CLOSED": "true", "MODEL_ARMOR_TEMPLATE_ID": ""},
@@ -1564,7 +1349,6 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
                 )
             )
 
-        # 3. Fail-closed mode with configured template when Model Armor / DLP raises upstream API errors
         template_id = "projects/interactive-rag/locations/us-central1/templates/rag-guard"
         mock_armor = MagicMock()
 
@@ -1573,7 +1357,6 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
             {"MODEL_ARMOR_FAIL_CLOSED": "true", "MODEL_ARMOR_TEMPLATE_ID": template_id},
             clear=False,
         ), patch.object(armor_module, "_get_model_armor_client", return_value=mock_armor):
-            # 3a. Prompt screening error -> HTTP 503, zero Gemini invocations
             self.created_llms.clear()
             self.captured_events.clear()
             mock_armor.sanitize_user_prompt.side_effect = RuntimeError("Model Armor PSC timeout")
@@ -1588,7 +1371,6 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
                 any(e["event_type"] == "security.prompt_screening_error" for e in self.captured_events)
             )
 
-            # 3b. Chunk sanitization error on /query -> HTTP 503, zero raw chunk leakage
             self.captured_events.clear()
             mock_armor.sanitize_model_response.side_effect = RuntimeError("Cloud DLP backend unavailable")
             r_chunk_err = self.agent_client.post(
@@ -1602,12 +1384,11 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
                 any(e["event_type"] == "security.chunk_screening_error" for e in self.captured_events)
             )
 
-            # 3c. Output sanitization error on /agent (stream=False) -> HTTP 503, zero raw answer leakage
             self.captured_events.clear()
             mock_armor.sanitize_user_prompt.side_effect = None
-            mock_armor.sanitize_user_prompt.return_value = _clean_prompt_response()
+            mock_armor.sanitize_user_prompt.return_value = make_clean_prompt_response()
             mock_armor.sanitize_model_response.side_effect = [
-                _clean_output_response(),
+                make_clean_output_response(),
                 RuntimeError("Output DLP timeout"),
             ]
             r_out_err = self.agent_client.post(
@@ -1621,13 +1402,12 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
                 any(e["event_type"] == "security.output_screening_error" for e in self.captured_events)
             )
 
-            # 3d. Mid-stream screening error on /agent/stream (both chunk DLP failure and output DLP failure) -> SSE error frame with http_status=503
             for err_thread, side_effects in (
                 ("fc-sse-chunk-err", [RuntimeError("Mid-stream chunk DLP failure")]),
                 (
                     "fc-sse-out-err",
                     [
-                        _dlp_redacted_output_response(
+                        make_dlp_redacted_output_response(
                             "Confidential SSN [US_SOCIAL_SECURITY_NUMBER] revenue summary."
                         ),
                         RuntimeError("Mid-stream output DLP failure"),
@@ -1642,11 +1422,7 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
                 )
                 self.assertEqual(r_sse_fc.status_code, 200)
                 self.assertNotIn("123-45-6789", r_sse_fc.text)
-                sse_payloads = [
-                    json.loads(line[len("data: ") :])
-                    for line in r_sse_fc.text.splitlines()
-                    if line.startswith("data: ") and line != "data: [DONE]"
-                ]
+                sse_payloads = parse_sse_frames(r_sse_fc.text)
                 err_frames = [p for p in sse_payloads if p.get("event") == "error"]
                 self.assertEqual(len(err_frames), 1)
                 self.assertEqual(err_frames[0].get("http_status"), 503)
@@ -1663,9 +1439,7 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
     def test_per_user_sliding_window_rate_limits_enforce_429_retry_after_and_tenant_isolation(
         self,
     ) -> None:
-        from src.core.compliance.policy import SlidingWindowRateLimiter
-
-        # Deterministic clock check on SlidingWindowRateLimiter window rollover
+        """Verifies per-UID sliding-window rate limits enforce HTTP 429 and `Retry-After` headers without affecting other tenants."""
         fake_now = [100.0]
         limiter = SlidingWindowRateLimiter(window_seconds=60.0, clock=lambda: fake_now[0])
         self.assertEqual(limiter.check_and_record("u1", 2), (True, 0))
@@ -1678,7 +1452,6 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
         fake_now[0] = 160.1
         self.assertEqual(limiter.check_and_record("u1", 2), (True, 0))
 
-        # End-to-end API rate-limit enforcement on /ingest, /query, and /agent with per-UID isolation
         with patch.dict(
             os.environ,
             {
@@ -1736,7 +1509,6 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
             self.assertEqual(rl_ing_events[0]["uid"], "alice_policy")
             self.assertEqual(rl_ing_events[0]["limit_per_minute"], 2)
 
-            # Tenant isolation: bob_policy has an independent ingest bucket
             res_bob_ing = self.ingest_client.post(
                 "/ingest",
                 headers={"X-Dev-User-Id": "bob_policy"},
@@ -1745,7 +1517,6 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
             )
             self.assertEqual(res_bob_ing.status_code, 200)
 
-            # Query rate limit across /query and /agent (shared query ceiling = 3/min)
             self.assertEqual(
                 self.agent_client.post(
                     "/query",
@@ -1786,7 +1557,6 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
             self.assertEqual(rl_q_events[0]["scope"], "query")
             self.assertEqual(rl_q_events[0]["limit_per_minute"], 3)
 
-            # Bob remains unaffected on /query
             self.assertEqual(
                 self.agent_client.post(
                     "/query",
@@ -1799,8 +1569,8 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
     def test_collection_quota_blocks_new_collections_at_cap_while_allowing_existing_collection_appends(
         self,
     ) -> None:
+        """Verifies `MAX_COLLECTIONS_PER_USER` blocks new collections at capacity (`HTTP 403`) while allowing appends to existing collections."""
         with patch.dict(os.environ, {"MAX_COLLECTIONS_PER_USER": "2"}, clear=False):
-            # Create 2 collections (reaches cap of 2)
             for col in ("col_one", "col_two"):
                 res = self.ingest_client.post(
                     "/ingest",
@@ -1810,7 +1580,6 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
                 )
                 self.assertEqual(res.status_code, 200, res.text)
 
-            # Creating a 3rd brand-new collection returns HTTP 403 + audit event without archiving orphaned PDFs
             self.captured_events.clear()
             uploads_before = [
                 b.name
@@ -1837,7 +1606,6 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
             self.assertEqual(quota_events[0]["current_collections"], 2)
             self.assertEqual(quota_events[0]["max_collections"], 2)
 
-            # Appending new documents to an ALREADY EXISTING collection ('col_one') succeeds with HTTP 200
             res_append = self.ingest_client.post(
                 "/ingest",
                 headers={"X-Dev-User-Id": "alice_policy"},
@@ -1846,7 +1614,6 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
             )
             self.assertEqual(res_append.status_code, 200, res_append.text)
 
-            # Separate tenant ('bob_policy') has an independent collection quota
             res_bob = self.ingest_client.post(
                 "/ingest",
                 headers={"X-Dev-User-Id": "bob_policy"},
@@ -1855,7 +1622,6 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
             )
             self.assertEqual(res_bob.status_code, 200, res_bob.text)
 
-            # Deleting 'col_two' frees a slot so 'alice_policy' can now create 'col_three'
             res_del = self.agent_client.delete(
                 "/collections/col_two",
                 headers={"X-Dev-User-Id": "alice_policy"},
@@ -1871,34 +1637,20 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
             self.assertEqual(res_col_three.status_code, 200, res_col_three.text)
 
     def test_static_policy_checks_and_cloud_run_deletion_protection(self) -> None:
-        from scripts.check_static_policies import evaluate_repo_static_policies
-
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        ok, violations = evaluate_repo_static_policies(repo_root)
+        """Verifies `evaluate_repo_static_policies` enforces single-region defaults, fail-closed Model Armor, and Cloud Run `deletion_protection`."""
+        ok, violations = evaluate_repo_static_policies(REPO_ROOT)
         self.assertTrue(ok, f"Expected live repository to pass static policy checks, got: {violations}")
         self.assertEqual(violations, [])
 
-        # Verify Makefile wires policy-check before plan and deploy
-        with open(os.path.join(repo_root, "Makefile"), encoding="utf-8") as fh:
+        with open(os.path.join(REPO_ROOT, "Makefile"), encoding="utf-8") as fh:
             makefile_text = fh.read()
         self.assertIn("policy-check:", makefile_text)
         self.assertIn("plan: policy-check", makefile_text)
         self.assertIn("deploy: policy-check", makefile_text)
 
-        # Synthetic repo mutation checks: global location default, disabled fail-closed, or disabled prod deletion_protection fail
-        syn_root = tempfile.mkdtemp(prefix="comp_static_policy_")
+        syn_root = create_synthetic_repo_copy(REPO_ROOT, prefix="comp_static_policy_")
+        syn_tfvars = os.path.join(syn_root, "infra", "terraform.tfvars")
         try:
-            os.makedirs(os.path.join(syn_root, "src", "core"), exist_ok=True)
-            shutil.copytree(os.path.join(repo_root, "infra"), os.path.join(syn_root, "infra"))
-            shutil.copy2(
-                os.path.join(repo_root, "src", "core", "config.py"),
-                os.path.join(syn_root, "src", "core", "config.py"),
-            )
-            syn_tfvars = os.path.join(syn_root, "infra", "terraform.tfvars")
-            if os.path.exists(syn_tfvars):
-                os.remove(syn_tfvars)
-
-            # 1. Mutate Python GOOGLE_CLOUD_LOCATION fallback to 'global'
             cfg_path = os.path.join(syn_root, "src", "core", "config.py")
             with open(cfg_path, encoding="utf-8") as fh:
                 orig_cfg = fh.read()
@@ -1910,7 +1662,6 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
             with open(cfg_path, "w", encoding="utf-8") as fh:
                 fh.write(orig_cfg)
 
-            # 2. Mutate Cloud Run deletion_protection back to false and disable MODEL_ARMOR_FAIL_CLOSED
             cr_path = os.path.join(syn_root, "infra", "cloud_run.tf")
             with open(cr_path, encoding="utf-8") as fh:
                 orig_cr = fh.read()
@@ -1932,7 +1683,6 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
             with open(cr_path, "w", encoding="utf-8") as fh:
                 fh.write(orig_cr)
 
-            # 3. Synthetic terraform.tfvars overriding region='eu' and model_armor_fail_closed=false
             with open(syn_tfvars, "w", encoding="utf-8") as fh:
                 fh.write('region = "eu"\nmodel_armor_fail_closed = false\n')
             ok_tfv, v_tfv = evaluate_repo_static_policies(syn_root)
@@ -1943,7 +1693,5 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
-
-
-
+    logger.info("Running Layer 4 Compliance & Governance unit test suite...")
+    unittest.main(verbosity=2)

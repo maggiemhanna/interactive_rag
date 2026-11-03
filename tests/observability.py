@@ -1,14 +1,35 @@
-"""Automated offline unit test suite for Layer 5: Observability & AI Monitoring."""
+"""Automated offline unit test suite for Layer 5: Observability & AI Monitoring (`src.core.observability`).
 
+Verifies:
+- Neutral request correlation (`src.core.context`) separated from compliance (`src.core.compliance.state`) and observability (`src.core.observability.state`).
+- Structured single-line GCP JSON logging (`GCPJsonFormatter`), trace/span enrichment, and PII query scrubbing (`RequestContextLogFilter`).
+- Hierarchical stage tracing (`start_span`), active span propagation, and end-to-end pipeline spans across ingestion, search, and LangGraph agent execution.
+- Token usage accumulation, similarity score summaries, SSE Time-to-First-Token (`ttft_ms`), and `interactiverag-telemetry` emission.
+- Regional observability Terraform resources (`infra/observability.tf`) and static pre-deploy policy checks.
+"""
+
+import io
+import json
+import logging
 import os
+import shutil
+import tempfile
 import unittest
+from unittest.mock import MagicMock, patch
 
 from fastapi import Depends
 from fastapi.testclient import TestClient
+from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, HumanMessage
 
+from scripts.check_static_policies import evaluate_repo_static_policies
+from src.agent import app as agent_app_module
+from src.agent import graph as agent_graph_module
+from src.agent.tools import get_retriever_tool
+from src.core import context as context_module
 from src.core.app_factory import create_app
 from src.core.auth import get_current_user
-from src.core import context as context_module
+from src.core.compliance.policy import reset_rate_limiters
 from src.core.compliance.state import (
     GUARDRAIL_FILTER_LABELS,
     get_guardrail_actions,
@@ -20,6 +41,7 @@ from src.core.compliance.state import (
     was_model_armor_active,
     was_pii_filtered,
 )
+from src.core.config import is_structured_logging_enabled
 from src.core.context import (
     RequestContext,
     RequestCorrelationMiddleware,
@@ -31,9 +53,23 @@ from src.core.context import (
     get_request_id,
     get_request_uid,
     get_trace_id,
+    hash_query,
     reset_request_context,
     set_active_span_id,
     set_request_uid,
+)
+from src.core.logger import setup_logging
+from src.core.observability import (
+    DEFAULT_TELEMETRY_LOG_NAME,
+    GCPJsonFormatter,
+    RequestContextLogFilter,
+    get_telemetry_log_name,
+    record_llm_usage,
+    record_retrieval_metrics,
+    register_span_listener,
+    register_telemetry_listener,
+    start_span,
+    telemetry as telemetry_module,
 )
 from src.core.observability.state import (
     get_elapsed_latency_ms,
@@ -47,6 +83,22 @@ from src.core.observability.state import (
     record_token_usage,
     record_ttft,
 )
+from src.core.storage import chroma as chroma_module
+from src.ingest import app as ingest_app_module
+from src.ingest.service import ingest_documents
+from src.ingest.splitter import split_pdfs
+from src.query.service import search_collection
+from tests.helpers import (
+    DeterministicFakeEmbeddings,
+    GroundedCitingChatModel,
+    REPO_ROOT,
+    cleanup_chroma_tmpdir,
+    create_synthetic_repo_copy,
+    make_test_pdf,
+    reset_memory_saver,
+)
+
+logger = setup_logging(name="tests.observability")
 
 
 class TestPhase1ContextAndPackageSeparation(unittest.TestCase):
@@ -54,12 +106,11 @@ class TestPhase1ContextAndPackageSeparation(unittest.TestCase):
 
     def test_legacy_compliance_context_file_removed_and_domain_functions_separated(self) -> None:
         """Verifies `src/core/compliance/context.py` is deleted and domain functions live in their `state.py` modules."""
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        legacy_path = os.path.join(repo_root, "src", "core", "compliance", "context.py")
-        neutral_path = os.path.join(repo_root, "src", "core", "context.py")
-        comp_state_path = os.path.join(repo_root, "src", "core", "compliance", "state.py")
-        obs_pkg_path = os.path.join(repo_root, "src", "core", "observability", "__init__.py")
-        obs_state_path = os.path.join(repo_root, "src", "core", "observability", "state.py")
+        legacy_path = os.path.join(REPO_ROOT, "src", "core", "compliance", "context.py")
+        neutral_path = os.path.join(REPO_ROOT, "src", "core", "context.py")
+        comp_state_path = os.path.join(REPO_ROOT, "src", "core", "compliance", "state.py")
+        obs_pkg_path = os.path.join(REPO_ROOT, "src", "core", "observability", "__init__.py")
+        obs_state_path = os.path.join(REPO_ROOT, "src", "core", "observability", "state.py")
 
         self.assertFalse(
             os.path.exists(legacy_path),
@@ -70,7 +121,6 @@ class TestPhase1ContextAndPackageSeparation(unittest.TestCase):
         self.assertTrue(os.path.isfile(obs_pkg_path))
         self.assertTrue(os.path.isfile(obs_state_path))
 
-        # Verify domain-specific compliance and observability helpers are NOT defined on src.core.context
         for domain_attr in (
             "GUARDRAIL_FILTER_LABELS",
             "mark_pii_filtered",
@@ -122,7 +172,6 @@ class TestPhase1ContextAndPackageSeparation(unittest.TestCase):
             self.assertEqual(prev_span, "0000000000000001")
             self.assertEqual(get_active_span_id(), "a1b2c3d400000002")
 
-            # Compliance guardrail & retrieval state helpers in src.core.compliance.state
             self.assertIn("sdp", GUARDRAIL_FILTER_LABELS)
             mark_pii_filtered(True)
             mark_model_armor_active(True)
@@ -144,7 +193,6 @@ class TestPhase1ContextAndPackageSeparation(unittest.TestCase):
             )
             self.assertEqual(get_retrieved_chunks_count(), 4)
 
-            # Observability state helpers in src.core.observability.state
             record_token_usage(input_tokens=400, output_tokens=100, total_tokens=500)
             record_token_usage(input_tokens=600, output_tokens=150)
             self.assertEqual(
@@ -218,7 +266,7 @@ class TestPhase1ContextAndPackageSeparation(unittest.TestCase):
         )
 
         client = TestClient(app)
-        with unittest.mock.patch.dict(os.environ, {"AUTH_DISABLED": "true"}, clear=False):
+        with patch.dict(os.environ, {"AUTH_DISABLED": "true"}, clear=False):
             resp = client.get(
                 "/inspect-context",
                 headers={
@@ -242,9 +290,7 @@ class TestPhase2StructuredLoggingAndTraceCorrelation(unittest.TestCase):
     """Phase 2 unit tests: `is_structured_logging_enabled`, `GCPJsonFormatter`, `RequestContextLogFilter`, and query scrubbing."""
 
     def tearDown(self) -> None:
-        from src.core.logger import setup_logging
-
-        with unittest.mock.patch.dict(
+        with patch.dict(
             os.environ,
             {"STRUCTURED_LOGGING": "false", "K_SERVICE": ""},
             clear=False,
@@ -253,30 +299,28 @@ class TestPhase2StructuredLoggingAndTraceCorrelation(unittest.TestCase):
 
     def test_is_structured_logging_enabled_env_and_cloud_run_defaults(self) -> None:
         """Verifies `is_structured_logging_enabled()` defaults to `is_cloud_run()` and honors `STRUCTURED_LOGGING`."""
-        from src.core.config import is_structured_logging_enabled
-
-        with unittest.mock.patch.dict(
+        with patch.dict(
             os.environ,
             {"STRUCTURED_LOGGING": "", "K_SERVICE": ""},
             clear=False,
         ):
             self.assertFalse(is_structured_logging_enabled())
 
-        with unittest.mock.patch.dict(
+        with patch.dict(
             os.environ,
             {"STRUCTURED_LOGGING": "", "K_SERVICE": "interactive-rag-agent"},
             clear=False,
         ):
             self.assertTrue(is_structured_logging_enabled())
 
-        with unittest.mock.patch.dict(
+        with patch.dict(
             os.environ,
             {"STRUCTURED_LOGGING": "true", "K_SERVICE": ""},
             clear=False,
         ):
             self.assertTrue(is_structured_logging_enabled())
 
-        with unittest.mock.patch.dict(
+        with patch.dict(
             os.environ,
             {"STRUCTURED_LOGGING": "false", "K_SERVICE": "interactive-rag-agent"},
             clear=False,
@@ -285,12 +329,6 @@ class TestPhase2StructuredLoggingAndTraceCorrelation(unittest.TestCase):
 
     def test_gcp_json_formatter_emits_single_line_json_with_trace_and_source_location(self) -> None:
         """Verifies `GCPJsonFormatter` produces single-line GCP structured JSON enriched from `RequestContext`."""
-        import io
-        import json
-        import logging
-
-        from src.core.observability import GCPJsonFormatter, RequestContextLogFilter
-
         ctx = RequestContext(
             request_id="req-phase2-json-001",
             trace_id="105445aa7843bc8bf206b12000100000",
@@ -312,7 +350,7 @@ class TestPhase2StructuredLoggingAndTraceCorrelation(unittest.TestCase):
             test_logger.setLevel(logging.INFO)
             test_logger.propagate = False
 
-            with unittest.mock.patch.dict(
+            with patch.dict(
                 os.environ,
                 {"GOOGLE_CLOUD_PROJECT": "interactive-rag-proj"},
                 clear=False,
@@ -347,13 +385,6 @@ class TestPhase2StructuredLoggingAndTraceCorrelation(unittest.TestCase):
 
     def test_request_context_log_filter_scrubs_raw_queries_in_extra_and_inline_messages(self) -> None:
         """Verifies `RequestContextLogFilter` scrubs raw `query` / `prompt` strings into `query_sha256` and `query_chars`."""
-        import io
-        import json
-        import logging
-
-        from src.core.context import hash_query
-        from src.core.observability import GCPJsonFormatter, RequestContextLogFilter
-
         stream = io.StringIO()
         handler = logging.StreamHandler(stream)
         handler.setFormatter(GCPJsonFormatter())
@@ -367,9 +398,7 @@ class TestPhase2StructuredLoggingAndTraceCorrelation(unittest.TestCase):
         secret_query = "What is CEO Jane Doe's home address and SSN?"
         expected_hash = hash_query(secret_query)
 
-        # 1. Raw query passed in extra={...}
         test_logger.info("Executing vector search", extra={"query": secret_query})
-        # 2. Raw query accidentally interpolated inline as query='...'
         test_logger.warning(f"Slow query detected: query='{secret_query}'")
 
         lines = [line for line in stream.getvalue().splitlines() if line.strip()]
@@ -388,12 +417,7 @@ class TestPhase2StructuredLoggingAndTraceCorrelation(unittest.TestCase):
 
     def test_setup_logging_switches_between_structured_json_and_coloredlogs(self) -> None:
         """Verifies `setup_logging()` installs `GCPJsonFormatter` when `STRUCTURED_LOGGING=true` and `coloredlogs` when `false`."""
-        import logging
-
-        from src.core.logger import setup_logging
-        from src.core.observability import GCPJsonFormatter, RequestContextLogFilter
-
-        with unittest.mock.patch.dict(
+        with patch.dict(
             os.environ,
             {"STRUCTURED_LOGGING": "true", "K_SERVICE": ""},
             clear=False,
@@ -409,7 +433,7 @@ class TestPhase2StructuredLoggingAndTraceCorrelation(unittest.TestCase):
                 "setup_logging() must attach RequestContextLogFilter to returned logger",
             )
 
-        with unittest.mock.patch.dict(
+        with patch.dict(
             os.environ,
             {"STRUCTURED_LOGGING": "false", "K_SERVICE": ""},
             clear=False,
@@ -427,17 +451,6 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
 
     def test_nested_spans_preserve_hierarchy_and_restore_active_span_id_and_log_span_id(self) -> None:
         """Verifies parent-child `span_id` hierarchy, `active_span_id` restoration, and log record span correlation."""
-        import io
-        import json
-        import logging
-
-        from src.core.observability import (
-            GCPJsonFormatter,
-            RequestContextLogFilter,
-            register_span_listener,
-            start_span,
-        )
-
         ctx = RequestContext(
             request_id="req-phase3-001",
             trace_id="105445aa7843bc8bf206b12000100000",
@@ -471,7 +484,6 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
                     self.assertEqual(llm_span["parent_span_id"], turn_span_id)
                     test_logger.info("Inside nested LLM span")
 
-                # Exiting child span restores parent's span_id
                 self.assertEqual(get_active_span_id(), turn_span_id)
 
                 with start_span("agent.retriever_tool", stage="retrieval", k=5) as ret_span:
@@ -480,14 +492,12 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
                     self.assertEqual(ret_span["parent_span_id"], turn_span_id)
                     ret_span["attributes"]["retrieved_chunks"] = 3
 
-            # Exiting outer span restores root_span_id
             self.assertEqual(get_active_span_id(), "0000000000000001")
 
             spans = get_recorded_spans()
             self.assertEqual(len(spans), 3)
             self.assertEqual(len(listener_spans), 3)
 
-            # Spans finish in inner-to-outer order: model_call, retriever_tool, turn
             self.assertEqual([s["name"] for s in spans], ["agent.model_call", "agent.retriever_tool", "agent.turn"])
             self.assertEqual(spans[0]["parent_span_id"], turn_span_id)
             self.assertEqual(spans[1]["parent_span_id"], turn_span_id)
@@ -502,7 +512,6 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
             self.assertIn("retrieval_ms", stage_latencies)
             self.assertIn("turn_ms", stage_latencies)
 
-            # Log emitted inside child span must carry that child span's logging.googleapis.com/spanId
             log_payload = json.loads(stream.getvalue().strip())
             self.assertEqual(log_payload["logging.googleapis.com/spanId"], llm_span_id)
         finally:
@@ -511,9 +520,6 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
 
     def test_span_error_status_and_raw_query_attribute_scrubbing(self) -> None:
         """Verifies exceptions inside `start_span` mark `status='error'` and scrub raw `query` attributes."""
-        from src.core.context import hash_query
-        from src.core.observability import start_span
-
         ctx = RequestContext(
             request_id="req-phase3-err",
             trace_id="205445aa7843bc8bf206b12000100000",
@@ -527,7 +533,6 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
                 with start_span("query.search_collection", stage="retrieval", query=secret_query):
                     raise RuntimeError("Simulated vector index error")
 
-            # Active span ID restored even after exception
             self.assertEqual(get_active_span_id(), "0000000000000009")
             spans = get_recorded_spans()
             self.assertEqual(len(spans), 1)
@@ -542,25 +547,6 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
 
     def test_end_to_end_pipeline_spans_across_ingestion_and_agent_execution(self) -> None:
         """Verifies `start_span` records stage latencies across PDF splitting, indexing, search, and LangGraph nodes."""
-        import shutil
-        import tempfile
-        from unittest.mock import patch
-
-        from langchain_core.messages import HumanMessage
-
-        from src.agent import graph as agent_graph_module
-        from src.agent.tools import get_retriever_tool
-        from src.core.storage import chroma as chroma_module
-        from src.core.storage import release_client_cache
-        from src.ingest.service import ingest_documents
-        from src.ingest.splitter import split_pdfs
-        from src.query.service import search_collection
-        from tests.ai_security import (
-            DeterministicFakeEmbeddings,
-            GroundedCitingChatModel,
-            make_test_pdf,
-        )
-
         temp_dir = tempfile.mkdtemp(prefix="obs_phase3_")
         pdf_dir = os.path.join(temp_dir, "pdfs")
         chroma_root = os.path.join(temp_dir, "chroma")
@@ -595,11 +581,9 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
                 },
                 clear=False,
             ):
-                # 1. Split PDFs -> ingest.split_pdfs (stage="chunking")
                 docs = split_pdfs([pdf_path], chunk_size=300, chunk_overlap=30)
                 self.assertGreaterEqual(len(docs), 1)
 
-                # 2. Ingest documents -> ingest.ingest_documents (stage="embedding")
                 ingest_documents(
                     uid="alice_e2e",
                     documents=docs,
@@ -607,7 +591,6 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
                     embedding_model="gemini-embedding-001",
                 )
 
-                # 3. Direct vector search -> query.search_collection (stage="retrieval")
                 results = search_collection(
                     uid="alice_e2e",
                     query="Annual revenue growth",
@@ -617,7 +600,6 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
                 )
                 self.assertGreaterEqual(len(results), 1)
 
-                # 4. Build and run LangGraph agent -> agent.input_guard, agent.model_call, agent.retriever_tool, agent.output_guard
                 retriever_tool = get_retriever_tool(
                     persist_directory=user_chroma_dir,
                     collection_name="obs_reports",
@@ -672,7 +654,7 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
                 self.assertGreaterEqual(stage_latencies[expected_stage_key], 0.0)
         finally:
             reset_request_context(token)
-            release_client_cache(user_chroma_dir)
+            cleanup_chroma_tmpdir(chroma_root)
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -681,14 +663,6 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
 
     def test_record_llm_usage_and_retrieval_metrics_accumulation(self) -> None:
         """Verifies `record_llm_usage()` and `record_retrieval_metrics()` accumulate across multi-step turns."""
-        from langchain_core.documents import Document
-        from langchain_core.messages import AIMessage
-
-        from src.core.observability import (
-            record_llm_usage,
-            record_retrieval_metrics,
-        )
-
         ctx = RequestContext(
             request_id="req-phase4-unit",
             trace_id="405445aa7843bc8bf206b12000100000",
@@ -696,7 +670,6 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
         )
         token = bind_request_context(ctx)
         try:
-            # 1. First LLM call (tool-calling turn) via usage_metadata
             msg_1 = AIMessage(
                 content="",
                 usage_metadata={"input_tokens": 180, "output_tokens": 35, "total_tokens": 215},
@@ -704,7 +677,6 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
             u1 = record_llm_usage(msg_1)
             self.assertEqual(u1, {"input_tokens": 180, "output_tokens": 35, "total_tokens": 215})
 
-            # 2. Second LLM call (synthesis turn) via response_metadata.usage_metadata
             msg_2 = AIMessage(
                 content="Grounded synthesis [report.pdf, p.1]",
                 response_metadata={
@@ -724,7 +696,6 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
             self.assertEqual(summary["total_tokens"], 730)
             self.assertEqual(summary["llm_calls"], 2)
 
-            # 3. Retrieval metrics across 2 tool calls
             d1 = Document(page_content="Chunk A", metadata={"source": "report.pdf", "page": 0})
             d2 = Document(page_content="Chunk B", metadata={"source": "report.pdf", "page": 1})
             m1 = record_retrieval_metrics([(d1, 0.90), (d2, 0.70)], is_tool_call=True)
@@ -742,36 +713,14 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
 
     def test_end_to_end_ingest_query_agent_and_sse_telemetry_emission(self) -> None:
         """Verifies `/ingest`, `/query`, `/agent`, and `/agent/stream` emit complete `interactiverag-telemetry` records."""
-        import shutil
-        import tempfile
-        from unittest.mock import MagicMock, patch
-
-        from src.agent import app as agent_app_module
-        from src.agent import graph as agent_graph_module
-        from src.core.compliance.policy import reset_rate_limiters
-        from src.core.observability import (
-            DEFAULT_TELEMETRY_LOG_NAME,
-            get_telemetry_log_name,
-            register_telemetry_listener,
-        )
-        from src.core.observability import telemetry as telemetry_module
-        from src.core.storage import chroma as chroma_module
-        from src.core.storage import release_client_cache
-        from src.ingest import app as ingestion_app_module
-        from tests.ai_security import (
-            DeterministicFakeEmbeddings,
-            GroundedCitingChatModel,
-            make_test_pdf,
-        )
-
         self.assertEqual(get_telemetry_log_name(), DEFAULT_TELEMETRY_LOG_NAME)
 
         chroma_tmp = tempfile.mkdtemp(prefix="obs_p4_chroma_")
         uploads_tmp = tempfile.mkdtemp(prefix="obs_p4_uploads_")
-        agent_graph_module.MEMORY_SAVER.storage.clear()
+        reset_memory_saver()
         reset_rate_limiters()
 
-        ingest_client = TestClient(ingestion_app_module.app)
+        ingest_client = TestClient(ingest_app_module.app)
         agent_client = TestClient(agent_app_module.app)
         telemetry_events = []
         unregister = register_telemetry_listener(telemetry_events.append)
@@ -801,7 +750,6 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
                 "ChatGoogleGenerativeAI",
                 side_effect=lambda *args, **kwargs: GroundedCitingChatModel(*args, **kwargs),
             ):
-                # 1. POST /ingest -> document.ingest
                 res_ingest = ingest_client.post(
                     "/ingest",
                     headers={
@@ -826,7 +774,6 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
                 self.assertIn("chunking_ms", ingest_tel[0]["stage_latency_ms"])
                 self.assertIn("embedding_ms", ingest_tel[0]["stage_latency_ms"])
 
-                # 2. POST /query -> vectorstore.query
                 telemetry_events.clear()
                 res_query = agent_client.post(
                     "/query",
@@ -844,10 +791,9 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
                 self.assertIsNotNone(query_tel[0]["top_similarity_score"])
                 self.assertIsNotNone(query_tel[0]["mean_similarity_score"])
                 self.assertIn("retrieval_ms", query_tel[0]["stage_latency_ms"])
-                self.assertNotIn("What was Q4 revenue?", json_dump := str(query_tel[0]))
+                self.assertNotIn("What was Q4 revenue?", str(query_tel[0]))
                 self.assertIn("query_sha256", query_tel[0])
 
-                # 3. POST /agent (stream=False) -> agent.query
                 telemetry_events.clear()
                 res_agent = agent_client.post(
                     "/agent",
@@ -883,7 +829,6 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
                 for stage_key in ("input_guard_ms", "llm_ms", "retrieval_ms", "output_guard_ms"):
                     self.assertIn(stage_key, rec["stage_latency_ms"])
 
-                # 4. POST /agent/stream (stream=True) -> agent.query with ttft_ms
                 telemetry_events.clear()
                 res_stream = agent_client.post(
                     "/agent/stream",
@@ -908,7 +853,6 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
                 self.assertGreaterEqual(srec["ttft_ms"], 0.0)
                 self.assertLessEqual(srec["ttft_ms"], srec["total_latency_ms"])
 
-                # 5. Verify Cloud Logging log_struct transport when TELEMETRY_CLOUD_LOGGING_ENABLED=true
                 mock_cloud_logger = MagicMock()
                 telemetry_module._cloud_loggers.clear()
                 with patch.dict(
@@ -929,12 +873,9 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
                     mock_cloud_logger.log_struct.assert_called_once()
         finally:
             unregister()
-            if os.path.exists(chroma_tmp):
-                for entry in os.scandir(chroma_tmp):
-                    if entry.is_dir():
-                        release_client_cache(entry.path)
-                shutil.rmtree(chroma_tmp, ignore_errors=True)
+            cleanup_chroma_tmpdir(chroma_tmp)
             shutil.rmtree(uploads_tmp, ignore_errors=True)
+            reset_memory_saver()
             reset_rate_limiters()
 
 
@@ -942,8 +883,8 @@ class TestPhase5ObservabilityInfrastructureAndStaticPolicies(unittest.TestCase):
     """Phase 5: Regional Observability Infrastructure in Terraform & Static Policy Checks."""
 
     def test_terraform_observability_infrastructure_definitions(self) -> None:
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        infra_dir = os.path.join(repo_root, "infra")
+        """Verifies `infra/` declares regional observability log buckets, sinks, log-based metrics, and dashboards."""
+        infra_dir = os.path.join(REPO_ROOT, "infra")
 
         with open(os.path.join(infra_dir, "apis.tf"), encoding="utf-8") as fh:
             apis_tf = fh.read()
@@ -999,29 +940,13 @@ class TestPhase5ObservabilityInfrastructureAndStaticPolicies(unittest.TestCase):
             self.assertIn(f'output "{out_name}"', outputs_tf)
 
     def test_static_policy_verifier_enforces_observability_and_regional_rules(self) -> None:
-        import shutil
-        import tempfile
-
-        from scripts.check_static_policies import evaluate_repo_static_policies
-
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        ok, violations = evaluate_repo_static_policies(repo_root)
+        """Verifies `evaluate_repo_static_policies` catches non-regional observability bucket or disabled structured logging."""
+        ok, violations = evaluate_repo_static_policies(REPO_ROOT)
         self.assertTrue(ok, f"Expected static policy check to pass, got: {violations}")
         self.assertEqual(violations, [])
 
-        syn_root = tempfile.mkdtemp(prefix="obs_static_policy_")
+        syn_root = create_synthetic_repo_copy(REPO_ROOT, prefix="obs_static_policy_")
         try:
-            os.makedirs(os.path.join(syn_root, "src", "core"), exist_ok=True)
-            shutil.copytree(os.path.join(repo_root, "infra"), os.path.join(syn_root, "infra"))
-            shutil.copy2(
-                os.path.join(repo_root, "src", "core", "config.py"),
-                os.path.join(syn_root, "src", "core", "config.py"),
-            )
-            syn_tfvars = os.path.join(syn_root, "infra", "terraform.tfvars")
-            if os.path.exists(syn_tfvars):
-                os.remove(syn_tfvars)
-
-            # Mutate observability.tf bucket location to "global" -> must fail static check
             obs_path = os.path.join(syn_root, "infra", "observability.tf")
             with open(obs_path, encoding="utf-8") as fh:
                 orig_obs = fh.read()
@@ -1033,7 +958,6 @@ class TestPhase5ObservabilityInfrastructureAndStaticPolicies(unittest.TestCase):
             with open(obs_path, "w", encoding="utf-8") as fh:
                 fh.write(orig_obs)
 
-            # Mutate cloud_run.tf STRUCTURED_LOGGING to "false" -> must fail static check
             cr_path = os.path.join(syn_root, "infra", "cloud_run.tf")
             with open(cr_path, encoding="utf-8") as fh:
                 orig_cr = fh.read()
@@ -1053,6 +977,5 @@ class TestPhase5ObservabilityInfrastructureAndStaticPolicies(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
-
-
+    logger.info("Running Layer 5 Observability & AI Monitoring unit test suite...")
+    unittest.main(verbosity=2)

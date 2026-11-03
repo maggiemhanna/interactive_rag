@@ -1,4 +1,12 @@
-"""Offline unit test suite for Scalability & Elasticity (workload isolation, scaling policies, cache bounds, and incremental GCS delta sync)."""
+"""Automated offline unit test suite for Layer 6: Scalability & Elasticity.
+
+Verifies:
+- Modular 4-package backend split (`src.ingest`, `src.manage`, `src.query`, `src.agent`).
+- 2-service Cloud Run route isolation (`ingest-api` vs `agent-api`) and shared in-container rate limiting.
+- Configurable `/tmp` LRU cache quotas (`CHROMA_TMP_MAX_BYTES`, `CHROMA_TMP_MIN_FREE_BYTES`).
+- Incremental MD5 delta synchronization to GCS (`storage.gcs_push` uploaded/skipped/deleted counts).
+- Terraform per-service concurrency, dedicated `/24` subnets, and horizontal scaling alerts/widgets.
+"""
 
 from __future__ import annotations
 
@@ -8,13 +16,14 @@ import os
 import shutil
 import tempfile
 import time
-import unittest
 from typing import Dict
+import unittest
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from scripts.check_static_policies import evaluate_repo_static_policies
+import src.agent
 from src.agent import app as agent_app_module
 from src.agent import graph as agent_graph_module
 from src.core import config as config_module
@@ -24,40 +33,45 @@ from src.core.context import (
     bind_request_context,
     reset_request_context,
 )
+from src.core.logger import setup_logging
 from src.core.observability import get_recorded_spans
 from src.core.storage import chroma as chroma_module
-from src.core.storage import gcs_sync as gcs_sync_module
-from src.core.storage import evict_tmp_cache, release_client_cache, user_write_lock
+from src.core.storage import evict_tmp_cache, gcs_sync as gcs_sync_module, user_write_lock
+import src.ingest
 from src.ingest import app as ingest_app_module
 from src.ingest import routes as ingest_routes_module
-from tests.ai_security import (
+import src.manage
+import src.query
+from tests.helpers import (
     DeterministicFakeEmbeddings,
+    FakeGCSBucket,
     GroundedCitingChatModel,
+    REPO_ROOT,
+    cleanup_chroma_tmpdir,
     make_test_pdf,
+    reset_memory_saver,
 )
-from tests.storage import FakeGCSBucket
+
+logger = setup_logging(name="tests.scalability_elasticity")
 
 
 class TestModularPackageSplitAndTwoServiceIsolation(unittest.TestCase):
-    """Verifies the 4-package modular split (src/ingest, src/manage, src/query, src/agent) and 2-service backend isolation."""
+    """Verifies the 4-package modular split (`src/ingest`, `src/manage`, `src/query`, `src/agent`) and 2-service backend isolation."""
 
     def setUp(self) -> None:
         self.chroma_tmp = tempfile.mkdtemp(prefix="scale_chroma_")
         self.uploads_tmp = tempfile.mkdtemp(prefix="scale_uploads_")
         self.fake_bucket = FakeGCSBucket("interactive-rag-scale-bucket")
-        agent_graph_module.MEMORY_SAVER.storage.clear()
+        reset_memory_saver()
         reset_rate_limiters()
 
         self.ingest_client = TestClient(ingest_app_module.app)
         self.agent_client = TestClient(agent_app_module.app)
 
     def tearDown(self) -> None:
-        if os.path.exists(self.chroma_tmp):
-            for entry in os.scandir(self.chroma_tmp):
-                if entry.is_dir():
-                    release_client_cache(entry.path)
-            shutil.rmtree(self.chroma_tmp, ignore_errors=True)
+        cleanup_chroma_tmpdir(self.chroma_tmp)
         shutil.rmtree(self.uploads_tmp, ignore_errors=True)
+        reset_memory_saver()
         reset_rate_limiters()
 
     def _env(self, **overrides: str) -> Dict[str, str]:
@@ -80,12 +94,7 @@ class TestModularPackageSplitAndTwoServiceIsolation(unittest.TestCase):
         return env
 
     def test_four_modular_packages_and_no_run_in_threadpool(self) -> None:
-        """Verifies src/ingest, src/manage, src/query, and src/agent exist cleanly and POST /ingest does NOT use run_in_threadpool."""
-        import src.agent
-        import src.ingest
-        import src.manage
-        import src.query
-
+        """Verifies `src/ingest`, `src/manage`, `src/query`, and `src/agent` exist cleanly and `POST /ingest` does not use `run_in_threadpool`."""
         self.assertTrue(hasattr(src.ingest, "ingest_router"))
         self.assertTrue(hasattr(src.manage, "collections_router"))
         self.assertTrue(hasattr(src.manage, "compliance_router"))
@@ -94,17 +103,14 @@ class TestModularPackageSplitAndTwoServiceIsolation(unittest.TestCase):
         self.assertTrue(hasattr(src.agent, "agent_router"))
         self.assertTrue(hasattr(src.agent, "app"))
 
-        # Verify legacy src/ingestion package is removed
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.assertFalse(os.path.exists(os.path.join(repo_root, "src", "ingestion")))
+        self.assertFalse(os.path.exists(os.path.join(REPO_ROOT, "src", "ingestion")))
 
-        # Verify POST /ingest is an async handler and does NOT use run_in_threadpool
         self.assertTrue(inspect.iscoroutinefunction(ingest_routes_module.ingest))
         routes_source = inspect.getsource(ingest_routes_module)
         self.assertNotIn("run_in_threadpool", routes_source)
 
     def test_two_service_route_isolation_and_shared_agent_cache_and_rate_limiter(self) -> None:
-        """Verifies ingest-api mounts only /ingest + /health, while agent-api mounts /query, /collections, /compliance/my-data, /agent, /agent/stream + /health."""
+        """Verifies `ingest-api` mounts only `/ingest` + `/health`, while `agent-api` mounts `/query`, `/collections`, `/compliance/my-data`, `/agent`, `/agent/stream` + `/health`."""
         ingest_paths = set(ingest_app_module.app.openapi()["paths"].keys())
         agent_paths = set(agent_app_module.app.openapi()["paths"].keys())
 
@@ -131,7 +137,6 @@ class TestModularPackageSplitAndTwoServiceIsolation(unittest.TestCase):
             self.assertIn(required_on_agent, agent_paths)
         self.assertNotIn("/ingest", agent_paths)
 
-        # Verify HTTP 404 on unmounted routes and shared _QUERY_RATE_LIMITER on agent-api
         with patch.dict(
             os.environ,
             self._env(RATE_LIMIT_QUERY_PER_MINUTE="2"),
@@ -158,7 +163,6 @@ class TestModularPackageSplitAndTwoServiceIsolation(unittest.TestCase):
                 404,
             )
 
-            # Ingest via ingest-api
             r_ing = self.ingest_client.post(
                 "/ingest",
                 data={"collection_name": "shared_col"},
@@ -166,21 +170,18 @@ class TestModularPackageSplitAndTwoServiceIsolation(unittest.TestCase):
             )
             self.assertEqual(r_ing.status_code, 200)
 
-            # 1st query via /query on agent-api (consumes 1/2 of RATE_LIMIT_QUERY_PER_MINUTE)
             r_q1 = self.agent_client.post(
                 "/query",
                 json={"query": "Shared cache", "collection_name": "shared_col"},
             )
             self.assertEqual(r_q1.status_code, 200)
 
-            # 2nd query via /agent on agent-api (consumes 2/2 of shared RATE_LIMIT_QUERY_PER_MINUTE)
             r_a2 = self.agent_client.post(
                 "/agent",
                 json={"query": "Shared cache", "collection_name": "shared_col", "stream": False},
             )
             self.assertEqual(r_a2.status_code, 200)
 
-            # 3rd query via /query on agent-api hits HTTP 429 from the single shared _QUERY_RATE_LIMITER
             r_q3 = self.agent_client.post(
                 "/query",
                 json={"query": "Shared cache", "collection_name": "shared_col"},
@@ -189,21 +190,17 @@ class TestModularPackageSplitAndTwoServiceIsolation(unittest.TestCase):
 
 
 class TestStorageCacheBoundsAndIncrementalMD5Sync(unittest.TestCase):
-    """Verifies configurable /tmp LRU cache bounds and incremental MD5 delta sync to GCS."""
+    """Verifies configurable `/tmp` LRU cache bounds and incremental MD5 delta sync to GCS."""
 
     def setUp(self) -> None:
         self.tmp_root = tempfile.mkdtemp(prefix="scale_cache_sync_")
         self.fake_bucket = FakeGCSBucket("interactive-rag-delta-bucket")
 
     def tearDown(self) -> None:
-        if os.path.exists(self.tmp_root):
-            for entry in os.scandir(self.tmp_root):
-                if entry.is_dir():
-                    release_client_cache(entry.path)
-            shutil.rmtree(self.tmp_root, ignore_errors=True)
+        cleanup_chroma_tmpdir(self.tmp_root)
 
     def test_configurable_chroma_tmp_cache_quotas_and_lru_eviction(self) -> None:
-        """Verifies CHROMA_TMP_MAX_BYTES and CHROMA_TMP_MIN_FREE_BYTES getters and LRU eviction."""
+        """Verifies `CHROMA_TMP_MAX_BYTES` and `CHROMA_TMP_MIN_FREE_BYTES` getters and LRU eviction."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CHROMA_TMP_MAX_BYTES", None)
             os.environ.pop("CHROMA_TMP_MIN_FREE_BYTES", None)
@@ -218,7 +215,6 @@ class TestStorageCacheBoundsAndIncrementalMD5Sync(unittest.TestCase):
             self.assertEqual(config_module.get_chroma_tmp_max_bytes(), 1024)
             self.assertEqual(config_module.get_chroma_tmp_min_free_bytes(), 0)
 
-            # Create 2 tenant directories totaling > 1024 bytes; older tenant must be evicted
             u_old = os.path.join(self.tmp_root, "tenant_old")
             u_new = os.path.join(self.tmp_root, "tenant_new")
             os.makedirs(u_old, exist_ok=True)
@@ -239,7 +235,7 @@ class TestStorageCacheBoundsAndIncrementalMD5Sync(unittest.TestCase):
             self.assertTrue(os.path.exists(u_new))
 
     def test_incremental_md5_delta_push_skips_unchanged_blobs_and_deletes_stale_blobs(self) -> None:
-        """Verifies _push_user_dir_to_gcs skips unchanged files via MD5 comparison and records span attributes."""
+        """Verifies `_push_user_dir_to_gcs` skips unchanged files via MD5 comparison and records span attributes."""
         uid = "delta_tenant"
         env = {
             "GCS_BUCKET_NAME": self.fake_bucket.name,
@@ -279,7 +275,6 @@ class TestStorageCacheBoundsAndIncrementalMD5Sync(unittest.TestCase):
         finally:
             reset_request_context(t1)
 
-        # Record initial generations of the 2 unchanged HNSW files
         gen_data_before = self.fake_bucket.blob(
             f"users/{uid}/chroma_db/hnsw_segment_01/data_level0.bin"
         ).generation
@@ -299,7 +294,6 @@ class TestStorageCacheBoundsAndIncrementalMD5Sync(unittest.TestCase):
                 gcs_sync_module, "_get_bucket", return_value=self.fake_bucket
             ):
                 with user_write_lock(uid) as user_dir:
-                    # Modify ONLY chroma.sqlite3 and remove header.bin; keep data_level0.bin identical
                     sqlite_file = os.path.join(user_dir, "chroma.sqlite3")
                     hnsw_header = os.path.join(user_dir, "hnsw_segment_01", "header.bin")
                     with open(sqlite_file, "wb") as fh:
@@ -314,7 +308,6 @@ class TestStorageCacheBoundsAndIncrementalMD5Sync(unittest.TestCase):
         finally:
             reset_request_context(t2)
 
-        # Unchanged HNSW data file was NOT re-uploaded (same GCS generation!)
         gen_data_after = self.fake_bucket.blob(
             f"users/{uid}/chroma_db/hnsw_segment_01/data_level0.bin"
         ).generation
@@ -333,12 +326,12 @@ class TestTerraformAndStaticScalingPolicies(unittest.TestCase):
     """Verifies Terraform scaling, concurrency, subnet, and monitoring definitions."""
 
     def test_terraform_scaling_concurrency_subnet_and_monitoring_definitions(self) -> None:
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        ok, violations = evaluate_repo_static_policies(repo_root)
+        """Verifies static policy compliance and Terraform scaling/concurrency/alerting definitions in `infra/`."""
+        ok, violations = evaluate_repo_static_policies(REPO_ROOT)
         self.assertTrue(ok, f"Expected static policy check to pass, got: {violations}")
         self.assertEqual(violations, [])
 
-        infra_dir = os.path.join(repo_root, "infra")
+        infra_dir = os.path.join(REPO_ROOT, "infra")
         with open(os.path.join(infra_dir, "variables.tf"), encoding="utf-8") as fh:
             vars_tf = fh.read()
         for var_name in (
@@ -376,4 +369,5 @@ class TestTerraformAndStaticScalingPolicies(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    logger.info("Running Layer 6 Scalability & Elasticity unit test suite...")
     unittest.main(verbosity=2)
