@@ -41,7 +41,7 @@ psc_subnet_cidr    = "10.10.3.0/28"
 
 # AI-Specific Security (Model Allowlists, Model Armor, Content Safety & Guardrail Ceilings)
 allowed_llm_models         = "gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite"
-allowed_embedding_models   = "gemini-embedding-001,text-embedding-005"
+allowed_embedding_models   = "gemini-embedding-001,text-embedding-004,text-embedding-005"
 gemini_safety_threshold    = "BLOCK_LOW_AND_ABOVE"
 model_armor_pi_confidence  = "MEDIUM_AND_ABOVE"
 model_armor_rai_confidence = "MEDIUM_AND_ABOVE"

@@ -330,7 +330,7 @@ class TestPhase1DataResidency(unittest.TestCase):
                 guardrails_module.validate_collection_name(missing_col)  # type: ignore[arg-type]
 
         expected_llms = "gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite"
-        expected_embeddings = "gemini-embedding-001,text-embedding-005"
+        expected_embeddings = "gemini-embedding-001,text-embedding-004,text-embedding-005"
         with open(os.path.join(REPO_ROOT, "infra", "variables.tf"), encoding="utf-8") as fh:
             variables_tf = fh.read()
         self.assertIn(f'default     = "{expected_llms}"', variables_tf)

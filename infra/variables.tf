@@ -300,7 +300,7 @@ variable "allowed_llm_models" {
 variable "allowed_embedding_models" {
   description = "Comma-separated allowlist of approved regional Vertex AI embedding models."
   type        = string
-  default     = "gemini-embedding-001,text-embedding-005"
+  default     = "gemini-embedding-001,text-embedding-004,text-embedding-005"
 }
 
 variable "gemini_safety_threshold" {
