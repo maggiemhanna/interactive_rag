@@ -117,22 +117,6 @@ def _validate_ingest_params(
     return safe_col, safe_emb
 
 
-def _enforce_file_ceiling(count: int) -> None:
-    """Enforces `MAX_FILES_PER_REQUEST`, mapping `ValueError` to `HTTP 400`."""
-    try:
-        validate_file_count(count)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-def _enforce_chunk_ceiling(count: int) -> None:
-    """Enforces `MAX_CHUNKS_PER_INGEST`, mapping `ValueError` to `HTTP 400`."""
-    try:
-        validate_chunk_count(count)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
 async def prepare_payload(request: Request, uid: str) -> IngestPayload:
     """Parses JSON or multipart PDF uploads, enforces upload ceilings, splits chunks, and cleans `/tmp`.
 
@@ -197,7 +181,7 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                     files = form.getlist("file")
 
                 valid_uploads = [f for f in files if hasattr(f, "filename") and f.filename]
-                _enforce_file_ceiling(len(valid_uploads) + len(raw_server_paths))
+                validate_file_count(len(valid_uploads) + len(raw_server_paths))
 
                 if valid_uploads:
                     request_upload_dir = os.path.join(user_upload_dir, uuid.uuid4().hex)
@@ -266,7 +250,7 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                 detail="Server-side filesystem 'pdf_paths' ingestion is disabled in Cloud Run. Please upload PDF files directly.",
             )
 
-        _enforce_file_ceiling(len(raw_server_paths))
+        validate_file_count(len(raw_server_paths))
 
         if not uploaded_files_info and not raw_server_paths:
             raise HTTPException(
@@ -285,14 +269,14 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                 if gcs_uri:
                     chunk.metadata["gcs_uri"] = gcs_uri
             all_chunks.extend(file_chunks)
-            _enforce_chunk_ceiling(len(all_chunks))
+            validate_chunk_count(len(all_chunks))
             processed_files.append(display_name)
 
         # 2. Load & split local server paths (local dev mode only)
         for server_path in raw_server_paths:
             file_chunks = split_pdfs([server_path])
             all_chunks.extend(file_chunks)
-            _enforce_chunk_ceiling(len(all_chunks))
+            validate_chunk_count(len(all_chunks))
             processed_files.append(server_path)
 
         return IngestPayload(

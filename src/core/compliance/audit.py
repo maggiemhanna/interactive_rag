@@ -6,7 +6,6 @@ with automatic Cloud Trace correlation and graceful stdout JSON fallback when ru
 
 from datetime import datetime, timezone
 import json
-import sys
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import uuid
@@ -33,21 +32,6 @@ logger = setup_logging(name="compliance.audit")
 _cloud_loggers: Dict[Tuple[str, str], Any] = {}
 _cloud_loggers_lock = threading.Lock()
 _audit_listeners: List[Callable[[Dict[str, Any]], None]] = []
-
-
-def _is_cloud_logging_enabled() -> bool:
-    """Determines whether audit events should be shipped over the network to GCP Cloud Logging.
-
-    Honors explicit `AUDIT_CLOUD_LOGGING_ENABLED` overrides and disables live network calls
-    automatically under `unittest`/`pytest` unless explicitly opted in.
-
-    Returns:
-        True when Cloud Logging publishing is active and `GOOGLE_CLOUD_PROJECT` is configured.
-    """
-    default_enabled = not ("unittest" in sys.modules or "pytest" in sys.modules)
-    return is_audit_cloud_logging_enabled(default=default_enabled) and bool(
-        get_google_cloud_project()
-    )
 
 
 def _get_cloud_logger(project_id: str, log_name: str) -> Any:
@@ -156,7 +140,7 @@ def emit_audit_event(
             pass
 
     shipped_to_gcp = False
-    if project_id and _is_cloud_logging_enabled():
+    if project_id and is_audit_cloud_logging_enabled():
         try:
             cloud_logger = _get_cloud_logger(project_id, get_audit_log_name())
             log_kwargs: Dict[str, Any] = {"severity": normalized_severity}

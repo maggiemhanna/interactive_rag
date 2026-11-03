@@ -9,6 +9,8 @@ Enforces server-side allowlists and resource guardrails across all API endpoints
 
 from typing import Any, Optional
 
+from fastapi import HTTPException
+
 from src.core.config import (
     COLLECTION_NAME_PATTERN,
     get_allowed_embedding_models,
@@ -136,13 +138,16 @@ def validate_file_count(file_count: int) -> int:
         Validated `file_count`.
 
     Raises:
-        ValueError: If `file_count` exceeds `MAX_FILES_PER_REQUEST`.
+        HTTPException: HTTP 400 if `file_count` exceeds `MAX_FILES_PER_REQUEST`.
     """
     max_files = get_max_files_per_request()
     if file_count > max_files:
-        raise ValueError(
-            f"Too many PDF files in a single request (received {file_count}, "
-            f"maximum allowed is {max_files})."
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Too many PDF files in a single request (received {file_count}, "
+                f"maximum allowed is {max_files})."
+            ),
         )
     return file_count
 
@@ -157,13 +162,16 @@ def validate_chunk_count(chunk_count: int) -> int:
         Validated `chunk_count`.
 
     Raises:
-        ValueError: If `chunk_count` exceeds `MAX_CHUNKS_PER_INGEST`.
+        HTTPException: HTTP 400 if `chunk_count` exceeds `MAX_CHUNKS_PER_INGEST`.
     """
     max_chunks = get_max_chunks_per_ingest()
     if chunk_count > max_chunks:
-        raise ValueError(
-            f"Ingestion exceeded the maximum allowed {max_chunks} chunks per request "
-            f"(already reached {chunk_count} chunks). Please upload smaller or fewer PDFs."
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Ingestion exceeded the maximum allowed {max_chunks} chunks per request "
+                f"(already reached {chunk_count} chunks). Please upload smaller or fewer PDFs."
+            ),
         )
     return chunk_count
 

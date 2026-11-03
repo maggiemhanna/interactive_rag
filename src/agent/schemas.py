@@ -9,7 +9,7 @@ from typing import Annotated, Any, Dict, List, NotRequired, Optional, Sequence, 
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AfterValidator, BaseModel, BeforeValidator, Field
 
 from src.core.ai_security.guardrails import (
     validate_collection_name,
@@ -23,18 +23,21 @@ from src.core.compliance.provenance import ComplianceMetadata
 class AgentRequest(BaseModel):
     """Validated JSON request payload for `POST /agent` and `POST /agent/stream`."""
 
-    query: str = Field(..., description="Query or question for the Agentic RAG assistant")
-    collection_name: str = Field(
+    query: Annotated[str, AfterValidator(validate_query_text)] = Field(
+        ...,
+        description="Query or question for the Agentic RAG assistant",
+    )
+    collection_name: Annotated[str, AfterValidator(validate_collection_name)] = Field(
         ...,
         description="Name of the Chroma vectorstore collection",
     )
     thread_id: str = Field(default="1", description="LangGraph thread ID for session state")
-    model_name: str = Field(
+    model_name: Annotated[str, BeforeValidator(validate_llm_model)] = Field(
         default="",
         validate_default=True,
         description="Approved Vertex AI generative LLM model name (defaults to first entry in ALLOWED_LLM_MODELS)",
     )
-    embedding_model: str = Field(
+    embedding_model: Annotated[str, BeforeValidator(validate_embedding_model)] = Field(
         default="",
         validate_default=True,
         description="Approved Vertex AI embedding model name (defaults to first entry in ALLOWED_EMBEDDING_MODELS)",
@@ -43,30 +46,6 @@ class AgentRequest(BaseModel):
         default=False,
         description="Whether to stream message events via Server-Sent Events (SSE)",
     )
-
-    @field_validator("query")
-    @classmethod
-    def _check_query(cls, value: str) -> str:
-        """Validates `query` is non-empty and within `MAX_QUERY_CHARS`."""
-        return validate_query_text(value)
-
-    @field_validator("collection_name")
-    @classmethod
-    def _check_collection_name(cls, value: str) -> str:
-        """Validates `collection_name` against `COLLECTION_NAME_PATTERN`."""
-        return validate_collection_name(value)
-
-    @field_validator("model_name", mode="before")
-    @classmethod
-    def _check_model_name(cls, value: Any) -> str:
-        """Validates `model_name` against `ALLOWED_LLM_MODELS`."""
-        return validate_llm_model(value)
-
-    @field_validator("embedding_model", mode="before")
-    @classmethod
-    def _check_embedding_model(cls, value: Any) -> str:
-        """Validates `embedding_model` against `ALLOWED_EMBEDDING_MODELS`."""
-        return validate_embedding_model(value)
 
 
 class AgentResponse(BaseModel):

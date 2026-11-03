@@ -7,6 +7,7 @@ detection, CORS allowlists, upload/query ceilings, and Model Armor configuration
 
 import os
 import re
+import sys
 from typing import List, Tuple
 
 from dotenv import find_dotenv, load_dotenv
@@ -209,9 +210,16 @@ def get_audit_log_name() -> str:
     return os.getenv("AUDIT_LOG_NAME", DEFAULT_AUDIT_LOG_NAME).strip() or DEFAULT_AUDIT_LOG_NAME
 
 
-def is_audit_cloud_logging_enabled(default: bool = True) -> bool:
-    """Returns True when `AUDIT_CLOUD_LOGGING_ENABLED` permits network publishing of audit records."""
-    return parse_bool_env("AUDIT_CLOUD_LOGGING_ENABLED", default=default)
+def is_audit_cloud_logging_enabled() -> bool:
+    """Returns True when audit events should be shipped over the network to GCP Cloud Logging.
+
+    Honors explicit `AUDIT_CLOUD_LOGGING_ENABLED` overrides, disables live network calls
+    automatically under `unittest`/`pytest` unless explicitly opted in, and requires `GOOGLE_CLOUD_PROJECT`.
+    """
+    default_enabled = not ("unittest" in sys.modules or "pytest" in sys.modules)
+    return parse_bool_env("AUDIT_CLOUD_LOGGING_ENABLED", default=default_enabled) and bool(
+        get_google_cloud_project()
+    )
 
 
 def get_telemetry_log_name() -> str:
@@ -222,9 +230,16 @@ def get_telemetry_log_name() -> str:
     )
 
 
-def is_telemetry_cloud_logging_enabled(default: bool = True) -> bool:
-    """Returns True when `TELEMETRY_CLOUD_LOGGING_ENABLED` permits network publishing of telemetry records."""
-    return parse_bool_env("TELEMETRY_CLOUD_LOGGING_ENABLED", default=default)
+def is_telemetry_cloud_logging_enabled() -> bool:
+    """Returns True when telemetry events should be shipped over the network to GCP Cloud Logging.
+
+    Honors explicit `TELEMETRY_CLOUD_LOGGING_ENABLED` overrides, disables live network calls
+    automatically under `unittest`/`pytest` unless explicitly opted in, and requires `GOOGLE_CLOUD_PROJECT`.
+    """
+    default_enabled = not ("unittest" in sys.modules or "pytest" in sys.modules)
+    return parse_bool_env("TELEMETRY_CLOUD_LOGGING_ENABLED", default=default_enabled) and bool(
+        get_google_cloud_project()
+    )
 
 
 def get_bucket_name() -> str:

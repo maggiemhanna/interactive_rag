@@ -10,7 +10,6 @@ structured JSON record per completed request to `interactiverag-telemetry`.
 from datetime import datetime, timezone
 import json
 import math
-import sys
 import threading
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import uuid
@@ -50,18 +49,6 @@ logger = setup_logging(name="observability.telemetry")
 _cloud_loggers: Dict[Tuple[str, str], Any] = {}
 _cloud_loggers_lock = threading.Lock()
 _telemetry_listeners: List[Callable[[Dict[str, Any]], None]] = []
-
-
-def _is_cloud_logging_enabled() -> bool:
-    """Determines whether telemetry events should be shipped over the network to GCP Cloud Logging.
-
-    Honors explicit `TELEMETRY_CLOUD_LOGGING_ENABLED` overrides and disables live network calls
-    automatically under `unittest`/`pytest` unless explicitly opted in.
-    """
-    default_enabled = not ("unittest" in sys.modules or "pytest" in sys.modules)
-    return is_telemetry_cloud_logging_enabled(default=default_enabled) and bool(
-        get_google_cloud_project()
-    )
 
 
 def _get_cloud_logger(project_id: str, log_name: str) -> Any:
@@ -310,7 +297,7 @@ def emit_telemetry_event(
             pass
 
     shipped_to_gcp = False
-    if project_id and _is_cloud_logging_enabled():
+    if project_id and is_telemetry_cloud_logging_enabled():
         try:
             cloud_logger = _get_cloud_logger(project_id, get_telemetry_log_name())
             log_kwargs: Dict[str, Any] = {"severity": normalized_severity}

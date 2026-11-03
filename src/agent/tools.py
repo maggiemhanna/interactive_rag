@@ -78,18 +78,6 @@ def _escape_xml_attr(value: str) -> str:
     )
 
 
-def _escape_chunk_text(text: str) -> str:
-    """Escapes `<` and `>` inside retrieved document text to prevent `</retrieved_chunk>` breakout.
-
-    Args:
-        text: Sanitized chunk body text.
-
-    Returns:
-        Chunk body text with angle brackets escaped as `&lt;` and `&gt;`.
-    """
-    return text.replace("<", "&lt;").replace(">", "&gt;")
-
-
 def _resolve_one_indexed_page(metadata: Dict[str, Any]) -> str:
     """Converts PyPDF's 0-indexed `page` metadata into a human-readable 1-indexed page string.
 
@@ -133,7 +121,7 @@ def format_retrieved_chunks(docs: Sequence[Document]) -> str:
         source_name = os.path.basename(raw_source.replace("\\", "/")) or raw_source or "unknown"
         safe_source = _escape_xml_attr(source_name)
         safe_page = _escape_xml_attr(_resolve_one_indexed_page(metadata))
-        safe_content = _escape_chunk_text(doc.page_content or "")
+        safe_content = (doc.page_content or "").replace("<", "&lt;").replace(">", "&gt;")
         rendered_blocks.append(
             f'<retrieved_chunk source="{safe_source}" page="{safe_page}">\n'
             f"{safe_content}\n"
