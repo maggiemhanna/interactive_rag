@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 
 from src.agent.memory import MEMORY_SAVER
 from src.agent.schemas import AgentRequest
-from src.agent.stream import SSE_HEADERS, stream_events, stream_sse
+from src.agent.service import SSE_HEADERS, stream_events, stream_sse
 from src.core.ai_security.armor import (
     SecurityScreeningUnavailableError,
     ensure_screening_available,

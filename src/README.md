@@ -130,7 +130,7 @@ curl -X POST "http://localhost:8000/ingest" \
 1. **XML-Spotlighted Retriever Tool (`tools.py`)**: Queries the user's Chroma collection, applies Cloud DLP `[INFO_TYPE]` chunk redaction, and wraps retrieved passages in `<retrieved_chunk source="..." page="...">` tags (`format_retrieved_chunks`, `get_retriever_tool`).
 2. **Tenant-Isolated Memory (`memory.py`)**: Namespaces `InMemorySaver` checkpoint threads under `{uid}:{thread_id}` and supports GDPR Art. 17 thread purging (`purge_user_memory_threads`).
 3. **Safety-Screened LangGraph StateGraph (`graph.py`)**: Compiles `input_guard` $\rightarrow$ `llm` $\rightarrow$ `tools` $\rightarrow$ `output_guard` with regional `ChatGoogleGenerativeAI`, Gemini safety thresholds, and `[source, p.X]` citation rules.
-4. **SSE & Interactive Streaming (`stream.py`, `display.py`)**: Streams sanitized message events, tool traces, and EU AI Act Art. 50 `compliance` frames over SSE (`format_sse_events`) or rich terminal panels (`run_interactive`).
+4. **SSE & Interactive Streaming (`service.py`, `display.py`)**: Streams sanitized message events, tool traces, and EU AI Act Art. 50 `compliance` frames over SSE (`stream_sse`) or rich terminal panels (`run_interactive`).
 5. **Unified Interactive FastAPI Service (`routes.py`, `app.py`, `schemas.py`)**: Defines `agent_router` (`POST /agent`, `POST /agent/stream`) in `routes.py` and mounts `agent_router`, `query_router` (`POST /query`), and `manage_router` (`GET /collections`, `DELETE /collections/{collection_name}`, `GET/DELETE /compliance/my-data`) plus `GET /health` in `app.py`.
 
 ### LangGraph Agent Workflow
@@ -297,7 +297,7 @@ src/
     ├── memory.py              # Tenant-namespaced InMemorySaver checkpoint management
     ├── tools.py               # XML-spotlighted, DLP-masked Chroma retriever tool
     ├── graph.py               # Safety-screened LangGraph StateGraph builder
-    ├── stream.py              # Agent event runner, SSE formatter & CLI interactive runner
+    ├── service.py             # Agent event runner, SSE formatter & CLI interactive runner
     ├── display.py             # Rich terminal message rendering
     ├── routes.py              # FastAPI router (`POST /agent`, `POST /agent/stream`)
     └── app.py                 # Agent FastAPI service (`agent_router`, `query_router`, `manage_router`)

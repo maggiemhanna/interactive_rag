@@ -136,10 +136,10 @@ To provide comprehensive protection across the RAG pipeline while relying on man
 
 ---
 
-### Phase 5: Streaming Redaction, Recursion Limits & Sanitized Errors (`src/agent/stream.py` & `src/agent/app.py`)
+### Phase 5: Streaming Redaction, Recursion Limits & Sanitized Errors (`src/agent/service.py` & `src/agent/app.py`)
 **Goal:** Ensure live SSE streams enforce recursion caps, emit only post-`output_guard` redacted messages, and never leak internal stack traces.
 
-- [x] **Bounded & Redacted Streaming (`src/agent/stream.py` & `src/agent/app.py`):**
+- [x] **Bounded & Redacted Streaming (`src/agent/service.py` & `src/agent/app.py`):**
   - Pass `recursion_limit = get_bounded_recursion_limit()` in `RunnableConfig` for both standard and streaming invocations.
   - Catch `GraphRecursionError` cleanly and return `RECURSION_LIMIT_MESSAGE`.
   - Buffer candidate assistant replies until `output_guard` completes so SSE clients receive only the sanitized, DLP-redacted response.

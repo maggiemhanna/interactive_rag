@@ -33,7 +33,7 @@ from src.core.observability.state import record_ttft
 from src.core.observability.telemetry import emit_telemetry_event
 from src.core.storage import has_sqlite, user_read_lock
 
-logger = setup_logging(name="agent.stream")
+logger = setup_logging(name="agent.service")
 
 SSE_HEADERS = {
     "Cache-Control": "no-cache",
@@ -64,54 +64,41 @@ def extract_text(content: Any) -> str:
     return str(content)
 
 
-def _should_print_console(verbose_console: Optional[bool], is_cli_mode: bool) -> bool:
-    """Determines whether Rich message panels should print to stdout.
-
-    Never prints interactive Rich panels inside Cloud Run containers so Cloud Logging
-    remains clean and free of raw prompt/document text.
-
-    Args:
-        verbose_console: Explicit caller override (`True` or `False`), or `None` for auto-detect.
-        is_cli_mode: True when invoked directly from interactive Python/CLI mode.
-
-    Returns:
-        True if Rich message trace panels should be rendered to stdout.
-    """
-    if is_cloud_run():
-        return False
-    if verbose_console is not None:
-        return verbose_console
-    if os.getenv("AGENT_CONSOLE_TRACE", "").strip().lower() in {"1", "true", "yes"}:
-        return True
-    return is_cli_mode
+def _sse_frame(payload: Dict[str, Any]) -> str:
+    """Formats a dictionary payload as a Server-Sent Events (`data: <json>\\n\\n`) frame."""
+    return f"data: {json.dumps(payload)}\n\n"
 
 
-def _stream_events(
+def stream_events(
     query: str,
-    persist_directory: str,
     collection_name: str,
-    thread_id: str,
+    thread_id: str = "1",
     model_name: Optional[str] = None,
     embedding_model: Optional[str] = None,
-    show_console: bool = False,
+    persist_directory: str = "chroma_db",
+    verbose_console: bool = False,
 ) -> Generator[Dict[str, Any], None, None]:
-    """Executes the compiled LangGraph agent and yields deduplicated message event dicts.
+    """Executes the compiled LangGraph agent and yields deduplicated message event dictionaries.
 
     Catches `GraphRecursionError` when tool-calling exceeds `AGENT_RECURSION_LIMIT` and
     yields a polite `RECURSION_LIMIT_MESSAGE` fallback turn.
 
     Args:
-        query: Validated user question.
-        persist_directory: Local filesystem path of the tenant's ChromaDB directory.
+        query: Validated user question to answer against `collection_name`.
         collection_name: Validated Chroma collection identifier.
         thread_id: Tenant-namespaced (`{uid}:{thread_id}`) checkpoint thread identifier.
         model_name: Optional approved Vertex AI generative LLM model identifier.
         embedding_model: Optional approved Vertex AI embedding model identifier.
-        show_console: Whether to render Rich message panels to stdout.
+        persist_directory: Local filesystem path of the tenant's ChromaDB directory.
+        verbose_console: Whether to render Rich message panels to stdout in local dev.
 
     Yields:
-        Dictionaries of the form `{'event': 'message', 'message': {...}, 'raw_message': BaseMessage}`.
+        Dictionaries of the form `{'event': 'message', 'message': {...}}`.
     """
+    show_console = not is_cloud_run() and (
+        verbose_console
+        or os.getenv("AGENT_CONSOLE_TRACE", "").strip().lower() in {"1", "true", "yes"}
+    )
     retriever_tool = get_retriever_tool(
         collection_name=collection_name,
         persist_directory=persist_directory,
@@ -124,47 +111,45 @@ def _stream_events(
         "configurable": {"thread_id": thread_id},
         "recursion_limit": recursion_limit,
     }
-    input_messages = [HumanMessage(content=query)]
     emitted_keys = set()
 
     try:
         for event in agent.stream(
-            {"messages": input_messages}, config, stream_mode="values"
+            {"messages": [HumanMessage(content=query)]}, config, stream_mode="values"
         ):
             messages = event.get("messages", [])
-            if messages:
-                last_msg = messages[-1]
-                msg_id = getattr(last_msg, "id", None)
-                dedup_key = (
-                    msg_id
-                    if msg_id is not None
-                    else (
-                        getattr(last_msg, "type", "unknown"),
-                        extract_text(getattr(last_msg, "content", "")),
-                        repr(getattr(last_msg, "tool_calls", None)),
-                    )
+            if not messages:
+                continue
+
+            last_msg = messages[-1]
+            msg_id = getattr(last_msg, "id", None)
+            dedup_key = (
+                msg_id
+                if msg_id is not None
+                else (
+                    getattr(last_msg, "type", "unknown"),
+                    extract_text(getattr(last_msg, "content", "")),
+                    repr(getattr(last_msg, "tool_calls", None)),
                 )
-                if dedup_key in emitted_keys:
-                    continue
-                emitted_keys.add(dedup_key)
+            )
+            if dedup_key in emitted_keys:
+                continue
+            emitted_keys.add(dedup_key)
 
-                if show_console:
-                    print_event(last_msg)
+            if show_console:
+                print_event(last_msg)
 
-                msg_dict = {
-                    "type": getattr(last_msg, "type", "unknown"),
-                    "content": extract_text(getattr(last_msg, "content", "")),
-                }
-                if getattr(last_msg, "tool_calls", None):
-                    msg_dict["tool_calls"] = last_msg.tool_calls
-                if getattr(last_msg, "name", None):
-                    msg_dict["name"] = last_msg.name
+            msg_dict: Dict[str, Any] = {
+                "type": getattr(last_msg, "type", "unknown"),
+                "content": extract_text(getattr(last_msg, "content", "")),
+            }
+            if getattr(last_msg, "tool_calls", None):
+                msg_dict["tool_calls"] = last_msg.tool_calls
+            if getattr(last_msg, "name", None):
+                msg_dict["name"] = last_msg.name
 
-                yield {
-                    "event": "message",
-                    "message": msg_dict,
-                    "raw_message": last_msg,
-                }
+            yield {"event": "message", "message": msg_dict}
+
     except GraphRecursionError:
         logger.warning(
             f"Agent reached recursion_limit={recursion_limit} for thread_id='{thread_id}'."
@@ -178,70 +163,15 @@ def _stream_events(
             query_sha256=hash_query(query),
             query_chars=len(query),
         )
-        fallback_msg = AIMessage(content=RECURSION_LIMIT_MESSAGE)
         if show_console:
-            print_event(fallback_msg)
+            print_event(AIMessage(content=RECURSION_LIMIT_MESSAGE))
         yield {
             "event": "message",
             "message": {
                 "type": "ai",
                 "content": RECURSION_LIMIT_MESSAGE,
             },
-            "raw_message": fallback_msg,
         }
-
-
-def stream_events(
-    query: str,
-    collection_name: str,
-    thread_id: str = "1",
-    model_name: Optional[str] = None,
-    embedding_model: Optional[str] = None,
-    persist_directory: Optional[str] = None,
-    verbose_console: Optional[bool] = None,
-) -> Generator[Dict[str, Any], None, None]:
-    """Streams LangGraph message events, resolving per-user Chroma storage when called from CLI.
-
-    Args:
-        query: User question to answer against `collection_name`.
-        collection_name: Target Chroma collection identifier.
-        thread_id: Session thread identifier (already `{uid}:`-scoped when `persist_directory` is passed).
-        model_name: Optional approved Vertex AI generative LLM model identifier.
-        embedding_model: Optional approved Vertex AI embedding model identifier.
-        persist_directory: Optional pre-locked tenant ChromaDB directory (used by HTTP handlers).
-        verbose_console: Optional flag controlling Rich terminal panel output.
-
-    Yields:
-        Deduplicated LangGraph message event dictionaries.
-    """
-    show_console = _should_print_console(
-        verbose_console=verbose_console,
-        is_cli_mode=(persist_directory is None),
-    )
-    if persist_directory is not None:
-        yield from _stream_events(
-            query=query,
-            persist_directory=persist_directory,
-            collection_name=collection_name,
-            thread_id=thread_id,
-            model_name=model_name,
-            embedding_model=embedding_model,
-            show_console=show_console,
-        )
-        return
-
-    cli_uid = os.getenv("DEV_USER_ID", "local-dev").strip() or "local-dev"
-    with user_read_lock(cli_uid) as resolved_dir:
-        target_dir = resolved_dir if has_sqlite(resolved_dir) else "chroma_db"
-        yield from _stream_events(
-            query=query,
-            persist_directory=target_dir,
-            collection_name=collection_name,
-            thread_id=f"{cli_uid}:{thread_id}",
-            model_name=model_name,
-            embedding_model=embedding_model,
-            show_console=show_console,
-        )
 
 
 def stream_sse(
@@ -275,7 +205,6 @@ def stream_sse(
                 model_name=request.model_name,
                 embedding_model=request.embedding_model,
                 persist_directory=stream_persist_dir,
-                verbose_console=False,
             ):
                 msg = evt["message"]
                 streamed_messages.append(msg)
@@ -283,11 +212,7 @@ def stream_sse(
                     record_ttft()
                 if msg.get("type") == "ai" and msg.get("content"):
                     final_answer = str(msg["content"])
-                data = {
-                    "event": evt["event"],
-                    "message": msg,
-                }
-                yield f"data: {json.dumps(data)}\n\n"
+                yield _sse_frame(evt)
 
         compliance_meta = build_compliance_metadata(
             model_name=request.model_name,
@@ -296,12 +221,13 @@ def stream_sse(
             scoped_thread_id=scoped_thread_id,
             checkpointer=MEMORY_SAVER,
         ).model_dump()
-        compliance_frame = {
-            "event": "compliance",
-            "compliance": compliance_meta,
-            "message": {"type": "compliance", "content": ""},
-        }
-        yield f"data: {json.dumps(compliance_frame)}\n\n"
+        yield _sse_frame(
+            {
+                "event": "compliance",
+                "compliance": compliance_meta,
+                "message": {"type": "compliance", "content": ""},
+            }
+        )
 
         emit_audit_event(
             "agent.query",
@@ -317,7 +243,7 @@ def stream_sse(
             citation_count=compliance_meta["citation_count"],
             pii_filtered=compliance_meta["pii_filtered"],
             guardrail_actions=[
-                a["filter"] + ":" + a["action"] for a in compliance_meta["guardrail_actions"]
+                f"{a['filter']}:{a['action']}" for a in compliance_meta["guardrail_actions"]
             ],
         )
         emit_telemetry_event(
@@ -353,16 +279,14 @@ def stream_sse(
             query_sha256=query_digest,
             query_chars=query_len,
         )
-        err_data = {
-            "event": "error",
-            "http_status": 503,
-            "error": SCREENING_UNAVAILABLE_MESSAGE,
-            "message": {
-                "type": "ai",
-                "content": SCREENING_UNAVAILABLE_MESSAGE,
-            },
-        }
-        yield f"data: {json.dumps(err_data)}\n\n"
+        yield _sse_frame(
+            {
+                "event": "error",
+                "http_status": 503,
+                "error": SCREENING_UNAVAILABLE_MESSAGE,
+                "message": {"type": "ai", "content": SCREENING_UNAVAILABLE_MESSAGE},
+            }
+        )
         yield "data: [DONE]\n\n"
     except Exception:
         logger.exception(
@@ -380,15 +304,13 @@ def stream_sse(
             query_sha256=query_digest,
             query_chars=query_len,
         )
-        err_data = {
-            "event": "error",
-            "error": INTERNAL_ERROR_MESSAGE,
-            "message": {
-                "type": "ai",
-                "content": INTERNAL_ERROR_MESSAGE,
-            },
-        }
-        yield f"data: {json.dumps(err_data)}\n\n"
+        yield _sse_frame(
+            {
+                "event": "error",
+                "error": INTERNAL_ERROR_MESSAGE,
+                "message": {"type": "ai", "content": INTERNAL_ERROR_MESSAGE},
+            }
+        )
         yield "data: [DONE]\n\n"
 
 
@@ -407,8 +329,17 @@ def run_interactive(
         f"Running interactive agent on collection '{collection_name}' "
         f"(query_sha256='{hash_query(query)}', query_chars={len(query)})"
     )
-    for _ in stream_events(query=query, collection_name=collection_name, verbose_console=True):
-        pass
+    cli_uid = os.getenv("DEV_USER_ID", "local-dev").strip() or "local-dev"
+    with user_read_lock(cli_uid) as resolved_dir:
+        target_dir = resolved_dir if has_sqlite(resolved_dir) else "chroma_db"
+        for _ in stream_events(
+            query=query,
+            collection_name=collection_name,
+            thread_id=f"{cli_uid}:1",
+            persist_directory=target_dir,
+            verbose_console=True,
+        ):
+            pass
 
 
 __all__ = ["SSE_HEADERS", "extract_text", "run_interactive", "stream_events", "stream_sse"]

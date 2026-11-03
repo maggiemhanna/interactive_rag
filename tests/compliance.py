@@ -454,7 +454,7 @@ class TestPhase2AuditLogging(unittest.TestCase):
             "manage.collections",
             "manage.compliance",
             "agent",
-            "agent.stream",
+            "agent.service",
             "agent.graph",
             "ai_security.armor",
             "ai_security.safety",

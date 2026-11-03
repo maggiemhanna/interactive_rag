@@ -772,7 +772,7 @@ class TestAISecuritySuite(unittest.TestCase):
                 self.assertEqual(r4.json()["detail"], INTERNAL_ERROR_MESSAGE)
                 self.assertNotIn("hunter2", r4.text)
 
-            with patch("src.agent.stream.stream_events", side_effect=secret_exc):
+            with patch("src.agent.service.stream_events", side_effect=secret_exc):
                 r5 = self.agent_client.post(
                     "/agent",
                     json={"query": "hello", "collection_name": "safety_col", "stream": True},

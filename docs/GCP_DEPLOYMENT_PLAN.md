@@ -119,7 +119,7 @@ To keep the deployment and persistence architecture cost-effective, fast, and re
   - Stage multipart PDF uploads in a per-request directory (`/tmp/uploads/{uid}/{request_uuid}`), archive validated PDFs to Cloud Storage, and guarantee cleanup in a `finally` block.
 - [x] **Isolated Agent Chat & Conversation Memory (`src/agent/`):**
   - Require `uid: str = Depends(get_current_user)` on `POST /agent` and `POST /agent/stream` (`src/agent/app.py`).
-  - Namespace all in-memory conversation threads by user ID (`scope_thread_id(uid, thread_id)` $\rightarrow$ `"{uid}:{thread_id}"` in `src/agent/memory.py` and `src/agent/stream.py`) so users can never read or continue another user's conversation thread.
+  - Namespace all in-memory conversation threads by user ID (`scope_thread_id(uid, thread_id)` $\rightarrow$ `"{uid}:{thread_id}"` in `src/agent/memory.py` and `src/agent/service.py`) so users can never read or continue another user's conversation thread.
 - [x] **Production Server & Streaming Configuration (`src/core/app_factory.py` & `src/core/config.py`):**
   - Provide unauthenticated `GET /health` endpoints for Cloud Run health probes.
   - Enforce explicit `ALLOWED_ORIGINS` CORS policies in Cloud Run rather than wildcard origins.
