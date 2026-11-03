@@ -60,6 +60,7 @@ To keep the deployment and persistence architecture cost-effective, fast, and re
 - **Startup Configuration Injection:** Instead, the frontend container generates `/env-config.js` from Cloud Run environment variables the moment the container starts. This lets you build the frontend Docker image once and configure it at deploy time:
   - **API URLs (`INGESTION_API_URL` & `AGENT_API_URL`):** Set to relative Load Balancer paths (`"/api/ingest"` and `"/api/agent"`) in Cloud Run (overriding the local development defaults `http://localhost:8000` and `http://localhost:8001`).
   - **Firebase & Project Settings (`FIREBASE_API_KEY`, `FIREBASE_PROJECT_ID`, `FIREBASE_AUTH_DOMAIN`):** Dynamically populated by Terraform from the newly created Identity Platform resource and project variables during `make deploy`.
+  - **Approved Model Catalogs (`ALLOWED_LLM_MODELS` & `ALLOWED_EMBEDDING_MODELS`):** Populated from `terraform.tfvars` (in Cloud Run via `/env-config.js`) or root `.env` (in local development via Vite) and mirrored by `GET /collections` so the frontend dropdowns always reflect the active model allowlists.
 
 ---
 
@@ -106,7 +107,7 @@ To keep the deployment and persistence architecture cost-effective, fast, and re
   - Implement `user_read_lock(uid)` and `user_write_lock(uid)` combining per-user in-process locks with an atomic Cloud Storage lock object (`if_generation_match=0` and automatic stale-lock TTL recovery).
   - Implement `evict_tmp_cache()` to remove the least-recently-used user cache directories from `/tmp` when free container memory drops below threshold.
 - [x] **Collection Management Routes (`src/core/storage/chroma.py` & `src/manage/collections.py`):**
-  - Expose authenticated `GET /collections` and `DELETE /collections/{collection_name}` endpoints wired into `agent-api` via `src/manage/routes.py` and `src/core/app_factory.py`.
+  - Expose authenticated `GET /collections` (returning collection names, chunk counts, each collection's bound `embedding_model`, and `allowed_llm_models` / `allowed_embedding_models`) and `DELETE /collections/{collection_name}` endpoints wired into `agent-api` via `src/manage/routes.py` and `src/core/app_factory.py`.
 
 ---
 

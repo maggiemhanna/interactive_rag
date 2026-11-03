@@ -1,6 +1,6 @@
 # InteractiveRAG - Source Module Documentation (`/src`)
 
-This directory contains the Python backend packages for **InteractiveRAG**, a multi-tenant, compliance-aware Agentic Retrieval-Augmented Generation platform powered by **LangGraph**, **Google Cloud Vertex AI** (`gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-2.5-flash-lite`, `gemini-embedding-001`, `text-embedding-005`), **Google Cloud Model Armor + Cloud DLP**, **ChromaDB**, **Google Cloud Storage**, and **FastAPI**.
+This directory contains the Python backend packages for **InteractiveRAG**, a multi-tenant, compliance-aware Agentic Retrieval-Augmented Generation platform powered by **LangGraph**, **Google Cloud Vertex AI** (`gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-2.5-flash-lite`, `gemini-embedding-001`, `text-embedding-004`, `text-embedding-005`), **Google Cloud Model Armor + Cloud DLP**, **ChromaDB**, **Google Cloud Storage**, and **FastAPI**.
 
 To prevent CPU- and memory-intensive PDF ingestion from blocking interactive queries or agent chat, the backend is organized into **4 modular domain packages** (`src/ingest`, `src/manage`, `src/query`, `src/agent`) plus shared platform infrastructure (`src/core`), deployed across **2 specialized backend Cloud Run services**:
 1. **`ingest-api` (`src.ingest.app:app`, Port 8000)**: Mounts **only** `src/ingest` (`POST /ingest` + `GET /health`) with low concurrency (`4`) and heavy vertical resources (`2 vCPU / 4Gi RAM`).
@@ -38,7 +38,7 @@ To prevent CPU- and memory-intensive PDF ingestion from blocking interactive que
 `src/core/` centralizes cross-cutting platform infrastructure and domain packages shared by both Cloud Run backend services (`ingest-api` and `agent-api`).
 
 ### Core Infrastructure
-- **`config.py`**: Single canonical source of truth for loading `.env` settings and parsing all environment variables across `src/` via typed runtime getters (`is_cloud_run`, `get_google_cloud_project`, `get_google_cloud_location`, `get_model_armor_location`, `get_allowed_origins`, `get_allowed_llm_models`, `get_allowed_embedding_models`, `get_bucket_name`, `get_chroma_tmp_max_bytes`, `get_chroma_tmp_min_free_bytes`, etc.) plus local service ports.
+- **`config.py`**: Single canonical source of truth for loading root `.env` settings and parsing all environment variables across `src/` via typed runtime getters (`is_cloud_run`, `get_google_cloud_project`, `get_google_cloud_location`, `get_model_armor_location`, `get_allowed_origins`, `get_allowed_llm_models`, `get_allowed_embedding_models`, `get_bucket_name`, `get_chroma_tmp_max_bytes`, `get_chroma_tmp_min_free_bytes`, etc.) plus local service ports.
 - **`context.py`**: Manages per-request `contextvars` correlation state (`RequestContext`, `RequestCorrelationMiddleware`, `hash_query`, `scrub_query_fields`) tracking sanitized `X-Request-Id`, Cloud Trace ID, active span ID, authenticated `uid`, and a thread-safe `data` store for domain modules.
 - **`auth.py`**: Verifies Google Identity Platform / Firebase Bearer JWTs (`verify_bearer_token`, `get_current_user`, `get_current_user_info`), enforces path-safe `uid` validation (`validate_uid`), and blocks `AUTH_DISABLED` bypasses when running on Cloud Run.
 - **`logger.py`**: Configures structured ANSI-colored console and GCP JSON logging (`setup_logging`, `format_dict_for_logs`).
@@ -48,7 +48,7 @@ To prevent CPU- and memory-intensive PDF ingestion from blocking interactive que
 - **`paths.py`**: Isolates per-user local directories (`/tmp/chroma_db/{uid}`, `/tmp/uploads/{uid}`), constructs GCS object prefixes, checkpoints SQLite WAL files, and evicts cached Chroma `SharedSystemClient` registries (`release_client_cache`).
 - **`gcs_sync.py`**: Pulls and pushes per-user ChromaDB snapshots between `/tmp` and `gs://<bucket>/users/{uid}/chroma_db/` with incremental MD5 delta sync (`_compute_file_md5_base64`, uploading only new or changed files and deleting stale remote blobs), `version.json` invalidation, and raw PDF upload archiving (`archive_upload`).
 - **`locks.py`**: Coordinates per-user `threading.RLock` instances, distributed `if_generation_match` GCS write locks with TTL stale-lock recovery (`user_write_lock`, `user_read_lock`), and bounded `/tmp` `tmpfs` LRU cache eviction (`evict_tmp_cache` enforcing `CHROMA_TMP_MAX_BYTES=512 MiB` and `CHROMA_TMP_MIN_FREE_BYTES=256 MiB`).
-- **`chroma.py`**: Instantiates regional Vertex AI `GoogleGenerativeAIEmbeddings`, executes normalized similarity search (`similarity_search_with_scores`), and manages per-user Chroma collections (`get_vectorstore`, `require_collection`, `list_collections`, `remove_collection`).
+- **`chroma.py`**: Instantiates regional Vertex AI `GoogleGenerativeAIEmbeddings`, persists and resolves each collection's bound `embedding_model` in Chroma collection metadata (`get_collection_embedding_model`, `resolve_collection_embedding_model`), executes normalized similarity search (`similarity_search_with_scores`), and manages per-user Chroma collections (`get_vectorstore`, `require_collection`, `list_collections`, `remove_collection`).
 
 ### `src/core/ai_security/` - Model Armor, Content Safety & Guardrails
 - **`armor.py`**: Regional Google Cloud Model Armor + Cloud Data Loss Prevention (SDP) screening for user prompts (`screen_user_prompt`), retrieved document chunks (`sanitize_chunk_text`, `sanitize_retrieved_documents`), and final LLM responses (`sanitize_model_output`) with fail-closed behavior in Cloud Run.
@@ -108,7 +108,7 @@ curl -X POST "http://localhost:8000/ingest" \
 ## 3. `src/manage/` - Collection Management & GDPR Self-Service Package
 
 `src/manage/` encapsulates tenant collection lifecycle management and GDPR Articles 15 & 17 self-service rights, mounted onto `agent-api`:
-- **`collections.py`**: Defines `collections_router` (`GET /collections` and `DELETE /collections/{collection_name}`).
+- **`collections.py`**: Defines `collections_router` (`GET /collections`, returning collection names, chunk counts, each collection's bound `embedding_model`, and `allowed_llm_models` / `allowed_embedding_models`; and `DELETE /collections/{collection_name}`).
 - **`compliance.py`**: Defines `compliance_router` (`GET /compliance/my-data` and `DELETE /compliance/my-data`), passing `MEMORY_SAVER` into `get_user_data_inventory` and `purge_all_user_data` in `src/core/compliance/dsar.py`.
 - **`routes.py`**: Defines `manage_router`, combining `collections_router` and `compliance_router` so `agent-api` can inspect and erase both ChromaDB collections and in-memory LangGraph sessions in a single atomic request.
 
@@ -118,7 +118,7 @@ curl -X POST "http://localhost:8000/ingest" \
 
 `src/query/` encapsulates direct top-$k$ semantic similarity search against a user's ChromaDB collection, mounted onto `agent-api`:
 - **`schemas.py`**: Defines `QueryRequest` (validating collection name, query text, `k`, and embedding model allowlist).
-- **`service.py`**: Implements `search_collection(uid, query, collection_name, k, embedding_model)` inside `user_read_lock(uid)` with Cloud DLP `[INFO_TYPE]` chunk masking and retrieval similarity score telemetry.
+- **`service.py`**: Implements `search_collection(uid, query, collection_name, k, embedding_model)` inside `user_read_lock(uid)`, automatically resolving the collection's bound `embedding_model` with Cloud DLP `[INFO_TYPE]` chunk masking and retrieval similarity score telemetry.
 - **`routes.py`**: Exposes `POST /query` (`query_router`), sharing `agent-api`'s warm `/tmp/chroma_db/{uid}` cache and `_QUERY_RATE_LIMITER`.
 
 ---
@@ -127,7 +127,7 @@ curl -X POST "http://localhost:8000/ingest" \
 
 ### Core Responsibilities
 `src/agent/` runs the stateful, safety-screened LangGraph RAG workflow and mounts `src/query` + `src/manage` + `src/agent` onto `agent-api`:
-1. **XML-Spotlighted Retriever Tool (`tools.py`)**: Queries the user's Chroma collection, applies Cloud DLP `[INFO_TYPE]` chunk redaction, and formats retrieved chunks into `<retrieved_chunk source="..." page="...">` tags via `format_retrieved_chunks` and `safe_tool_name` from `src/core/ai_security/guardrails.py` (`get_retriever_tool`).
+1. **XML-Spotlighted Retriever Tool (`tools.py`)**: Queries the user's Chroma collection using its bound `embedding_model`, applies Cloud DLP `[INFO_TYPE]` chunk redaction, and formats retrieved chunks into `<retrieved_chunk source="..." page="...">` tags via `format_retrieved_chunks` and `safe_tool_name` from `src/core/ai_security/guardrails.py` (`get_retriever_tool`).
 2. **Tenant-Isolated Memory (`memory.py`)**: Owns the `MEMORY_SAVER` (`InMemorySaver`) checkpointer and namespaces checkpoint threads under `{uid}:{thread_id}` (`make_user_thread_id`).
 3. **Safety-Screened LangGraph StateGraph (`graph.py`)**: Compiles `input_guard` $\rightarrow$ `model_call` $\leftrightarrow$ `tools` $\rightarrow$ `output_guard` with regional `ChatGoogleGenerativeAI`, Gemini safety thresholds, and `[source, p.X]` citation rules.
 4. **SSE & Interactive Streaming (`service.py`, `display.py`)**: Streams sanitized message events, tool traces, and EU AI Act Art. 50 `compliance` frames over SSE (`stream_sse`), emits canonical `agent.query` audit/telemetry events (`emit_agent_query_events`), or renders rich terminal panels (`run_interactive`).
@@ -145,7 +145,7 @@ curl -X POST "http://localhost:8000/ingest" \
 | :--- | :--- | :--- | :--- |
 | `GET` | `/health` | N/A | Unauthenticated readiness/liveness probe (`agent-api`). |
 | `POST` | `/query` | `application/json` | Performs top-$k$ similarity search with DLP chunk sanitization (`src/query`). |
-| `GET` | `/collections` | N/A | Lists the authenticated user's ChromaDB collections and chunk counts (`src/manage`). |
+| `GET` | `/collections` | N/A | Lists the authenticated user's ChromaDB collections, chunk counts, bound `embedding_model`, and `allowed_llm_models` / `allowed_embedding_models` (`src/manage`). |
 | `DELETE` | `/collections/{collection_name}` | N/A | Deletes a ChromaDB collection from local cache and GCS (`src/manage`). |
 | `GET` | `/compliance/my-data` | N/A | Returns GDPR Art. 15 personal data inventory across GCS, Chroma, and memory threads (`src/manage`). |
 | `DELETE` | `/compliance/my-data` | N/A | Executes GDPR Art. 17 hard erasure across GCS, `/tmp`, and memory threads (`src/manage`). |
@@ -224,7 +224,7 @@ curl -X POST "http://localhost:8001/agent/stream" \
    GOOGLE_CLOUD_PROJECT="interactive-rag"
    GOOGLE_CLOUD_LOCATION="us-central1"  # Must be a concrete single GCP region (never "global")
    ALLOWED_LLM_MODELS="gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite"
-   ALLOWED_EMBEDDING_MODELS="gemini-embedding-001,text-embedding-005"
+   ALLOWED_EMBEDDING_MODELS="gemini-embedding-001,text-embedding-004,text-embedding-005"
    ```
 3. **Dependencies**:
    ```bash

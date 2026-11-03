@@ -4,10 +4,10 @@
 
 Instead of combining unrelated documents into a single shared database, InteractiveRAG gives every signed-in user an isolated workspace where they can organize PDFs into domain-specific vector collections (for example, separating annual financial reports from clinical research). Through the web dashboard or REST APIs, users can:
 
-- **Ingest PDF Documents (`POST /ingest`)**: Upload PDF documents that are parsed page-by-page, split into overlapping text chunks, converted into vector embeddings using Vertex AI, and indexed into a named vector collection.
-- **Run Direct Semantic Search (`POST /query`)**: Perform top-$k$ similarity searches scoped strictly to a selected collection to inspect relevant document chunks, similarity scores, and page numbers directly.
-- **Chat with a Grounded AI Agent (`POST /agent`, `POST /agent/stream`)**: Ask questions in a multi-turn conversation with a stateful LangGraph agent that dynamically queries the user's chosen collection, grounds every factual statement in retrieved evidence with inline `[filename.pdf, p.X]` citations, and streams each workflow step in real time over Server-Sent Events (SSE).
-- **Manage Document Collections (`GET /collections`, `DELETE /collections/{collection_name}`)**: List all vector collections in the user's workspace along with their indexed chunk counts, or delete a collection when it is no longer needed.
+- **Ingest PDF Documents (`POST /ingest`)**: Upload PDF documents that are parsed page-by-page, split into overlapping text chunks, converted into vector embeddings using Vertex AI (`gemini-embedding-001`, `text-embedding-004`, or `text-embedding-005`), and indexed into a named vector collection bound to that embedding model.
+- **Run Direct Semantic Search (`POST /query`)**: Perform top-$k$ similarity searches scoped strictly to a selected collection (automatically using the collection's bound embedding model) to inspect relevant document chunks, similarity scores, and page numbers directly.
+- **Chat with a Grounded AI Agent (`POST /agent`, `POST /agent/stream`)**: Ask questions in a multi-turn conversation with a stateful LangGraph agent that dynamically queries the user's chosen collection using its bound embedding model, grounds every factual statement in retrieved evidence with inline `[filename.pdf, p.X]` citations, and streams each workflow step in real time over Server-Sent Events (SSE).
+- **Manage Document Collections (`GET /collections`, `DELETE /collections/{collection_name}`)**: List all vector collections in the user's workspace along with their indexed chunk counts, bound `embedding_model`, and server-approved model catalogs (`allowed_llm_models`, `allowed_embedding_models`), or delete a collection when it is no longer needed.
 - **Exercise Self-Service Privacy Controls (`GET /compliance/my-data`, `DELETE /compliance/my-data`)**: Export a complete inventory of stored collections, uploaded PDFs, storage bytes, and active conversation threads, or permanently erase all personal data—including live and archived Cloud Storage object versions, local vector caches, and conversation memory—in a single action.
 
 ---
@@ -33,9 +33,9 @@ InteractiveRAG organizes its backend into **4 modular Python packages** (`src/in
   — *Called in [`src/ingest/routes.py`](src/ingest/routes.py)*
 
 ### 2. Embedding Models & Domain-Scoped Vector Databases
-- **Vertex AI Dense Vector Embeddings:** Document chunks (at ingestion time) and search queries (at retrieval time) are converted into dense semantic vectors using **Google Cloud Vertex AI** embedding models (`gemini-embedding-001` by default, or `text-embedding-005`).  
+- **Vertex AI Dense Vector Embeddings & Collection-Bound Embedding Consistency:** Document chunks (at ingestion time) and search queries (at retrieval time) are converted into dense semantic vectors using **Google Cloud Vertex AI** embedding models (`gemini-embedding-001` by default, `text-embedding-004`, or `text-embedding-005`). When a collection is first created, its chosen `embedding_model` is persisted in ChromaDB collection metadata (`resolve_collection_embedding_model`); all subsequent document appends (`POST /ingest`), direct similarity searches (`POST /query`), and agent retriever calls (`POST /agent`, `POST /agent/stream`) on that collection automatically resolve and use its bound embedding model so vectors always remain in a consistent embedding space.  
   — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
-  — *Called in [`src/ingest/service.py`](src/ingest/service.py) & [`src/query/service.py`](src/query/service.py)*
+  — *Called in [`src/ingest/service.py`](src/ingest/service.py), [`src/query/service.py`](src/query/service.py) & [`src/agent/tools.py`](src/agent/tools.py)*
 - **Domain-Scoped Named Collections:** Instead of pooling all uploaded files into a single flat vector index (which degrades retrieval accuracy when documents cover different topics), documents are organized into separate named **ChromaDB** collections (for example, separating financial reports from clinical studies) that can be listed or deleted independently.  
   — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
   — *Called in [`src/ingest/service.py`](src/ingest/service.py), [`src/query/service.py`](src/query/service.py) & [`src/manage/collections.py`](src/manage/collections.py)*
@@ -162,9 +162,9 @@ Multiple users can sign in and use the cloud platform simultaneously—each pers
 
 - **1.5 Build-Once Frontend with Startup Runtime Configuration**
   - **Decoupling Image Builds from Cloud Provisioning:** Single-page web apps normally bake API URLs and Firebase keys into static JavaScript files during `docker build`, which happens *before* Terraform has provisioned the Load Balancer or generated the project's Firebase Web API key.
-  - **Dynamic Startup Configuration (`/env-config.js`):** When the frontend container starts on Cloud Run, its startup script reads the environment variables injected by Terraform and writes `/env-config.js`, which the browser loads before starting the React app—allowing a single immutable frontend image to run in any environment without rebuilding.  
+  - **Dynamic Startup Configuration (`/env-config.js`):** When the frontend container starts on Cloud Run, its startup script reads the environment variables injected by Terraform (including `INGESTION_API_URL`, `AGENT_API_URL`, Firebase auth settings, `ALLOWED_LLM_MODELS`, and `ALLOWED_EMBEDDING_MODELS`) and writes `/env-config.js`, which the browser loads before starting the React app—allowing a single immutable frontend image to run in any environment without rebuilding (and falling back to the root `.env` via `frontend/vite.config.js` during local development).  
     — *Provisioned in [`infra/cloud_run.tf`](infra/cloud_run.tf)*  
-    — *Implemented in [`docker/entrypoint-frontend.sh`](docker/entrypoint-frontend.sh)*  
+    — *Implemented in [`docker/entrypoint-frontend.sh`](docker/entrypoint-frontend.sh) & [`frontend/vite.config.js`](frontend/vite.config.js)*  
     — *Called in [`frontend/index.html`](frontend/index.html) & [`frontend/src/firebase.js`](frontend/src/firebase.js)*
 
 ---
@@ -220,12 +220,12 @@ Every user question, retrieved document chunk, and AI reply flows through a mult
     — *Called in [`src/ingest/schemas.py`](src/ingest/schemas.py), [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py), [`src/query/schemas.py`](src/query/schemas.py), [`src/agent/schemas.py`](src/agent/schemas.py), [`src/agent/tools.py`](src/agent/tools.py) & [`src/manage/collections.py`](src/manage/collections.py)*
 
 - **3.2 Pillar 2 — Model Access Controls**
-  - **Server-Approved Model Catalogs:** Instead of allowing callers to request arbitrary Vertex AI models, the backend maintains curated allowlists of approved chat models (`gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-2.5-flash-lite`) and embedding models (`gemini-embedding-001`, `text-embedding-005`).  
+  - **Server-Approved Model Catalogs:** Instead of allowing callers to request arbitrary Vertex AI models, the backend maintains curated allowlists of approved chat models (`gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-2.5-flash-lite`) and embedding models (`gemini-embedding-001`, `text-embedding-004`, `text-embedding-005`).  
     — *Provisioned in [`infra/cloud_run.tf`](infra/cloud_run.tf)*  
     — *Implemented in [`src/core/config.py`](src/core/config.py) & [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*
-  - **Automatic Endpoint Validation:** Every ingestion, search, and chat request requires an explicit collection name, defaults to the primary approved model when omitted, and immediately rejects unapproved model names with `HTTP 422`.  
-    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
-    — *Called in [`src/ingest/schemas.py`](src/ingest/schemas.py), [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py), [`src/query/schemas.py`](src/query/schemas.py) & [`src/agent/schemas.py`](src/agent/schemas.py)*
+  - **Automatic Endpoint Validation & Collection-Bound Embedding Enforcement:** Every ingestion, search, and chat request requires an explicit collection name, defaults to the primary approved model when omitted, immediately rejects unapproved model names with `HTTP 422`, and automatically enforces each existing collection's bound `embedding_model` across subsequent uploads, similarity searches, and agent retrieval calls.  
+    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py) & [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
+    — *Called in [`src/ingest/schemas.py`](src/ingest/schemas.py), [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py), [`src/ingest/service.py`](src/ingest/service.py), [`src/query/schemas.py`](src/query/schemas.py), [`src/query/service.py`](src/query/service.py), [`src/agent/schemas.py`](src/agent/schemas.py) & [`src/agent/tools.py`](src/agent/tools.py)*
 
 - **3.3 Pillar 3 — AI & Ingestion Guardrails**
   - **Strict Document Grounding Guardrails:** The system prompt and retriever tool enforce anti-hallucination guardrails requiring the model to rely solely on `<retrieved_chunk>` evidence with 1-indexed `[filename.pdf, p.X]` citations and abstain whenever retrieved context is empty or insufficient.  
@@ -564,7 +564,7 @@ GEMINI_SAFETY_THRESHOLD="BLOCK_LOW_AND_ABOVE"
 
 # Approved Model Catalogs & Guardrail Ceilings
 ALLOWED_LLM_MODELS="gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite"
-ALLOWED_EMBEDDING_MODELS="gemini-embedding-001,text-embedding-005"
+ALLOWED_EMBEDDING_MODELS="gemini-embedding-001,text-embedding-004,text-embedding-005"
 MAX_UPLOAD_MB="20"
 MAX_FILES_PER_REQUEST="10"
 MAX_CHUNKS_PER_INGEST="1000"
@@ -717,6 +717,6 @@ curl -s "http://localhost:8001/compliance/my-data" | python3 -m json.tool
 
 ### 4. Interactive Web Dashboard Workflow
 1. Open **http://localhost:3000** (or your deployed `https://<LB-IP-with-dashes>.sslip.io` URL and sign in via **Identity Platform**).
-2. **Ingest PDFs**: Upload one or more PDF files into a named collection using an approved embedding model.
-3. **Manage Collections & Privacy**: View your isolated collections and chunk counts, delete collections you no longer need, or open **"My Data & Privacy"** to inspect your full data footprint or erase all account data.
-4. **Chat & Verify Provenance Badges**: Select an approved Gemini model and ask questions in the chat panel to watch real-time retriever tool calls, grounded `[filename.pdf, p.X]` citations, DLP-filtered responses, and EU AI Act transparency badges.
+2. **Ingest PDFs**: Upload one or more PDF files into a named collection and choose an approved embedding model (`gemini-embedding-001`, `text-embedding-004`, or `text-embedding-005`) when creating a new collection. When adding PDFs to an existing collection, the dashboard automatically locks to that collection's bound embedding model.
+3. **Manage Collections, Search Chunks & Privacy**: View your isolated collections, chunk counts, and bound embedding models, run direct top-$k$ chunk similarity searches (using the selected collection's bound embedding model), delete collections you no longer need, or open **"My Data & Privacy"** to inspect your full data footprint or erase all account data.
+4. **Chat & Verify Provenance Badges**: Select an approved Gemini LLM model (`gemini-2.5-flash`, `gemini-2.5-pro`, or `gemini-2.5-flash-lite`) from the configured model catalog and ask questions in the chat panel (which automatically retrieves using the active collection's bound embedding model) to watch real-time retriever tool calls, grounded `[filename.pdf, p.X]` citations, DLP-filtered responses, and EU AI Act transparency badges.

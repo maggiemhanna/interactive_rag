@@ -216,7 +216,7 @@ Because several core scalability capabilities were already established in earlie
   - Vertex AI automatically distributes inference across Google's regional TPU/GPU fleet and bills strictly per input/output character or token, giving the platform elastic accelerator capacity with `$0` idle GPU cost.
 
 - **`[Already Implemented]` Multi-Model Tiering for Latency & Cost Efficiency:**
-  - Callers and the frontend UI can select from three approved regional Gemini models (and two approved Vertex AI embedding models: `gemini-embedding-001` and `text-embedding-005`) depending on the complexity of the task:
+  - Callers and the frontend UI can select from three approved regional Gemini models (and three approved Vertex AI embedding models: `gemini-embedding-001`, `text-embedding-004`, and `text-embedding-005`, bound per collection at creation time) depending on the complexity of the task:
     - **`gemini-2.5-flash` (Default):** Best balance of low latency, high throughput, and low cost for everyday multi-step RAG turns.
     - **`gemini-2.5-pro`:** Higher reasoning capacity for complex multi-document synthesis.
     - **`gemini-2.5-flash-lite`:** Ultra-fast, lowest-cost model for simple factual lookups.
