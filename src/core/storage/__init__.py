@@ -12,12 +12,14 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from src.core.storage.chroma import (
+        get_collection_embedding_model,
         get_embeddings,
         get_vectorstore,
         has_sqlite,
         list_collections,
         remove_collection,
         require_collection,
+        resolve_collection_embedding_model,
         similarity_search_with_scores,
     )
     from src.core.storage.gcs_sync import archive_upload
@@ -42,12 +44,14 @@ if TYPE_CHECKING:
     )
 
 _EXPORT_MAP: dict[str, str] = {
+    "get_collection_embedding_model": "src.core.storage.chroma",
     "get_embeddings": "src.core.storage.chroma",
     "get_vectorstore": "src.core.storage.chroma",
     "has_sqlite": "src.core.storage.chroma",
     "list_collections": "src.core.storage.chroma",
     "remove_collection": "src.core.storage.chroma",
     "require_collection": "src.core.storage.chroma",
+    "resolve_collection_embedding_model": "src.core.storage.chroma",
     "similarity_search_with_scores": "src.core.storage.chroma",
     "archive_upload": "src.core.storage.gcs_sync",
     "LockTimeoutError": "src.core.storage.locks",

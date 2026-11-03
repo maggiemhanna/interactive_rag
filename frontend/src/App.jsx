@@ -2448,13 +2448,17 @@ export default function App() {
   const activeThread =
     agentThreads.find((t) => t.id === activeThreadId) || agentThreads[0] || null;
 
-  const getCollectionEmbeddingModel = (colName, detailsList = collectionDetails, embModels = availableEmbeddingModels) => {
+  const getCollectionEmbeddingModel = (
+    colName,
+    detailsList = collectionDetails,
+    embModels = availableEmbeddingModels
+  ) => {
     if (!colName || !Array.isArray(detailsList)) return null;
     const found = detailsList.find((d) => d && d.name === colName);
-    if (found?.embedding_model && embModels.includes(found.embedding_model)) {
+    if (found?.embedding_model) {
       return found.embedding_model;
     }
-    return null;
+    return embModels[0] || DEFAULT_ALLOWED_EMBEDDING_MODELS[0] || 'gemini-embedding-001';
   };
 
   const resetTenantState = () => {
@@ -2791,10 +2795,15 @@ export default function App() {
     setLoading(true);
 
     try {
+      const effectiveIngestEmbedding =
+        collectionMode === 'existing' && collections.includes(targetCollection)
+          ? getCollectionEmbeddingModel(targetCollection) || ingestEmbeddingModel
+          : ingestEmbeddingModel;
+
       const formData = new FormData();
       formData.append('collection_name', targetCollection);
-      if (ingestEmbeddingModel) {
-        formData.append('embedding_model', ingestEmbeddingModel);
+      if (effectiveIngestEmbedding) {
+        formData.append('embedding_model', effectiveIngestEmbedding);
       }
 
       if (uploadMode === 'files') {
@@ -2870,6 +2879,8 @@ export default function App() {
     setQueryLoading(true);
 
     try {
+      const effectiveQueryEmbedding =
+        getCollectionEmbeddingModel(queryCollection) || queryEmbeddingModel;
       const response = await authFetch(`${AGENT_API_BASE}/query`, {
         method: 'POST',
         headers: {
@@ -2879,7 +2890,7 @@ export default function App() {
           query: trimmedQuery,
           collection_name: queryCollection,
           k: Number(topK),
-          embedding_model: queryEmbeddingModel,
+          embedding_model: effectiveQueryEmbedding,
         }),
       });
 
@@ -3137,6 +3148,8 @@ export default function App() {
     abortControllerRef.current = controller;
 
     try {
+      const effectiveAgentEmbedding =
+        getCollectionEmbeddingModel(targetCollection) || agentEmbeddingModel;
       const endpointUrl =
         agentEndpointMode === 'standard'
           ? `${AGENT_API_BASE}/agent`
@@ -3148,7 +3161,7 @@ export default function App() {
               collection_name: targetCollection,
               thread_id: targetThreadId,
               model_name: agentLlmModel,
-              embedding_model: agentEmbeddingModel,
+              embedding_model: effectiveAgentEmbedding,
               stream: false,
             }
           : {
@@ -3156,7 +3169,7 @@ export default function App() {
               collection_name: targetCollection,
               thread_id: targetThreadId,
               model_name: agentLlmModel,
-              embedding_model: agentEmbeddingModel,
+              embedding_model: effectiveAgentEmbedding,
             };
 
       const response = await authFetch(endpointUrl, {
@@ -3601,18 +3614,43 @@ export default function App() {
               {/* Embedding Model Selection */}
               <div className="form-group">
                 <label className="form-label">Embedding Model</label>
-                <select
-                  className="form-select"
-                  value={ingestEmbeddingModel}
-                  onChange={(e) => setIngestEmbeddingModel(e.target.value)}
-                  aria-label="Embedding model for document indexing"
-                >
-                  {availableEmbeddingModels.map((model) => (
-                    <option key={model} value={model}>
-                      {model}
-                    </option>
-                  ))}
-                </select>
+                {collectionMode === 'existing' && collections.length > 0 && selectedCollection ? (
+                  <>
+                    <div
+                      className="collection-embedding-readonly"
+                      title="Existing collections are locked to the embedding model used when they were created"
+                    >
+                      <Layers size={15} color="var(--accent-cyan)" />
+                      <span className="collection-embedding-readonly-name">
+                        {getCollectionEmbeddingModel(selectedCollection) || ingestEmbeddingModel}
+                      </span>
+                      <span className="collection-embedding-readonly-tag">
+                        Collection Model
+                      </span>
+                    </div>
+                    <p style={{ fontSize: '0.75rem', color: 'var(--text-dim)', marginTop: '6px' }}>
+                      Locked to <strong>{selectedCollection}</strong>&apos;s embedding model so all vectors remain comparable. Select <strong>New Collection</strong> to choose a different embedding model.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <select
+                      className="form-select"
+                      value={ingestEmbeddingModel}
+                      onChange={(e) => setIngestEmbeddingModel(e.target.value)}
+                      aria-label="Embedding model for document indexing"
+                    >
+                      {availableEmbeddingModels.map((model) => (
+                        <option key={model} value={model}>
+                          {model}
+                        </option>
+                      ))}
+                    </select>
+                    <p style={{ fontSize: '0.75rem', color: 'var(--text-dim)', marginTop: '6px' }}>
+                      This embedding model will be bound to the collection and automatically used for all searches and AI Assistant queries on it.
+                    </p>
+                  </>
+                )}
               </div>
 
               {/* Step 2: Document Source */}
@@ -3755,22 +3793,24 @@ export default function App() {
                 )}
               </div>
 
-              {/* Embedding Model Selection */}
-              <div className="form-group">
-                <label className="form-label">Embedding Model</label>
-                <select
-                  className="form-select"
-                  value={queryEmbeddingModel}
-                  onChange={(e) => setQueryEmbeddingModel(e.target.value)}
-                  aria-label="Embedding model for similarity search"
-                >
-                  {availableEmbeddingModels.map((model) => (
-                    <option key={model} value={model}>
-                      {model}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {/* Collection Embedding Model (Read-Only) */}
+              {queryCollection && (
+                <div className="form-group">
+                  <label className="form-label">Collection Embedding Model</label>
+                  <div
+                    className="collection-embedding-readonly"
+                    title="Queries automatically use the selected collection's embedding model so vector similarity is comparable"
+                  >
+                    <Layers size={15} color="var(--accent-cyan)" />
+                    <span className="collection-embedding-readonly-name">
+                      {getCollectionEmbeddingModel(queryCollection) || queryEmbeddingModel}
+                    </span>
+                    <span className="collection-embedding-readonly-tag">
+                      Auto-matched to collection
+                    </span>
+                  </div>
+                </div>
+              )}
 
               {/* Query Text */}
               <div className="form-group">
@@ -4103,25 +4143,18 @@ export default function App() {
                       </select>
                     </div>
 
-                    <div className="agent-model-picker">
-                      <span className="agent-picker-label">
-                        <Layers size={13} color="var(--accent-cyan)" />
-                        <span>Embedding</span>
-                      </span>
-                      <select
-                        className="form-select agent-compact-select"
-                        value={agentEmbeddingModel}
-                        onChange={(e) => setAgentEmbeddingModel(e.target.value)}
-                        disabled={agentLoading}
-                        aria-label="Choose embedding model"
+                    {effectiveCollection && (
+                      <div
+                        className="agent-embedding-badge"
+                        title="Retrieval automatically uses this collection's embedding model so vector similarity is comparable"
                       >
-                        {availableEmbeddingModels.map((model) => (
-                          <option key={model} value={model}>
-                            {model}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
+                        <Layers size={12} color="var(--accent-cyan)" />
+                        <span className="agent-embedding-badge-label">Embedding:</span>
+                        <span className="agent-embedding-badge-value">
+                          {getCollectionEmbeddingModel(effectiveCollection) || agentEmbeddingModel}
+                        </span>
+                      </div>
+                    )}
 
                     <div
                       className="chunk-view-segmented"

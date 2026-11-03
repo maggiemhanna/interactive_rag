@@ -18,7 +18,10 @@ from src.core.ai_security.guardrails import (
     validate_embedding_model,
 )
 from src.core.compliance.residency import validate_gcp_region
-from src.core.config import get_google_cloud_project
+from src.core.config import (
+    get_allowed_embedding_models,
+    get_google_cloud_project,
+)
 from src.core.storage.paths import SQLITE_FILENAME
 
 
@@ -46,6 +49,85 @@ def get_embeddings(
     )
 
 
+def _infer_collection_embedding_model(col: Any) -> Optional[str]:
+    """Resolves a Chroma collection's approved embedding model from metadata or vector dimension."""
+    try:
+        allowed = get_allowed_embedding_models()
+    except Exception:
+        allowed = ()
+
+    col_meta = getattr(col, "metadata", None) or {}
+    if isinstance(col_meta, dict):
+        raw_model = col_meta.get("embedding_model")
+        if isinstance(raw_model, str) and raw_model.strip():
+            candidate = raw_model.strip()
+            if not allowed or candidate in allowed:
+                return candidate
+
+    try:
+        if hasattr(col, "get"):
+            sample = col.get(limit=1, include=["embeddings"])
+            embeddings = sample.get("embeddings") if isinstance(sample, dict) else None
+            if embeddings is not None and len(embeddings) > 0 and embeddings[0] is not None:
+                dim = len(embeddings[0])
+                if dim == 3072 and (not allowed or "gemini-embedding-001" in allowed):
+                    return "gemini-embedding-001"
+    except Exception:
+        pass
+
+    return None
+
+
+def get_collection_embedding_model(
+    persist_directory: str,
+    collection_name: str,
+) -> Optional[str]:
+    """Looks up the stored or inferred embedding model for `collection_name` in `persist_directory`.
+
+    Args:
+        persist_directory: Local tenant ChromaDB directory path.
+        collection_name: Validated Chroma collection identifier.
+
+    Returns:
+        Approved embedding model identifier string if stored/inferred on the collection, else `None`.
+    """
+    safe_collection = validate_collection_name(collection_name)
+    if not has_sqlite(persist_directory):
+        return None
+    try:
+        client = chromadb.PersistentClient(path=persist_directory)
+        for col in client.list_collections():
+            if getattr(col, "name", None) == safe_collection:
+                return _infer_collection_embedding_model(col)
+    except Exception:
+        return None
+    return None
+
+
+def resolve_collection_embedding_model(
+    persist_directory: str,
+    collection_name: str,
+    embedding_model: Optional[str] = None,
+) -> str:
+    """Resolves the effective embedding model for `collection_name`, preferring the collection's stored model.
+
+    Always validates `embedding_model` against the approved embedding model catalog first so unapproved
+    model identifiers are rejected consistently, then returns the collection's stored embedding model
+    when `collection_name` already exists in `persist_directory`.
+
+    Args:
+        persist_directory: Local tenant ChromaDB directory path.
+        collection_name: Target Chroma collection identifier.
+        embedding_model: Optional caller-requested embedding model identifier.
+
+    Returns:
+        Validated embedding model identifier bound to `collection_name`.
+    """
+    fallback_model = validate_embedding_model(embedding_model)
+    stored_model = get_collection_embedding_model(persist_directory, collection_name)
+    return stored_model or fallback_model
+
+
 def get_vectorstore(
     collection_name: str,
     persist_directory: str = "chroma_db",
@@ -53,18 +135,27 @@ def get_vectorstore(
 ) -> Chroma:
     """Initializes or loads a `Chroma` vectorstore instance for `persist_directory` and `collection_name`.
 
+    Automatically binds `embedding_function` to the collection's stored embedding model when the
+    collection already exists in `persist_directory`, ensuring query and retrieval embeddings
+    remain in the same vector space as the indexed documents.
+
     Args:
         collection_name: Validated Chroma collection identifier.
         persist_directory: Local filesystem path of the tenant's ChromaDB directory.
-        embedding_model: Optional approved Vertex AI embedding model identifier.
+        embedding_model: Optional approved Vertex AI embedding model identifier (used when creating a new collection).
 
     Returns:
         Initialized `langchain_chroma.Chroma` vectorstore instance.
     """
     safe_collection = validate_collection_name(collection_name)
+    resolved_model = resolve_collection_embedding_model(
+        persist_directory=persist_directory,
+        collection_name=safe_collection,
+        embedding_model=embedding_model,
+    )
     return Chroma(
         persist_directory=persist_directory,
-        embedding_function=get_embeddings(embedding_model=embedding_model),
+        embedding_function=get_embeddings(embedding_model=resolved_model),
         collection_name=safe_collection,
     )
 
@@ -145,7 +236,7 @@ def list_collections(persist_directory: str) -> Dict[str, Any]:
         persist_directory: Local tenant ChromaDB directory path.
 
     Returns:
-        Dictionary containing `'collections'` (list of names) and `'details'` (`[{'name', 'count'}]`).
+        Dictionary containing `'collections'` (list of names) and `'details'` (`[{'name', 'count', 'embedding_model'}]`).
     """
     if not has_sqlite(persist_directory):
         return {"collections": [], "details": []}
@@ -159,8 +250,7 @@ def list_collections(persist_directory: str) -> Dict[str, Any]:
             count = col.count()
         except Exception:
             count = 0
-        col_meta = getattr(col, "metadata", None) or {}
-        emb_model = col_meta.get("embedding_model") if isinstance(col_meta, dict) else None
+        emb_model = _infer_collection_embedding_model(col)
         entry: Dict[str, Any] = {"name": col.name, "count": count}
         if isinstance(emb_model, str) and emb_model.strip():
             entry["embedding_model"] = emb_model.strip()
@@ -184,12 +274,14 @@ def remove_collection(persist_directory: str, collection_name: str) -> None:
 
 
 __all__ = [
+    "get_collection_embedding_model",
     "get_embeddings",
     "get_vectorstore",
     "has_sqlite",
     "list_collections",
     "remove_collection",
     "require_collection",
+    "resolve_collection_embedding_model",
     "similarity_search_with_scores",
 ]
 

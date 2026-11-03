@@ -12,13 +12,10 @@ from typing import List, Tuple
 
 from dotenv import find_dotenv, load_dotenv
 
-SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 
 def load_env() -> None:
-    """Loads environment variables from repository root `.env` and `src/.env` if present."""
+    """Loads environment variables from repository root `.env` if present."""
     load_dotenv(find_dotenv())
-    load_dotenv(os.path.join(SRC_DIR, ".env"))
 
 
 # Load environment variables once on core config import before deriving defaults

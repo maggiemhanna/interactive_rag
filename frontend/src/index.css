@@ -1868,6 +1868,60 @@ h1, h2, h3, h4 {
   max-width: 230px;
 }
 
+.agent-embedding-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.38rem;
+  padding: 0.36rem 0.68rem;
+  border-radius: var(--radius-sm);
+  background: rgba(6, 182, 212, 0.08);
+  border: 1px solid rgba(6, 182, 212, 0.24);
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.agent-embedding-badge-label {
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.agent-embedding-badge-value {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.76rem;
+  color: #a5f3fc;
+}
+
+.collection-embedding-readonly {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.72rem 0.95rem;
+  border-radius: var(--radius-sm);
+  background: rgba(6, 182, 212, 0.06);
+  border: 1px solid rgba(6, 182, 212, 0.25);
+  color: #e2e8f0;
+  font-size: 0.9rem;
+}
+
+.collection-embedding-readonly-name {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.86rem;
+  font-weight: 600;
+  color: #a5f3fc;
+}
+
+.collection-embedding-readonly-tag {
+  margin-left: auto;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--accent-cyan);
+  background: rgba(6, 182, 212, 0.12);
+  border: 1px solid rgba(6, 182, 212, 0.28);
+  padding: 0.14rem 0.5rem;
+  border-radius: 999px;
+}
+
 .thread-id-pill {
   display: inline-flex;
   align-items: center;

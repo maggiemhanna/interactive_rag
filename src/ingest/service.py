@@ -15,6 +15,7 @@ from src.core.logger import setup_logging
 from src.core.observability.tracing import start_span
 from src.core.storage import (
     get_vectorstore,
+    resolve_collection_embedding_model,
     user_write_lock,
 )
 
@@ -49,6 +50,12 @@ def ingest_documents(
         if not os.path.exists(persist_directory):
             os.makedirs(persist_directory)
 
+        resolved_embedding_model = resolve_collection_embedding_model(
+            persist_directory=persist_directory,
+            collection_name=collection_name,
+            embedding_model=safe_embedding_model,
+        )
+
         with start_span(
             "ingest.ingest_documents",
             stage="embedding",
@@ -60,7 +67,7 @@ def ingest_documents(
                 vectorstore = get_vectorstore(
                     collection_name=collection_name,
                     persist_directory=persist_directory,
-                    embedding_model=safe_embedding_model,
+                    embedding_model=resolved_embedding_model,
                 )
 
                 batch_size = 100
@@ -80,7 +87,7 @@ def ingest_documents(
                         raw_col.modify(
                             metadata={
                                 **(existing_meta if isinstance(existing_meta, dict) else {}),
-                                "embedding_model": safe_embedding_model,
+                                "embedding_model": resolved_embedding_model,
                             }
                         )
                 except Exception:
