@@ -53,15 +53,15 @@ To prevent CPU- and memory-intensive PDF ingestion from blocking interactive que
 ### `src/core/ai_security/` - Model Armor, Content Safety & Guardrails
 - **`armor.py`**: Regional Google Cloud Model Armor + Cloud Data Loss Prevention (SDP) screening for user prompts (`screen_user_prompt`), retrieved document chunks (`sanitize_chunk_text`, `sanitize_retrieved_documents`), and final LLM responses (`sanitize_model_output`) with fail-closed behavior in Cloud Run.
 - **`safety.py`**: Vertex AI Gemini `HarmBlockThreshold` safety configuration (`get_gemini_safety_settings`), `finish_reason="SAFETY"` refusal detection (`is_safety_blocked`), and standardized user-safe refusal/error messages.
-- **`guardrails.py`**: Server-enforced LLM and embedding model allowlists (`validate_llm_model`, `validate_embedding_model`), collection identifier sanitization (`validate_collection_name`), and query/upload/chunk ceilings (`validate_query_text`, `validate_file_count`, `validate_chunk_count`).
+- **`guardrails.py`**: Server-enforced LLM and embedding model allowlists (`validate_llm_model`, `validate_embedding_model`), collection and tool identifier sanitization (`validate_collection_name`, `safe_tool_name`), query/upload/chunk ceilings (`validate_query_text`, `validate_file_count`, `validate_chunk_count`), PDF file-signature and upload path guardrails (`sanitize_filename`, `validate_pdf_bytes`, `validate_server_pdf_paths`), and XML spotlighting for retrieved passages (`EMPTY_RETRIEVAL_MARKER`, `format_retrieved_chunks`).
 
 ### `src/core/compliance/` - Data Residency, Audit Logging, Provenance & DSAR
 - **`residency.py`**: Enforces single-region GCP locations (`validate_gcp_region`), rejecting `global` and multi-region specifiers (`us`, `eu`, `asia`, `nam4`, `eur4`) before any Vertex AI or Model Armor client call.
 - **`state.py`**: Manages per-request compliance guardrail and retrieval state (`GUARDRAIL_FILTER_LABELS`, `mark_pii_filtered`, `mark_model_armor_active`, `record_guardrail_action`, `record_retrieved_chunks`) stored on `RequestContext`.
 - **`audit.py`**: Emits PII-free structured audit records (`emit_audit_event`) to stdout and Google Cloud Logging (`interactiverag-audit`) and hashes queries via SHA-256 (`hash_query`).
 - **`policy.py`**: Enforces per-user sliding-window rate limiters (`enforce_ingest_rate_limit`, `enforce_query_rate_limit`) and collection count quotas (`enforce_collection_quota`).
-- **`provenance.py`**: Builds EU AI Act Article 50 transparency, citation grounding, and Model Armor provenance metadata (`ComplianceMetadata`, `build_compliance_metadata`).
-- **`dsar.py`**: Executes GDPR Article 15 data inventory (`get_user_data_inventory`) and Article 17 hard erasure (`purge_all_user_data`) across live + noncurrent versioned GCS blobs, local `/tmp` caches, and LangGraph memory checkpoints.
+- **`provenance.py`**: Extracts inline `[source, p.X]` citations (`extract_citations`) and builds EU AI Act Article 50 transparency, citation grounding, and Model Armor provenance metadata (`ComplianceMetadata`, `build_compliance_metadata`).
+- **`dsar.py`**: Executes GDPR Article 15 data inventory (`get_user_data_inventory`), Article 17 hard erasure (`purge_all_user_data`) across live + noncurrent versioned GCS blobs and local `/tmp` caches, and dependency-injected conversation memory thread inspection and erasure (`list_user_memory_threads`, `clear_user_memory`).
 
 ### `src/core/observability/` - Observability & AI Monitoring
 - **`logging.py`**: Enriches `LogRecord` instances from `RequestContext`, scrubs raw queries into `query_sha256` / `query_chars` (`RequestContextLogFilter`), and formats single-line Cloud Logging JSON (`GCPJsonFormatter`).
@@ -75,7 +75,7 @@ To prevent CPU- and memory-intensive PDF ingestion from blocking interactive que
 
 ### Core Responsibilities
 `src/ingest/` isolates CPU- and memory-heavy PDF parsing, text splitting, batch embedding, and ChromaDB HNSW indexing into a dedicated Cloud Run service (`ingest-api`) so uploads never block interactive queries or agent chat:
-1. **Upload Staging & Validation (`upload_parser.py`)**: Parses JSON or multipart `/ingest` payloads, enforces `%PDF-` magic-byte checks, `MAX_UPLOAD_MB` (413), `MAX_FILES_PER_REQUEST` (400), and `MAX_CHUNKS_PER_INGEST` (400), stages uploads inside `/tmp/uploads/{uid}/{request_id}`, and guarantees cleanup.
+1. **Upload Staging & Validation (`upload_parser.py`)**: Parses JSON or multipart `/ingest` payloads, enforces per-user ingestion rate limits and collection quotas, delegates `%PDF-` magic-byte checks, filename sanitization, server path validation, `MAX_UPLOAD_MB` (413), and `MAX_FILES_PER_REQUEST` (400) to `src/core/ai_security/guardrails.py`, stages uploads inside `/tmp/uploads/{uid}/{request_id}`, and guarantees cleanup.
 2. **PDF Loading & Chunking (`splitter.py`)**: Loads PDFs via `PyPDFLoader` and splits pages into overlapping chunks (`chunk_size=1000`, `chunk_overlap=200`) using `RecursiveCharacterTextSplitter`.
 3. **Batched Vector Indexing (`service.py`)**: Indexes chunks in batches of `100` inside `user_write_lock(uid)` (`ingest_documents`) and pushes incremental MD5 deltas to GCS.
 4. **Dedicated FastAPI Service (`routes.py`, `app.py`, `schemas.py`)**: Exposes **only** `POST /ingest` and `GET /health`.
@@ -109,7 +109,7 @@ curl -X POST "http://localhost:8000/ingest" \
 
 `src/manage/` encapsulates tenant collection lifecycle management and GDPR Articles 15 & 17 self-service rights, mounted onto `agent-api`:
 - **`collections.py`**: Defines `collections_router` (`GET /collections` and `DELETE /collections/{collection_name}`).
-- **`compliance.py`**: Defines `compliance_router` (`GET /compliance/my-data` and `DELETE /compliance/my-data`).
+- **`compliance.py`**: Defines `compliance_router` (`GET /compliance/my-data` and `DELETE /compliance/my-data`), passing `MEMORY_SAVER` into `get_user_data_inventory` and `purge_all_user_data` in `src/core/compliance/dsar.py`.
 - **`routes.py`**: Defines `manage_router`, combining `collections_router` and `compliance_router` so `agent-api` can inspect and erase both ChromaDB collections and in-memory LangGraph sessions in a single atomic request.
 
 ---
@@ -127,8 +127,8 @@ curl -X POST "http://localhost:8000/ingest" \
 
 ### Core Responsibilities
 `src/agent/` runs the stateful, safety-screened LangGraph RAG workflow and mounts `src/query` + `src/manage` + `src/agent` onto `agent-api`:
-1. **XML-Spotlighted Retriever Tool (`tools.py`)**: Queries the user's Chroma collection, applies Cloud DLP `[INFO_TYPE]` chunk redaction, and wraps retrieved passages in `<retrieved_chunk source="..." page="...">` tags (`format_retrieved_chunks`, `get_retriever_tool`).
-2. **Tenant-Isolated Memory (`memory.py`)**: Namespaces `InMemorySaver` checkpoint threads under `{uid}:{thread_id}` and supports GDPR Art. 17 thread purging (`clear_user_memory`).
+1. **XML-Spotlighted Retriever Tool (`tools.py`)**: Queries the user's Chroma collection, applies Cloud DLP `[INFO_TYPE]` chunk redaction, and formats retrieved passages into `<retrieved_chunk source="..." page="...">` tags via `format_retrieved_chunks` and `safe_tool_name` from `src/core/ai_security/guardrails.py` (`get_retriever_tool`).
+2. **Tenant-Isolated Memory (`memory.py`)**: Owns the `MEMORY_SAVER` (`InMemorySaver`) checkpointer and namespaces checkpoint threads under `{uid}:{thread_id}` (`make_user_thread_id`).
 3. **Safety-Screened LangGraph StateGraph (`graph.py`)**: Compiles `input_guard` $\rightarrow$ `model_call` $\leftrightarrow$ `tools` $\rightarrow$ `output_guard` with regional `ChatGoogleGenerativeAI`, Gemini safety thresholds, and `[source, p.X]` citation rules.
 4. **SSE & Interactive Streaming (`service.py`, `display.py`)**: Streams sanitized message events, tool traces, and EU AI Act Art. 50 `compliance` frames over SSE (`stream_sse`), emits canonical `agent.query` audit/telemetry events (`emit_agent_query_events`), or renders rich terminal panels (`run_interactive`).
 5. **Unified Interactive FastAPI Service (`routes.py`, `app.py`, `schemas.py`)**: Defines `agent_router` (`POST /agent`, `POST /agent/stream`) in `routes.py` and mounts `agent_router`, `query_router` (`POST /query`), and `manage_router` (`GET /collections`, `DELETE /collections/{collection_name}`, `GET/DELETE /compliance/my-data`) plus `GET /health` in `app.py`.
@@ -241,7 +241,7 @@ src/
 ├── README.md
 ├── core/
 │   ├── __init__.py
-│   ├── config.py              # .env loading, runtime environment, /tmp caps & allowlist getters
+│   ├── config.py              # Single source of truth for all env vars, runtime settings, /tmp caps & allowlists
 │   ├── context.py             # Shared RequestContext & RequestCorrelationMiddleware
 │   ├── auth.py                # Firebase JWT verification & path-safe uid validation
 │   ├── logger.py              # ANSI-colored structured logging setup
@@ -256,7 +256,7 @@ src/
 │   │   ├── __init__.py
 │   │   ├── armor.py           # Regional Model Armor + Cloud DLP prompt/chunk/output screening
 │   │   ├── safety.py          # Gemini HarmBlockThreshold settings & refusal messages
-│   │   └── guardrails.py      # Model allowlists, query/upload/chunk ceilings & recursion bounds
+│   │   └── guardrails.py      # Model allowlists, query/upload/chunk ceilings, XML spotlighting & tool-name sanitization
 │   ├── compliance/
 │   │   ├── __init__.py
 │   │   ├── residency.py       # Single-region GCP location enforcement
@@ -264,7 +264,7 @@ src/
 │   │   ├── audit.py           # PII-free Cloud Logging publisher & SHA-256 query hashing
 │   │   ├── policy.py          # Per-user sliding-window rate limiters & collection quotas
 │   │   ├── provenance.py      # EU AI Act Art. 50 transparency & citation grounding metadata
-│   │   └── dsar.py            # GDPR Art. 15 inventory & Art. 17 versioned hard erasure
+│   │   └── dsar.py            # GDPR Art. 15 inventory, Art. 17 versioned hard erasure & memory thread wiping
 │   └── observability/
 │       ├── __init__.py
 │       ├── logging.py         # Structured GCP JSON formatter & request correlation filter
@@ -275,7 +275,7 @@ src/
 │   ├── __init__.py
 │   ├── __main__.py            # Entrypoint (`python -m src.ingest`)
 │   ├── splitter.py            # PyPDFLoader + RecursiveCharacterTextSplitter chunking
-│   ├── upload_parser.py       # Multipart/JSON upload staging, %PDF- & ceiling validation
+│   ├── upload_parser.py       # Multipart/JSON upload staging, quota checks & guardrail delegation
 │   ├── schemas.py             # IngestRequest Pydantic model
 │   ├── service.py             # Batch Chroma indexing inside distributed GCS write lock
 │   ├── routes.py              # FastAPI router (`POST /ingest`)
@@ -294,8 +294,8 @@ src/
     ├── __init__.py
     ├── __main__.py            # Entrypoint (`python -m src.agent`)
     ├── schemas.py             # AgentRequest & AgentState models
-    ├── memory.py              # Tenant-namespaced InMemorySaver checkpoint management
-    ├── tools.py               # XML-spotlighted, DLP-masked Chroma retriever tool
+    ├── memory.py              # Tenant-namespaced InMemorySaver checkpointer (`MEMORY_SAVER`)
+    ├── tools.py               # DLP-masked Chroma retriever tool delegating XML spotlighting to guardrails
     ├── graph.py               # Safety-screened LangGraph StateGraph builder
     ├── service.py             # Agent event runner, SSE formatter & CLI interactive runner
     ├── display.py             # Rich terminal message rendering

@@ -102,15 +102,16 @@ To keep the governance layer practical, maintainable, and aligned with cloud sec
 ### Phase 2: Privacy-Safe Audit Logging & Trace Correlation
 **Goal:** Create an end-to-end, PII-free audit trail across the Load Balancer, backend microservices, and Google Cloud services that is immediately searchable in Cloud Logging and archived regionally.
 
-- [x] **Request Correlation & Structured Audit Logger (`src/core/context.py`, `src/core/compliance/`):**
+- [x] **Request Correlation & Structured Audit Logger (`src/core/context.py`, `src/core/config.py`, `src/core/compliance/`):**
   - **`src/core/context.py`:** Manage generic per-request correlation context (`RequestContext`: `request_id`, `trace_id`, `active_span_id`, `service_name`, `uid`, `method`, `path`) using Python `contextvars` and wire `RequestCorrelationMiddleware` into both services via `src/core/app_factory.py` to read or generate `X-Request-Id`, extract Cloud Run's `X-Cloud-Trace-Context`, and echo `X-Request-Id` on every HTTP response.
   - **`src/core/compliance/state.py`:** Store per-request compliance guardrail and retrieval state (`GUARDRAIL_FILTER_LABELS`, `mark_pii_filtered`, `mark_model_armor_active`, `record_guardrail_action`, `record_retrieved_chunks`) on the active `RequestContext`.
-  - **`src/core/compliance/audit.py`:**
-    - Implement `emit_audit_event()` to publish structured JSON audit records to the `interactiverag-audit` stream in Google Cloud Logging (with stdout JSON fallback when running offline).
+  - **`src/core/compliance/audit.py` & `src/core/config.py`:**
+    - Centralize audit stream settings (`is_audit_cloud_logging_enabled()`, `get_audit_log_name()`) in `src/core/config.py`.
+    - Implement `emit_audit_event()` in `src/core/compliance/audit.py` to publish structured JSON audit records to the `interactiverag-audit` stream in Google Cloud Logging (with stdout JSON fallback when running offline).
     - Re-export `hash_query()` from `src/core/context.py` to automatically replace any raw user query text with `query_sha256` and `query_chars`.
 - [x] **Application-Wide Audit Coverage & PII Scrubbing (`src/`):**
-  - Remove plaintext user query logging from `src/agent/app.py`, `src/agent/service.py`, and `src/ingestion/service.py`.
-  - Emit structured audit events for authentication failures (`src/core/auth.py`), collection listing and deletion (`src/core/storage/routes.py`), document ingestion and vector search (`src/ingestion/app.py`), agent chat and streaming (`src/agent/app.py`, `src/agent/service.py`), and Model Armor / DLP blocks or redactions (`src/core/ai_security/armor.py`, `src/agent/graph.py`).
+  - Remove plaintext user query logging across `src/agent/`, `src/query/`, and `src/ingest/`.
+  - Emit structured audit events for authentication failures (`src/core/auth.py`), collection listing and deletion (`src/manage/collections.py`), GDPR inventory and erasure (`src/manage/compliance.py`), document ingestion (`src/ingest/routes.py`), vector search (`src/query/routes.py`), agent chat and streaming (`src/agent/routes.py`, `src/agent/service.py`), and Model Armor / DLP blocks or redactions (`src/core/ai_security/armor.py`, `src/agent/graph.py`).
 - [x] **Cloud Audit Logs, Load Balancer Logs & Regional Audit Bucket (`infra/`):**
   - **`infra/apis.tf`, `infra/iam.tf`, `Makefile`:** Enable `logging.googleapis.com`, grant `roles/logging.configWriter` to the Terraform deployer service account, and grant `roles/logging.logWriter` to the backend runtime service account.
   - **`infra/compliance.tf`:**
@@ -125,13 +126,13 @@ To keep the governance layer practical, maintainable, and aligned with cloud sec
 **Goal:** Empower users to inspect or permanently erase all of their stored personal data (GDPR Art. 15 & 17) and provide clear AI transparency and grounding indicators on every response (EU AI Act Art. 50).
 
 - [x] **GDPR Data Inventory & Complete Versioned Erasure (`src/`):**
-  - **`src/core/compliance/dsar.py`:**
-    - Implement `get_user_data_inventory(uid)` to return a user's collections, passage counts, uploaded PDF filenames, live and archived Cloud Storage object counts, and total storage bytes.
-    - Implement `purge_all_user_data(uid)` to permanently delete **all live and noncurrent Cloud Storage object versions** under `users/{uid}/` (`versions=True`), plus local `/tmp/chroma_db/{uid}` and `/tmp/uploads/{uid}` directories.
-  - **`src/agent/memory.py`:** Implement `list_user_memory_threads(uid)` and `purge_user_memory_threads(uid)` to count and wipe all `{uid}:*` conversation checkpoints from in-memory chat storage.
-  - **`src/core/compliance/routes.py` & `src/core/app_factory.py`:** Expose `GET /compliance/my-data` (Art. 15 inventory) and `DELETE /compliance/my-data` (Art. 17 complete erasure) on both backend services, emitting `dsar.export_inventory` and `dsar.erase_user_data` audit events.
+  - **`src/core/compliance/dsar.py` & `src/agent/memory.py`:**
+    - Implement `list_user_memory_threads(uid, checkpointer)` and `clear_user_memory(uid, checkpointer)` in `src/core/compliance/dsar.py` to count and wipe all `{uid}:*` conversation checkpoints using dependency injection (so `MEMORY_SAVER` remains owned exclusively by `src/agent/memory.py` without upward imports from `src/core/` into `src/agent/`).
+    - Implement `get_user_data_inventory(uid, checkpointer=None)` in `src/core/compliance/dsar.py` to return a user's collections, passage counts, uploaded PDF filenames, live and archived Cloud Storage object counts, total storage bytes, and active chat thread count.
+    - Implement `purge_all_user_data(uid, checkpointer=None)` in `src/core/compliance/dsar.py` to permanently delete **all live and noncurrent Cloud Storage object versions** under `users/{uid}/` (`versions=True`), local `/tmp/chroma_db/{uid}` and `/tmp/uploads/{uid}` directories, and all `{uid}:*` conversation checkpoints.
+  - **`src/manage/compliance.py` & `src/agent/app.py`:** Expose `GET /compliance/my-data` (Art. 15 inventory) and `DELETE /compliance/my-data` (Art. 17 complete erasure) on `agent-api`, injecting `MEMORY_SAVER` into `get_user_data_inventory` and `purge_all_user_data` and emitting `dsar.export_inventory` and `dsar.erase_user_data` audit events.
 - [x] **EU AI Act Provenance Metadata & Frontend Privacy Controls (`src/` & `frontend/`):**
-  - **`src/core/compliance/provenance.py`, `src/core/compliance/state.py`, `src/agent/schemas.py`, `src/agent/app.py`, `src/agent/service.py`:** Build and attach a structured `compliance` metadata object (`ai_generated`, `model`, `region`, `grounding_enforced`, `grounded`, `citation_count`, `retrieved_passages`, `pii_filtered`, `model_armor_active`, `filters_checked`, `guardrail_actions`, `request_id`) to all `/agent` JSON responses and `/agent/stream` SSE completion events.
+  - **`src/core/compliance/provenance.py`, `src/core/compliance/state.py`, `src/agent/schemas.py`, `src/agent/routes.py`, `src/agent/service.py`:** Build and attach a structured `compliance` metadata object (`ai_generated`, `model`, `region`, `grounding_enforced`, `grounded`, `citation_count`, `retrieved_passages`, `pii_filtered`, `model_armor_active`, `filters_checked`, `guardrail_actions`, `request_id`) to all `/agent` JSON responses and `/agent/stream` SSE completion events.
   - **`frontend/src/api.js` & `frontend/src/App.jsx`:**
     - Render transparency badges on every assistant message showing AI generation status, model and region, citation grounding status, and any Model Armor / DLP safety actions taken.
     - Add the **"My Data & Privacy"** self-service modal allowing authenticated users to inspect their stored data footprint and trigger complete account data erasure.
@@ -143,13 +144,13 @@ To keep the governance layer practical, maintainable, and aligned with cloud sec
 
 - [x] **Fail-Closed Security Screening (`src/core/ai_security/` & `src/`):**
   - **`src/core/config.py` & `src/core/ai_security/armor.py`:** Add `MODEL_ARMOR_FAIL_CLOSED` (enabled in Cloud Run deployments). When active, any missing template or upstream error calling Model Armor or Cloud DLP raises `SecurityScreeningUnavailableError` and emits an audit event.
-  - **`src/agent/app.py`, `src/agent/service.py`, `src/ingestion/app.py`:** Catch `SecurityScreeningUnavailableError` and return `HTTP 503 Service Unavailable` (or an SSE error frame with `http_status: 503`) so unscreened prompts, chunks, or responses never pass through.
+  - **`src/agent/routes.py`, `src/agent/service.py`, `src/query/routes.py`, `src/ingest/routes.py`:** Catch `SecurityScreeningUnavailableError` and return `HTTP 503 Service Unavailable` (or an SSE error frame with `http_status: 503`) so unscreened prompts, chunks, or responses never pass through.
 - [x] **Per-User Rate Limits & Collection Quotas (`src/core/compliance/policy.py`):**
   - Implement thread-safe per-user sliding-window rate limiters for ingestion (`RATE_LIMIT_INGEST_PER_MINUTE`, default `10`) and queries (`RATE_LIMIT_QUERY_PER_MINUTE`, default `30`), returning `HTTP 429` with a `Retry-After` header and emitting `policy.rate_limit_exceeded` audit events.
   - Implement `enforce_collection_quota(uid, collection_name)` to cap the number of collections a user can own (`MAX_COLLECTIONS_PER_USER`, default `20`), returning `HTTP 403` and emitting `policy.collection_quota_exceeded` when creating a new collection over the limit while allowing uploads into existing collections.
-  - Enforce rate limits and quotas in `src/ingestion/upload_parser.py`, `src/ingestion/app.py`, and `src/agent/app.py` **before** archiving uploaded PDFs to Cloud Storage.
+  - Enforce rate limits and quotas in `src/ingest/upload_parser.py`, `src/query/routes.py`, and `src/agent/routes.py` **before** archiving uploaded PDFs to Cloud Storage.
 - [x] **Infrastructure Protection & Pre-Deploy Policy Gate (`infra/`, `scripts/`, `Makefile`):**
-  - **`infra/cloud_run.tf`:** Set `deletion_protection = var.environment == "prod"` on `ingestion_api`, `agent_api`, and `frontend`.
+  - **`infra/cloud_run.tf`:** Set `deletion_protection = var.environment == "prod"` on `ingest_api`, `agent_api`, and `frontend`.
   - **`scripts/check_static_policies.py` & `Makefile` (`policy-check`):** Automatically verify before `make plan` and `make deploy` that the live Organization Policy allows `REGION`, no Python or Terraform config uses `"global"` or multi-regions, fail-closed screening is enabled, production deletion protection is configured, and `terraform validate` succeeds.
 
 ---
@@ -157,7 +158,7 @@ To keep the governance layer practical, maintainable, and aligned with cloud sec
 ### Phase 5: Automated Compliance Test Suite & Documentation
 **Goal:** Continuously verify all compliance, residency, privacy, and policy guardrails offline before code reaches production.
 
-- [x] **`tests/compliance.py`:** Comprehensive offline `unittest` suite covering:
+- [x] **`tests/compliance.py` & `tests/helpers.py`:** Comprehensive offline `unittest` suite (using shared versioned GCS and LLM doubles from `tests/helpers.py`) covering:
   - Phase 1: Single-region validation, rejection of `"global"` and multi-regions, explicit regional binding on Vertex AI clients, Organization Policy evaluation, and single-source-of-truth model allowlists.
   - Phase 2: End-to-end `X-Request-Id` and `X-Cloud-Trace-Context` correlation across REST and SSE, Cloud Logging publication with graceful fallback, and zero plaintext query leakage across all loggers.
   - Phase 3: GDPR Art. 15 inventory and Art. 17 complete erasure across live and noncurrent Cloud Storage object versions, local caches, and conversation memory with strict multi-tenant isolation, plus EU AI Act Art. 50 provenance metadata across all guardrail states.

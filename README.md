@@ -64,18 +64,18 @@ InteractiveRAG organizes its backend into **4 modular Python packages** (`src/in
   — *Called in [`src/agent/routes.py`](src/agent/routes.py)*
 
 ### 4. Document Grounding & Inline Page Citations
-- **1-Indexed Page Number Normalization:** PDF parsers number pages starting at `0`, which causes off-by-one confusion when cited directly. Before returning passages to the language model, the retriever tool converts `0`-based page metadata into human-readable `1`-indexed page numbers (`p.1`, `p.2`, ...) and attaches the exact `source` filename and `page` number to each passage.  
-  — *Implemented in [`src/agent/tools.py`](src/agent/tools.py)*  
-  — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
+- **1-Indexed Page Number Normalization:** PDF parsers number pages starting at `0`, which causes off-by-one confusion when cited directly. Before returning passages to the language model, the retrieval guardrail formatter converts `0`-based page metadata into human-readable `1`-indexed page numbers (`p.1`, `p.2`, ...) and attaches the exact `source` filename and `page` number to each passage.  
+  — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
+  — *Called in [`src/agent/tools.py`](src/agent/tools.py)*
 - **Mandatory Document Grounding:** The system prompt enforces a strict grounding contract requiring the agent to call the retriever tool before answering factual questions and base every factual claim *exclusively* on the retrieved document passages rather than pretraining memory or assumptions.  
   — *Implemented in [`src/agent/graph.py`](src/agent/graph.py)*  
   — *Called in [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
 - **Explicit Abstention When Evidence Is Missing:** Whenever the retriever returns no matching chunks or the retrieved passages lack sufficient evidence to answer the question, the agent explicitly states that the answer cannot be found in the available documents rather than guessing.  
-  — *Implemented in [`src/agent/tools.py`](src/agent/tools.py) & [`src/agent/graph.py`](src/agent/graph.py)*  
-  — *Called in [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
+  — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py) & [`src/agent/graph.py`](src/agent/graph.py)*  
+  — *Called in [`src/agent/tools.py`](src/agent/tools.py), [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
 - **Inline `[source, p.X]` Page Citations:** Every factual statement in the assistant's answer must include an inline citation matching the exact `source` filename and `1`-indexed `page` number of the supporting passage (for example, `[annual_report.pdf, p.4]`) so users can verify every claim against the source PDF.  
-  — *Implemented in [`src/agent/tools.py`](src/agent/tools.py) & [`src/agent/graph.py`](src/agent/graph.py)*  
-  — *Called in [`src/core/compliance/provenance.py`](src/core/compliance/provenance.py)*
+  — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py) & [`src/agent/graph.py`](src/agent/graph.py)*  
+  — *Called in [`src/agent/tools.py`](src/agent/tools.py), [`src/core/compliance/provenance.py`](src/core/compliance/provenance.py) & [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*
 
 ---
 
@@ -139,10 +139,10 @@ Multiple users can sign in and use the cloud platform simultaneously—each pers
     — *Implemented in [`src/core/storage/paths.py`](src/core/storage/paths.py) & [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
     — *Called in [`src/ingest/service.py`](src/ingest/service.py), [`src/query/service.py`](src/query/service.py) & [`src/manage/collections.py`](src/manage/collections.py)*
   - **Isolated Per-Request PDF Upload Staging:** In cloud deployments, the ingestion service accepts only multipart file uploads (blocking requests that reference local server file paths). Uploaded PDFs are staged in an isolated per-request folder (`/tmp/uploads/{uid}/{request_id}`), archived to the user's private Cloud Storage prefix (`gs://<bucket>/users/{uid}/uploads/`), and deleted from local disk as soon as indexing finishes.  
-    — *Implemented in [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py) & [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py)*  
+    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py), [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py) & [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py)*  
     — *Called in [`src/ingest/routes.py`](src/ingest/routes.py)*
   - **Tenant-Namespaced Conversation Memory:** Every multi-turn chat thread is namespaced as `{uid}:{thread_id}` inside the in-memory LangGraph checkpointer so one user can never read, resume, or clear another user's conversation history.  
-    — *Implemented in [`src/agent/memory.py`](src/agent/memory.py)*  
+    — *Implemented in [`src/agent/memory.py`](src/agent/memory.py) & [`src/core/compliance/dsar.py`](src/core/compliance/dsar.py)*  
     — *Called in [`src/agent/routes.py`](src/agent/routes.py), [`src/agent/service.py`](src/agent/service.py) & [`src/manage/compliance.py`](src/manage/compliance.py)*
 
 - **1.4 Durable Cloud Storage $\leftrightarrow$ Container Memory Synchronization**
@@ -213,24 +213,24 @@ Every user question, retrieved document passage, and AI reply flows through a mu
     — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
     — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
   - **XML Spotlighting for Retrieved PDF Passages:** Because malicious instructions hidden inside a PDF could try to impersonate system commands, every retrieved document chunk is wrapped inside `<retrieved_chunk source="..." page="...">` tags with any internal `<` or `>` characters escaped first so a document can never break out of its quotation box, and the system prompt instructs Gemini to treat all chunk content strictly as untrusted reference data.  
-    — *Implemented in [`src/agent/tools.py`](src/agent/tools.py)*  
-    — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
-  - **Safe Collection Naming:** Collection names are validated against a strict alphanumeric pattern across all endpoints so attackers cannot smuggle prompt instructions into retriever tool descriptions via collection names.  
     — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
-    — *Called in [`src/ingest/schemas.py`](src/ingest/schemas.py), [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py), [`src/query/schemas.py`](src/query/schemas.py), [`src/agent/schemas.py`](src/agent/schemas.py) & [`src/manage/collections.py`](src/manage/collections.py)*
+    — *Called in [`src/agent/tools.py`](src/agent/tools.py) & [`src/agent/graph.py`](src/agent/graph.py)*
+  - **Safe Collection Naming:** Collection names are validated against a strict alphanumeric pattern across all endpoints and sanitized before binding to tool identifiers so attackers cannot smuggle prompt instructions into retriever tool descriptions via collection names.  
+    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
+    — *Called in [`src/ingest/schemas.py`](src/ingest/schemas.py), [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py), [`src/query/schemas.py`](src/query/schemas.py), [`src/agent/schemas.py`](src/agent/schemas.py), [`src/agent/tools.py`](src/agent/tools.py) & [`src/manage/collections.py`](src/manage/collections.py)*
 
 - **3.2 Pillar 2 — Model Access Controls**
   - **Server-Approved Model Catalogs:** Instead of allowing callers to request arbitrary Vertex AI models, the backend maintains curated allowlists of approved chat models (`gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-2.5-flash-lite`) and embedding models (`gemini-embedding-001`, `text-embedding-005`).  
     — *Provisioned in [`infra/cloud_run.tf`](infra/cloud_run.tf)*  
-    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*
+    — *Implemented in [`src/core/config.py`](src/core/config.py) & [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*
   - **Automatic Endpoint Validation:** Every ingestion, search, and chat request requires an explicit collection name, defaults to the primary approved model when omitted, and immediately rejects unapproved model names with `HTTP 422`.  
     — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
     — *Called in [`src/ingest/schemas.py`](src/ingest/schemas.py), [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py), [`src/query/schemas.py`](src/query/schemas.py) & [`src/agent/schemas.py`](src/agent/schemas.py)*
 
 - **3.3 Pillar 3 — AI & Ingestion Guardrails**
   - **Strict Document Grounding Guardrails:** The system prompt and retriever tool enforce anti-hallucination guardrails requiring the model to rely solely on `<retrieved_chunk>` evidence with 1-indexed `[filename.pdf, p.X]` citations and abstain whenever retrieved context is empty or insufficient.  
-    — *Implemented in [`src/agent/tools.py`](src/agent/tools.py) & [`src/agent/graph.py`](src/agent/graph.py)*  
-    — *Called in [`src/core/compliance/provenance.py`](src/core/compliance/provenance.py)*
+    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py), [`src/agent/tools.py`](src/agent/tools.py) & [`src/agent/graph.py`](src/agent/graph.py)*  
+    — *Called in [`src/core/compliance/provenance.py`](src/core/compliance/provenance.py) & [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*
   - **Query Length & Top-$k$ Search Bounds:** Request validators enforce maximum query text length (`4,000` characters) and similarity search result bounds (`k` between `1` and `50`).  
     — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
     — *Called in [`src/query/schemas.py`](src/query/schemas.py) & [`src/agent/schemas.py`](src/agent/schemas.py)*
@@ -238,7 +238,7 @@ Every user question, retrieved document passage, and AI reply flows through a mu
     — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
     — *Called in [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py) & [`src/ingest/splitter.py`](src/ingest/splitter.py)*
   - **Bounded Agent Retrieval Loops:** The agent's tool-calling loop is capped (`6` steps by default) so ambiguous questions cannot trigger endless retrieval cycles, returning a clean fallback message if the step limit is reached.  
-    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
+    — *Implemented in [`src/core/config.py`](src/core/config.py) & [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*  
     — *Called in [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
 
 - **3.4 Pillar 4 — Output Filtering & Sanitized Errors**
@@ -300,7 +300,7 @@ Enterprise governance controls ensure that all data and AI calls stay within app
     — *Called in [`src/manage/compliance.py`](src/manage/compliance.py) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*
   - **GDPR Art. 17 Right to Erasure (`DELETE /compliance/my-data`) & Storage Hygiene:** Users can permanently erase all of their data in one action—deleting every live and archived object version in Cloud Storage, wiping local vector and upload caches, and clearing all conversation history from agent memory—complemented by Cloud Storage lifecycle rules that automatically prune archived object versions after 7 days.  
     — *Provisioned in [`infra/storage.tf`](infra/storage.tf)*  
-    — *Implemented in [`src/core/compliance/dsar.py`](src/core/compliance/dsar.py) & [`src/agent/memory.py`](src/agent/memory.py)*  
+    — *Implemented in [`src/core/compliance/dsar.py`](src/core/compliance/dsar.py)*  
     — *Called in [`src/manage/compliance.py`](src/manage/compliance.py) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*
   - **EU AI Act Art. 50 AI Provenance & Transparency Badges:** Every `/agent` JSON response and `/agent/stream` SSE completion event includes structured provenance metadata and renders visual verification badges in the chat UI allowing the user to see:
     - **AI Generation, Model & Region:** Whether the reply was AI-generated or stopped by a guardrail, which exact **Gemini model** and **cloud region** produced it, and the correlating request ID.
@@ -430,11 +430,11 @@ InteractiveRAG/
 │   ├── core/                           # Shared authentication, storage, AI security, compliance & observability
 │   │   ├── ai_security/                # 5-pillar AI security package
 │   │   │   ├── armor.py                # Model Armor & Cloud DLP screening/redaction client
-│   │   │   ├── guardrails.py           # Collection/query validators & PDF upload guardrails
+│   │   │   ├── guardrails.py           # Model/query/upload guardrails, XML spotlighting & tool-name sanitization
 │   │   │   └── safety.py               # Gemini safety settings & refusal detection
 │   │   ├── compliance/                 # 4-pillar compliance & governance package
 │   │   │   ├── audit.py                # Structured JSON audit logger & SHA-256 query hashing
-│   │   │   ├── dsar.py                 # GDPR Art. 15 inventory & Art. 17 versioned erasure
+│   │   │   ├── dsar.py                 # GDPR Art. 15 inventory, Art. 17 versioned erasure & memory thread wiping
 │   │   │   ├── policy.py               # Per-user sliding-window rate limiters & collection quotas
 │   │   │   ├── provenance.py           # EU AI Act Art. 50 transparency & citation grounding metadata
 │   │   │   ├── residency.py            # Single-region GCP location validation
@@ -451,7 +451,7 @@ InteractiveRAG/
 │   │   │   └── paths.py                # Tenant-isolated path helpers & client cache release
 │   │   ├── app_factory.py              # Shared FastAPI app factory, CORS, middleware & /health
 │   │   ├── auth.py                     # Identity Platform / Firebase Bearer JWT verification
-│   │   ├── config.py                   # Approved model catalogs, /tmp caps, guardrail limits & settings
+│   │   ├── config.py                   # Single source of truth for all env vars, model catalogs, /tmp caps & limits
 │   │   ├── context.py                  # Shared RequestContext & RequestCorrelationMiddleware
 │   │   └── logger.py                   # Application logging setup
 │   ├── ingest/                         # Package 1: Dedicated Document Ingestion Service (Port 8000, `ingest-api`)
@@ -460,7 +460,7 @@ InteractiveRAG/
 │   │   ├── schemas.py                  # Validated IngestRequest model
 │   │   ├── service.py                  # Batched ChromaDB indexing inside distributed GCS write lock
 │   │   ├── splitter.py                 # PDF page loading & overlapping text chunking
-│   │   └── upload_parser.py            # Multipart PDF upload staging, quota & magic-byte checks
+│   │   └── upload_parser.py            # Multipart PDF upload staging, quota checks & guardrail delegation
 │   ├── manage/                         # Package 2: Collection Management & GDPR Self-Service (`agent-api`)
 │   │   ├── collections.py              # collections_router (`GET /collections` & `DELETE /collections/{collection_name}`)
 │   │   ├── compliance.py               # compliance_router (`GET /compliance/my-data` & `DELETE /compliance/my-data`)
@@ -473,11 +473,11 @@ InteractiveRAG/
 │   │   ├── app.py                      # FastAPI service mounting agent_router, query_router & manage_router
 │   │   ├── display.py                  # Terminal message formatting helpers
 │   │   ├── graph.py                    # Hardened StateGraph (input_guard -> model_call <-> tools -> output_guard)
-│   │   ├── memory.py                   # Tenant-isolated conversation checkpoint memory
+│   │   ├── memory.py                   # Tenant-namespaced InMemorySaver checkpointer (`MEMORY_SAVER`)
 │   │   ├── routes.py                   # agent_router (`POST /agent` & `POST /agent/stream`)
 │   │   ├── schemas.py                  # Validated AgentRequest, AgentResponse & AgentState schemas
 │   │   ├── service.py                  # Bounded recursion runner & live SSE event generator
-│   │   └── tools.py                    # XML-spotlighted retriever tool with 1-indexed citations
+│   │   └── tools.py                    # DLP-masked Chroma retriever tool delegating XML spotlighting to guardrails
 │   └── README.md                       # Backend package reference
 ├── frontend/                           # React + Vite web dashboard (Port 3000)
 │   ├── index.html                      # Loads runtime /env-config.js before the React bundle
@@ -509,6 +509,7 @@ InteractiveRAG/
 │   ├── OBSERVABILITY_PLAN.md           # Layer 5: Observability & AI Monitoring (4 Pillars)
 │   └── SCALABILITY_ELASTICITY_PLAN.md  # Layer 6: Scalability & Elasticity (6 Pillars)
 ├── tests/                              # Automated unit suites & live smoke scripts
+│   ├── helpers.py                      # Shared offline test doubles, fake GCS/LLM/embeddings & lifecycle utilities
 │   ├── auth.py                         # Token verification, tenant UID validation & bypass tests
 │   ├── storage.py                      # Per-user GCS sync, distributed lock & LRU cache tests
 │   ├── multi_tenant_api.py             # Cross-tenant isolation tests across REST & SSE APIs
@@ -537,23 +538,58 @@ gcloud auth application-default login
 
 Create a `.env` file in the project root:
 ```bash
+# GCP Project, Quota, Firebase & Single-Region Vertex AI Configuration
 GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
+GOOGLE_CLOUD_QUOTA_PROJECT="your-gcp-project-id"
 GOOGLE_CLOUD_LOCATION="us-central1"
+FIREBASE_PROJECT_ID="your-gcp-project-id"
 
-# Local development bypass (automatically ignored on Cloud Run when K_SERVICE is set):
+# Storage, Distributed Locks, /tmp Cache Quotas & CORS Configuration
+# GCS_BUCKET_NAME=""
+LOCAL_CHROMA_ROOT="/tmp/chroma_db"
+UPLOAD_TMP_ROOT="/tmp/uploads"
+ARCHIVE_UPLOADS_TO_GCS="true"
+CHROMA_LOCK_TTL_SECONDS="300"
+CHROMA_LOCK_TIMEOUT_SECONDS="60"
+CHROMA_TMP_MAX_BYTES="536870912"
+CHROMA_TMP_MIN_FREE_BYTES="268435456"
+# ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173"
+ANONYMIZED_TELEMETRY="FALSE"
+
+# AI Security: Model Armor, Cloud DLP & Gemini Safety Settings
+# MODEL_ARMOR_TEMPLATE_ID=""
+MODEL_ARMOR_LOCATION="us-central1"
+MODEL_ARMOR_FAIL_CLOSED="false"
+GEMINI_SAFETY_THRESHOLD="BLOCK_LOW_AND_ABOVE"
+
+# Approved Model Catalogs & Guardrail Ceilings
+ALLOWED_LLM_MODELS="gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite"
+ALLOWED_EMBEDDING_MODELS="gemini-embedding-001,text-embedding-005"
+MAX_UPLOAD_MB="20"
+MAX_FILES_PER_REQUEST="10"
+MAX_CHUNKS_PER_INGEST="1000"
+MAX_QUERY_CHARS="4000"
+AGENT_RECURSION_LIMIT="6"
+
+# Compliance & Governance: Structured Audit Logging, Rate Limits & Quotas
+AUDIT_LOG_NAME="interactiverag-audit"
+# AUDIT_CLOUD_LOGGING_ENABLED="true"
+RATE_LIMIT_INGEST_PER_MINUTE="10"
+RATE_LIMIT_QUERY_PER_MINUTE="30"
+MAX_COLLECTIONS_PER_USER="20"
+
+# Observability & AI Monitoring: Telemetry, Structured Logging & Cloud Trace
+TELEMETRY_LOG_NAME="interactiverag-telemetry"
+# TELEMETRY_CLOUD_LOGGING_ENABLED="true"
+# STRUCTURED_LOGGING="false"
+# CLOUD_TRACE_ENABLED="false"
+
+# Local Development, CLI & Auth Bypass Options (automatically ignored on Cloud Run when K_SERVICE is set):
+AGENT_CONSOLE_TRACE="false"
+UVICORN_RELOAD="false"
+# PORT="8000"
 AUTH_DISABLED="true"
 DEV_USER_ID="local-dev"
-
-# Optional AI security, rate-limit, quota & /tmp cache overrides (defaults shown):
-# ALLOWED_LLM_MODELS="gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite"
-# ALLOWED_EMBEDDING_MODELS="gemini-embedding-001,text-embedding-005"
-# GEMINI_SAFETY_THRESHOLD="BLOCK_LOW_AND_ABOVE"
-# MODEL_ARMOR_TEMPLATE_ID=""
-# RATE_LIMIT_INGEST_PER_MINUTE="10"
-# RATE_LIMIT_QUERY_PER_MINUTE="30"
-# MAX_COLLECTIONS_PER_USER="20"
-# CHROMA_TMP_MAX_BYTES="536870912"
-# CHROMA_TMP_MIN_FREE_BYTES="268435456"
 ```
 
 ### 2. Install Python Dependencies

@@ -69,31 +69,31 @@ To keep the deployment and persistence architecture cost-effective, fast, and re
 **Goal:** Package the frontend and backend services into production container images and define all Google Cloud resources reproducibly in Terraform.
 
 - [x] **Docker Packaging (`docker/` & `.dockerignore`):**
-  - **`docker/Dockerfile.backend`:** Build a single unified Python image able to run either the Ingestion service (`src.ingestion.app`) or the Agent service (`src.agent.app`).
+  - **`docker/Dockerfile.backend`:** Build a single unified Python image able to run either the Ingestion service (`src.ingest.app`) or the Agent service (`src.agent.app`).
   - **`docker/Dockerfile.frontend`, `docker/nginx.conf.template`, `docker/entrypoint-frontend.sh`:** Build the React application and serve it via Nginx, generating `/usr/share/nginx/html/env-config.js` (`window.__ENV__`) dynamically at container startup.
 - [x] **Terraform Modules (`infra/`):**
   - **`infra/versions.tf`, `infra/variables.tf`, `infra/apis.tf`, `infra/outputs.tf`:** Define provider versions, input variables, required Google Cloud APIs, and stack outputs.
   - **`infra/storage.tf`:** Provision a private, versioned Cloud Storage bucket (`uniform_bucket_level_access = true`, `public_access_prevention = "enforced"`) with lifecycle rules that prune old archived object versions.
   - **`infra/iam.tf`:** Provision a least-privilege backend runtime service account (`backend_sa`) with access only to the persistence bucket and Vertex AI models.
   - **`infra/auth.tf`:** Provision Google Cloud Identity Platform (Email/Password + optional Google OAuth via Secret Manager) and register a Firebase Web App + API key.
-  - **`infra/cloud_run.tf`:** Provision the three Cloud Run Gen2 services (`frontend`, `ingestion_api`, `agent_api`) with startup/liveness probes, session affinity on the agent service, and auto-wired environment variables.
+  - **`infra/cloud_run.tf`:** Provision the three Cloud Run Gen2 services (`frontend`, `ingest_api`, `agent_api`) with startup/liveness probes, session affinity on the agent service, and auto-wired environment variables.
 - [x] **Build & Deployment Automation (`Makefile` & `cloudbuild.yaml`):**
   - Provide `make bootstrap`, `make build-push`, `make plan`, `make deploy`, and `make outputs` commands supporting both local Terraform and Google Cloud Build execution.
 
 ---
 
-### Phase 2: Backend Authentication (`src/core/auth.py`)
+### Phase 2: Backend Authentication (`src/core/auth.py` & `src/core/config.py`)
 **Goal:** Verify user identity on every API request and prevent unauthorized or cross-tenant access.
 
-- [x] **Firebase Admin Token Verification (`src/core/auth.py`):**
+- [x] **Firebase Admin Token Verification (`src/core/auth.py` & `src/core/config.py`):**
   - Initialize the Firebase Admin SDK using Application Default Credentials and the configured Google Cloud project.
   - Implement the `get_current_user` FastAPI dependency to extract and validate the `Authorization: Bearer <ID_TOKEN>` header via `firebase_admin.auth.verify_id_token()`, returning `HTTP 401 Unauthorized` on missing, expired, or invalid tokens.
   - Validate that every extracted user ID (`uid`) conforms to a strict safe character pattern (`^[a-zA-Z0-9_-]{1,128}$`) so it can never be used for directory traversal.
-  - Support a local-development authentication bypass (`AUTH_DISABLED=true`) that is automatically ignored whenever the service runs inside Cloud Run (`K_SERVICE` set).
+  - Support a local-development authentication bypass (`AUTH_DISABLED=true`, checked via `is_local_auth_disabled()` and `get_dev_user_id()` in `src/core/config.py`) that is automatically ignored whenever the service runs inside Cloud Run (`K_SERVICE` set).
 
 ---
 
-### Phase 3: Per-User Cloud Storage ↔ ChromaDB Persistence (`src/core/storage/`)
+### Phase 3: Per-User Cloud Storage ↔ ChromaDB Persistence (`src/core/storage/` & `src/manage/`)
 **Goal:** Provide fast local ChromaDB reads and writes backed by durable, lock-protected per-user storage in Google Cloud Storage.
 
 - [x] **Isolated Tenant Paths & Client Cache (`src/core/storage/paths.py`):**
@@ -105,21 +105,21 @@ To keep the deployment and persistence architecture cost-effective, fast, and re
 - [x] **Distributed Locks & Local Cache Eviction (`src/core/storage/locks.py`):**
   - Implement `user_read_lock(uid)` and `user_write_lock(uid)` combining per-user in-process locks with an atomic Cloud Storage lock object (`if_generation_match=0` and automatic stale-lock TTL recovery).
   - Implement `evict_tmp_cache()` to remove the least-recently-used user cache directories from `/tmp` when free container memory drops below threshold.
-- [x] **Shared Collection Management Routes (`src/core/storage/chroma.py` & `src/core/storage/routes.py`):**
-  - Expose authenticated `GET /collections` and `DELETE /collections/{collection_name}` endpoints wired into both backend services via `src/core/app_factory.py`.
+- [x] **Collection Management Routes (`src/core/storage/chroma.py` & `src/manage/collections.py`):**
+  - Expose authenticated `GET /collections` and `DELETE /collections/{collection_name}` endpoints wired into `agent-api` via `src/manage/routes.py` and `src/core/app_factory.py`.
 
 ---
 
-### Phase 4: Multi-Tenant Backend Hardening (`src/ingestion/`, `src/agent/`, `src/core/`)
+### Phase 4: Multi-Tenant Backend Hardening (`src/ingest/`, `src/query/`, `src/agent/`, `src/core/`)
 **Goal:** Isolate every document upload, vector search, and agent conversation by authenticated user ID and harden server settings for production.
 
-- [x] **Isolated Document Ingestion & Vector Search (`src/ingestion/`):**
-  - Require `uid: str = Depends(get_current_user)` on `POST /ingest` and `POST /query` (`src/ingestion/app.py`).
-  - Block server-filesystem `pdf_paths` ingestion when running in Cloud Run (`src/ingestion/upload_parser.py`).
+- [x] **Isolated Document Ingestion & Vector Search (`src/ingest/` & `src/query/`):**
+  - Require `uid: str = Depends(get_current_user)` on `POST /ingest` (`src/ingest/routes.py`) and `POST /query` (`src/query/routes.py`).
+  - Block server-filesystem `pdf_paths` ingestion when running in Cloud Run via `validate_server_pdf_paths()` (`src/core/ai_security/guardrails.py` & `src/ingest/upload_parser.py`).
   - Stage multipart PDF uploads in a per-request directory (`/tmp/uploads/{uid}/{request_uuid}`), archive validated PDFs to Cloud Storage, and guarantee cleanup in a `finally` block.
 - [x] **Isolated Agent Chat & Conversation Memory (`src/agent/`):**
-  - Require `uid: str = Depends(get_current_user)` on `POST /agent` and `POST /agent/stream` (`src/agent/app.py`).
-  - Namespace all in-memory conversation threads by user ID (`scope_thread_id(uid, thread_id)` $\rightarrow$ `"{uid}:{thread_id}"` in `src/agent/memory.py` and `src/agent/service.py`) so users can never read or continue another user's conversation thread.
+  - Require `uid: str = Depends(get_current_user)` on `POST /agent` and `POST /agent/stream` (`src/agent/routes.py`).
+  - Namespace all in-memory conversation threads by user ID (`make_user_thread_id(uid, thread_id)` $\rightarrow$ `"{uid}:{thread_id}"` in `src/agent/memory.py`, `src/agent/routes.py`, and `src/agent/service.py`) so users can never read or continue another user's conversation thread.
 - [x] **Production Server & Streaming Configuration (`src/core/app_factory.py` & `src/core/config.py`):**
   - Provide unauthenticated `GET /health` endpoints for Cloud Run health probes.
   - Enforce explicit `ALLOWED_ORIGINS` CORS policies in Cloud Run rather than wildcard origins.

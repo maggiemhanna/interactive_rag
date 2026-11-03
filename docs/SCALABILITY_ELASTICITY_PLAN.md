@@ -240,7 +240,7 @@ Because several core scalability capabilities were already established in earlie
 
 - [x] **Create `src/manage/` (`collections.py`, `compliance.py`, `routes.py`, `__init__.py`):**
   - Define `collections_router` in `src/manage/collections.py` (`GET /collections` and `DELETE /collections/{collection_name}`).
-  - Define `compliance_router` in `src/manage/compliance.py` (`GET /compliance/my-data` and `DELETE /compliance/my-data`), inspecting and erasing both ChromaDB storage and in-memory LangGraph conversation checkpoints (`list_user_memory_threads`, `clear_user_memory`).
+  - Define `compliance_router` in `src/manage/compliance.py` (`GET /compliance/my-data` and `DELETE /compliance/my-data`), inspecting and erasing both ChromaDB storage and in-memory LangGraph conversation checkpoints (`list_user_memory_threads` and `clear_user_memory` in `src/core/compliance/dsar.py`, receiving `MEMORY_SAVER` from `src/agent/memory.py`).
   - Combine both routers into `manage_router` in `src/manage/routes.py`.
 - [x] **Create `src/query/` (`schemas.py`, `service.py`, `routes.py`, `__init__.py`):**
   - Define `QueryRequest` in `src/query/schemas.py`, `search_collection()` in `src/query/service.py`, and `query_router` (`POST /query`) in `src/query/routes.py`.
@@ -273,15 +273,15 @@ Because several core scalability capabilities were already established in earlie
 **Goal:** Eliminate redundant Cloud Storage file uploads during writes, add Cloud Monitoring scaling panels and saturation alerts, and verify all invariants offline.
 
 - [x] **Incremental MD5 Delta Push (`src/core/storage/gcs_sync.py`):**
-  - Implement `_compute_file_md5_b64(file_path)` and update `_push_user_dir_to_gcs(uid, user_dir)` to compare local file MD5 digests against existing Cloud Storage blob `md5_hash` values—uploading only new or modified files, deleting removed files, and recording `uploaded_files`, `skipped_files`, and `deleted_files` on the `storage.gcs_push` trace span.
+  - Implement `_compute_file_md5_base64(file_path)` and update `_push_user_dir_to_gcs(uid, user_dir)` to compare local file MD5 digests against existing Cloud Storage blob `md5_hash` values—uploading only new or modified files, deleting removed files, and recording `uploaded_files`, `skipped_files`, and `deleted_files` on the `storage.gcs_push` trace span.
 - [x] **Cloud Monitoring Scaling Dashboard Widgets (`infra/observability.tf`):**
   - Extend `google_monitoring_dashboard.interactiverag_observability` with Widgets 9–12 tracking active vs. idle container instances, `p95` CPU and memory (`/tmp`) utilization, `p95` concurrent requests per instance, and `p50`/`p95` end-to-end service request latencies.
 - [x] **Sustained Saturation & Latency Alert Policies (`infra/observability.tf`, `infra/variables.tf`):**
   - Provision `google_monitoring_alert_policy.agent_high_latency_alert`, `cloud_run_memory_saturation_alert`, and `cloud_run_5xx_error_rate_alert`.
 - [x] **Static Infrastructure & Scaling Policy Gate (`scripts/check_static_policies.py`):**
   - Extend `scripts/check_static_policies.py` to verify concurrency variables, `/24` subnet masks, `4Gi` ingestion memory, `/tmp` quota environment variables, and Cloud Monitoring alert policies.
-- [x] **Automated Scalability & Elasticity Unit Test Suite (`tests/scalability_elasticity.py`):**
-  - Add `tests/scalability_elasticity.py` to test the 4-package / 2-service split, shared rate limiter and cache behavior on `agent-api`, dynamic `/tmp` LRU cache eviction, incremental MD5 delta sync to Cloud Storage, and Terraform scaling policies offline.
+- [x] **Automated Scalability & Elasticity Unit Test Suite (`tests/scalability_elasticity.py` & `tests/helpers.py`):**
+  - Add `tests/scalability_elasticity.py` (backed by shared offline test doubles and synthetic repository utilities in `tests/helpers.py`) to test the 4-package / 2-service split, shared rate limiter and cache behavior on `agent-api`, dynamic `/tmp` LRU cache eviction, incremental MD5 delta sync to Cloud Storage, and Terraform scaling policies offline.
 
 ---
 

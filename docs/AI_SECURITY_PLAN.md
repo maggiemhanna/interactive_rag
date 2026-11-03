@@ -96,13 +96,13 @@ To provide comprehensive protection across the RAG pipeline while relying on man
 ---
 
 ### Phase 2: Centralized AI Security Package (`src/core/config.py` & `src/core/ai_security/`)
-**Goal:** Build a modular Python security package handling input/model validation, Gemini safety settings, and regional Model Armor / Cloud DLP screening.
+**Goal:** Build a modular Python security package handling input/model validation, PDF upload guardrails, XML spotlighting, Gemini safety settings, and regional Model Armor / Cloud DLP screening.
 
 - [x] **Runtime Security Configuration (`src/core/config.py` & `requirements.txt`):**
   - Add `google-cloud-modelarmor` to `requirements.txt`.
-  - Expose validated getters for approved LLM and embedding catalogs (`get_allowed_llm_models()`, `get_allowed_embedding_models()`), upload/query/chunk ceilings, recursion limits, Gemini safety thresholds, and Model Armor settings.
-- [x] **Guardrail Validators (`src/core/ai_security/guardrails.py`):**
-  - Implement `validate_collection_name()`, `validate_llm_model()`, `validate_embedding_model()`, `validate_query_text()`, `validate_file_count()`, `validate_chunk_count()`, and `get_bounded_recursion_limit()`.
+  - Centralize all environment variable resolution in `src/core/config.py`, exposing validated getters for approved LLM and embedding catalogs (`get_allowed_llm_models()`, `get_allowed_embedding_models()`), upload/query/chunk ceilings, recursion limits (`get_agent_recursion_limit()`), Gemini safety thresholds (`get_gemini_safety_threshold()`), and Model Armor settings (`get_model_armor_template_id()`, `get_model_armor_location()`, `is_model_armor_fail_closed()`).
+- [x] **Guardrail Validators & XML Spotlighting (`src/core/ai_security/guardrails.py`):**
+  - Implement `validate_collection_name()`, `safe_tool_name()`, `validate_llm_model()`, `validate_embedding_model()`, `validate_query_text()`, `validate_file_count()`, `validate_chunk_count()`, `sanitize_filename()`, `validate_pdf_bytes()`, `validate_server_pdf_paths()`, and XML spotlighting helpers (`EMPTY_RETRIEVAL_MARKER`, `format_retrieved_chunks()`).
 - [x] **Content Safety Helpers (`src/core/ai_security/safety.py`):**
   - Implement `get_gemini_safety_settings()`, `is_safety_blocked()`, and standardized user-facing refusal and error messages (`PROMPT_BLOCKED_MESSAGE`, `SAFETY_REFUSAL_MESSAGE`, `RECURSION_LIMIT_MESSAGE`, `INTERNAL_ERROR_MESSAGE`, `SCREENING_UNAVAILABLE_MESSAGE`).
 - [x] **Model Armor & Cloud DLP Client (`src/core/ai_security/armor.py`):**
@@ -110,24 +110,24 @@ To provide comprehensive protection across the RAG pipeline while relying on man
 
 ---
 
-### Phase 3: Ingestion Guardrails, Upload Ceilings & Retrieval Redaction (`src/ingestion/` & `src/core/storage/`)
+### Phase 3: Ingestion Guardrails, Upload Ceilings & Retrieval Redaction (`src/ingest/`, `src/query/`, `src/manage/`)
 **Goal:** Validate all inputs and file uploads before indexing, mask PII in direct similarity searches, and sanitize server errors.
 
-- [x] **Request Schema Validation (`src/ingestion/schemas.py`, `src/agent/schemas.py`, `src/core/storage/routes.py`):**
-  - Enforce `collection_name`, `query`, `model_name`, and `embedding_model` validators across `/ingest`, `/query`, `/agent`, `/agent/stream`, and `DELETE /collections/{collection_name}`.
-- [x] **Multipart Upload Validation & Chunk Ceilings (`src/ingestion/upload_parser.py` & `src/ingestion/splitter.py`):**
-  - Verify non-empty files, `%PDF-` magic header bytes, `MAX_UPLOAD_MB` (`HTTP 413`), `MAX_FILES_PER_REQUEST` (`HTTP 400`), and `MAX_CHUNKS_PER_INGEST` (`HTTP 400`).
-- [x] **Sanitized Vector Search & Error Handling (`src/ingestion/service.py` & `src/ingestion/app.py`):**
+- [x] **Request Schema Validation (`src/ingest/schemas.py`, `src/query/schemas.py`, `src/agent/schemas.py`, `src/manage/collections.py`):**
+  - Enforce `collection_name`, `query`, `k`, `model_name`, and `embedding_model` validators directly via `src/core/ai_security/guardrails.py` across `/ingest`, `/query`, `/agent`, `/agent/stream`, and `DELETE /collections/{collection_name}`.
+- [x] **Multipart Upload Validation & Chunk Ceilings (`src/ingest/upload_parser.py`, `src/ingest/splitter.py`, `src/core/ai_security/guardrails.py`):**
+  - Verify non-empty files, `%PDF-` magic header bytes (`validate_pdf_bytes()`), `MAX_UPLOAD_MB` (`HTTP 413`), filename sanitization (`sanitize_filename()`), server path restrictions (`validate_server_pdf_paths()`), `MAX_FILES_PER_REQUEST` (`validate_file_count()`, `HTTP 400`), and `MAX_CHUNKS_PER_INGEST` (`validate_chunk_count()`, `HTTP 400`).
+- [x] **Sanitized Vector Search & Error Handling (`src/query/service.py`, `src/query/routes.py`, `src/ingest/routes.py`):**
   - Run `sanitize_retrieved_documents()` on passages returned by `POST /query` so direct similarity search results also have PII masked.
   - Replace raw exception strings in `HTTP 500` responses with `INTERNAL_ERROR_MESSAGE`.
 
 ---
 
-### Phase 4: XML Spotlighting, Grounding, Citations & Agent Guard Nodes (`src/agent/`)
+### Phase 4: XML Spotlighting, Grounding, Citations & Agent Guard Nodes (`src/agent/` & `src/core/ai_security/`)
 **Goal:** Wrap retrieved passages in escaped XML tags, enforce grounded answers with 1-indexed page citations, and wire `input_guard` and `output_guard` nodes into the LangGraph agent.
 
-- [x] **Spotlighting Retriever Tool (`src/agent/tools.py`):**
-  - Build a custom `@tool` (`retrieve_documents`) that masks retrieved chunks via `sanitize_retrieved_documents()`, converts page numbers to 1-indexed values, escapes `<` and `>` characters inside chunk text, and wraps each passage in `<retrieved_chunk rank="..." source="..." page="...">...</retrieved_chunk>`.
+- [x] **Spotlighting Retriever Tool (`src/agent/tools.py` & `src/core/ai_security/guardrails.py`):**
+  - Build a custom `@tool` (`get_retriever_tool()`) that sanitizes the tool identifier via `safe_tool_name()`, masks retrieved chunks via `sanitize_retrieved_documents()`, and delegates 1-indexed page normalization, `<` / `>` tag-breakout escaping, and `<retrieved_chunk rank="..." source="..." page="...">...</retrieved_chunk>` wrapping to `format_retrieved_chunks()` in `src/core/ai_security/guardrails.py`.
 - [x] **Hardened LangGraph Pipeline (`src/agent/graph.py`):**
   - Wire the graph topology as `START -> input_guard -> model_call <-> tools -> output_guard -> END`:
     - **`input_guard`:** Validates query length and screens the prompt with `screen_user_prompt()`; if blocked, short-circuits directly to `END` with a refusal message.
@@ -136,21 +136,21 @@ To provide comprehensive protection across the RAG pipeline while relying on man
 
 ---
 
-### Phase 5: Streaming Redaction, Recursion Limits & Sanitized Errors (`src/agent/service.py` & `src/agent/app.py`)
+### Phase 5: Streaming Redaction, Recursion Limits & Sanitized Errors (`src/agent/service.py` & `src/agent/routes.py`)
 **Goal:** Ensure live SSE streams enforce recursion caps, emit only post-`output_guard` redacted messages, and never leak internal stack traces.
 
-- [x] **Bounded & Redacted Streaming (`src/agent/service.py` & `src/agent/app.py`):**
-  - Pass `recursion_limit = get_bounded_recursion_limit()` in `RunnableConfig` for both standard and streaming invocations.
+- [x] **Bounded & Redacted Streaming (`src/agent/service.py` & `src/agent/routes.py`):**
+  - Pass `recursion_limit = get_agent_recursion_limit()` in `RunnableConfig` for both standard and streaming invocations.
   - Catch `GraphRecursionError` cleanly and return `RECURSION_LIMIT_MESSAGE`.
   - Buffer candidate assistant replies until `output_guard` completes so SSE clients receive only the sanitized, DLP-redacted response.
   - Sanitize all unexpected `HTTP 500` and SSE error frames with `INTERNAL_ERROR_MESSAGE`.
 
 ---
 
-### Phase 6: Automated AI Security Test Suite (`tests/ai_security.py`)
+### Phase 6: Automated AI Security Test Suite (`tests/ai_security.py` & `tests/helpers.py`)
 **Goal:** Verify all five AI security pillars offline with deterministic unit and integration tests.
 
-- [x] **`tests/ai_security.py`:** Offline `unittest` suite covering:
+- [x] **`tests/ai_security.py` & `tests/helpers.py`:** Offline `unittest` suite (backed by shared test doubles and Model Armor response builders in `tests/helpers.py`) covering:
   - Approved vs. unapproved LLM and embedding model validation across all endpoints.
   - Rejection of malicious `collection_name` strings across `/ingest`, `/query`, `/agent`, and `/collections`.
   - XML spotlighting formatting, 1-indexed page citations, and `</retrieved_chunk>` tag-breakout escaping.

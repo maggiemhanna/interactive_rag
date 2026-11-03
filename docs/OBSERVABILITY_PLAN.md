@@ -112,21 +112,21 @@ A common question is: *If we already generate an `X-Request-Id` on every call, w
 **Goal:** Record hierarchical spans and millisecond timings across Cloud Storage synchronization, PDF ingestion, vector search, and every LangGraph agent node.
 
 - [x] **Span Tracer (`src/core/observability/tracing.py`):**
-  - Implement `start_span(name, stage=None, **attributes)` context manager that generates a 16-character hex `span_id`, links to the parent `active_span_id` on `RequestContext`, measures duration via `time.perf_counter()`, records the completed span and stage latency via `record_span()` in `src/core/observability/state.py`, and optionally exports spans to **Google Cloud Trace** when `CLOUD_TRACE_ENABLED="true"`.
-- [x] **Pipeline Instrumentation (`src/core/storage/`, `src/ingestion/`, `src/agent/`):**
+  - Implement `start_span(name, stage=None, **attributes)` context manager that generates a 16-character hex `span_id`, links to the parent `active_span_id` on `RequestContext`, measures duration via `time.perf_counter()`, records the completed span and stage latency via `record_span()` in `src/core/observability/state.py`, and optionally exports spans to **Google Cloud Trace** when `CLOUD_TRACE_ENABLED="true"` (`is_cloud_trace_enabled()` in `src/core/config.py`).
+- [x] **Pipeline Instrumentation (`src/core/storage/`, `src/ingest/`, `src/query/`, `src/agent/`):**
   - **`src/core/storage/gcs_sync.py`:** Instrument Cloud Storage download/upload sync (`stage="gcs_sync"`).
-  - **`src/ingestion/splitter.py` & `src/ingestion/service.py`:** Instrument PDF splitting (`stage="chunking"`), batched Chroma indexing (`stage="embedding"`), and vector search (`stage="retrieval"`).
+  - **`src/ingest/splitter.py`, `src/ingest/service.py` & `src/query/service.py`:** Instrument PDF splitting (`stage="chunking"`), batched Chroma indexing (`stage="embedding"`), and vector search (`stage="retrieval"`).
   - **`src/agent/graph.py` & `src/agent/tools.py`:** Instrument `input_guard` (`stage="input_guard"`), `model_call` (`stage="llm"`), retriever tool execution (`stage="retrieval"`), and `output_guard` (`stage="output_guard"`).
 
 ---
 
-### Phase 4: AI-Specific Monitoring & `interactiverag-telemetry` Stream (`src/core/observability/telemetry.py`, `src/agent/`, `src/ingestion/`)
+### Phase 4: AI-Specific Monitoring & `interactiverag-telemetry` Stream (`src/core/observability/telemetry.py`, `src/agent/`, `src/query/`, `src/ingest/`)
 **Goal:** Capture per-turn latency breakdowns, streaming TTFT, Gemini token usage, and retrieval/grounding quality signals, and publish them as structured events to `interactiverag-telemetry`.
 
-- [x] **AI Telemetry Helpers & `interactiverag-telemetry` Publisher (`src/core/observability/telemetry.py`):**
+- [x] **AI Telemetry Helpers & `interactiverag-telemetry` Publisher (`src/core/observability/telemetry.py` & `src/core/config.py`):**
   - Implement `record_llm_usage(response)` in `src/agent/graph.py` (`model_call`) to extract `input_tokens`, `output_tokens`, and `total_tokens` from `AIMessage.usage_metadata` and accumulate them across multi-step tool calls via `record_token_usage()` in `src/core/observability/state.py`.
-  - Implement `record_retrieval_metrics(docs_with_scores)` in `src/agent/tools.py` and `src/ingestion/service.py` to capture `top_similarity_score`, `mean_similarity_score`, retrieved passage counts, and tool call counts via `src/core/observability/state.py`.
-  - Implement `emit_telemetry_event(event_type, **fields)` reading accumulated state from `src/core/observability/state.py` and publishing one structured AI/performance JSON record per completed request (`document.ingest`, `vectorstore.query`, `agent.query`) to `projects/<project>/logs/interactiverag-telemetry` (`TELEMETRY_LOG_NAME`), enriched with `total_latency_ms`, `ttft_ms`, `stage_latency_ms`, `span_count`, `input_tokens`, `output_tokens`, `total_tokens`, `llm_calls`, `tool_calls_count`, `retrieved_passages`, `top_similarity_score`, `mean_similarity_score`, `citation_count`, and `grounded`.
+  - Implement `record_retrieval_metrics(docs_with_scores)` in `src/agent/tools.py` and `src/query/service.py` to capture `top_similarity_score`, `mean_similarity_score`, retrieved passage counts, and tool call counts via `src/core/observability/state.py`.
+  - Implement `emit_telemetry_event(event_type, **fields)` reading accumulated state from `src/core/observability/state.py`, reusing `extract_citations()` from `src/core/compliance/provenance.py`, and publishing one structured AI/performance JSON record per completed request (`document.ingest`, `vectorstore.query`, `agent.query`) to `projects/<project>/logs/interactiverag-telemetry` (`get_telemetry_log_name()` / `is_telemetry_cloud_logging_enabled()` in `src/core/config.py`), enriched with `total_latency_ms`, `ttft_ms`, `stage_latency_ms`, `span_count`, `input_tokens`, `output_tokens`, `total_tokens`, `llm_calls`, `tool_calls_count`, `retrieved_passages`, `top_similarity_score`, `mean_similarity_score`, `citation_count`, and `grounded`.
 
 ---
 
@@ -135,13 +135,13 @@ A common question is: *If we already generate an `X-Request-Id` on every call, w
 
 - [x] **Terraform Observability Infrastructure (`infra/observability.tf`, `infra/apis.tf`, `infra/iam.tf`, `infra/cloud_run.tf`, `infra/outputs.tf`):**
   - **`infra/apis.tf` & `infra/iam.tf`:** Enable `monitoring.googleapis.com` and `cloudtrace.googleapis.com`; grant `roles/monitoring.metricWriter` and `roles/cloudtrace.agent` to `backend_sa`.
-  - **`infra/cloud_run.tf`:** Set `TELEMETRY_LOG_NAME = "interactiverag-telemetry"`, `STRUCTURED_LOGGING = "true"`, and `CLOUD_TRACE_ENABLED = "true"` on `ingestion_api` and `agent_api`.
+  - **`infra/cloud_run.tf`:** Set `TELEMETRY_LOG_NAME = "interactiverag-telemetry"`, `STRUCTURED_LOGGING = "true"`, and `CLOUD_TRACE_ENABLED = "true"` on `ingest_api` and `agent_api`.
   - **`infra/observability.tf`:**
     - Provision a regional Cloud Logging bucket (`google_logging_project_bucket_config.observability_telemetry`) pinned to `var.region` (30-day default retention, with single-region precondition).
     - Provision a log sink (`google_logging_project_sink.observability_sink`) routing `interactiverag-telemetry` and Cloud Run `stdout`/`stderr` container logs into the regional `observability_telemetry` bucket.
     - Provision `google_logging_metric` resources over `interactiverag-telemetry` (`agent_turn_latency_ms`, `agent_ttft_ms`, `agent_llm_stage_latency_ms`, `agent_retrieval_stage_latency_ms`, `agent_input_tokens`, `agent_output_tokens`, `agent_total_tokens`, `retrieval_mean_similarity_score`, `agent_ungrounded_answers`, `ingestion_chunks_added`) and a unified 8-widget `google_monitoring_dashboard`.
-- [x] **Automated Offline Test Suite (`tests/observability.py`) & Documentation (`README.md`):**
-  - Verify `src/core/context.py` request isolation, structured JSON log formatting and query scrubbing, hierarchical span timings across LangGraph nodes, multi-turn token accumulation, similarity score tracking, SSE `ttft_ms`, and `interactiverag-telemetry` event emission.
+- [x] **Automated Offline Test Suite (`tests/observability.py` & `tests/helpers.py`) & Documentation (`README.md`):**
+  - Verify `src/core/context.py` request isolation, structured JSON log formatting and query scrubbing, hierarchical span timings across LangGraph nodes, multi-turn token accumulation, similarity score tracking, SSE `ttft_ms`, and `interactiverag-telemetry` event emission using shared offline doubles in `tests/helpers.py`.
 
 ---
 
