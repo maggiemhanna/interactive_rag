@@ -31,7 +31,7 @@ def export_my_data_inventory(uid: str = Depends(get_current_user)) -> Dict[str, 
         uid: Verified tenant user identifier injected by `get_current_user`.
 
     Returns:
-        JSON inventory dictionary containing collection counts, passages, GCS object counts, and memory threads.
+        JSON inventory dictionary containing collection counts, chunks, GCS object counts, and memory threads.
     """
     try:
         inventory = get_user_data_inventory(uid, checkpointer=MEMORY_SAVER)
@@ -40,7 +40,7 @@ def export_my_data_inventory(uid: str = Depends(get_current_user)) -> Dict[str, 
             "dsar.export_inventory",
             uid=uid,
             collection_count=inventory["collection_count"],
-            total_passages=inventory["total_passages"],
+            total_chunks=inventory["total_chunks"],
             uploaded_pdf_count=inventory["uploaded_pdf_count"],
             gcs_live_object_count=inventory["gcs_live_object_count"],
             gcs_noncurrent_version_count=inventory["gcs_noncurrent_version_count"],

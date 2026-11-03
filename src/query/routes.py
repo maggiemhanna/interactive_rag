@@ -39,7 +39,7 @@ def query(
         uid: Verified tenant user identifier injected by `get_current_user`.
 
     Returns:
-        JSON response containing sanitized passage `results` and `results_count`.
+        JSON response containing sanitized chunk `results` and `results_count`.
     """
     try:
         enforce_query_rate_limit(uid)

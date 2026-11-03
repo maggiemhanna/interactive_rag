@@ -31,7 +31,7 @@ def get_collections(uid: str = Depends(get_current_user)) -> Dict[str, Any]:
         uid: Verified tenant user identifier injected by `get_current_user`.
 
     Returns:
-        JSON payload with `'collections'` names and `'details'` per-collection passage counts.
+        JSON payload with `'collections'` names and `'details'` per-collection chunk counts.
     """
     try:
         with user_read_lock(uid) as persist_directory:

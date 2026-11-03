@@ -358,7 +358,7 @@ resource "google_logging_metric" "agent_total_tokens" {
 resource "google_logging_metric" "retrieval_mean_similarity_score" {
   project         = var.project_id
   name            = "${var.app_name}/retrieval_mean_similarity_score"
-  description     = "Normalized mean ChromaDB vector similarity score (0.0 to 1.0) of retrieved passages."
+  description     = "Normalized mean ChromaDB vector similarity score (0.0 to 1.0) of retrieved chunks."
   filter          = "logName=\"projects/${var.project_id}/logs/interactiverag-telemetry\" AND (jsonPayload.event_type=\"agent.query\" OR jsonPayload.event_type=\"vectorstore.query\") AND jsonPayload.mean_similarity_score > 0"
   value_extractor = "EXTRACT(jsonPayload.mean_similarity_score)"
 

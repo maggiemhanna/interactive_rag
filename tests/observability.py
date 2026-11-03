@@ -787,7 +787,7 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
                 query_tel = [e for e in telemetry_events if e["event_type"] == "vectorstore.query"]
                 self.assertEqual(len(query_tel), 1)
                 self.assertEqual(query_tel[0]["request_id"], "req-obs-query-001")
-                self.assertEqual(query_tel[0]["retrieved_passages"], 1)
+                self.assertEqual(query_tel[0]["retrieved_chunks"], 1)
                 self.assertIsNotNone(query_tel[0]["top_similarity_score"])
                 self.assertIsNotNone(query_tel[0]["mean_similarity_score"])
                 self.assertIn("retrieval_ms", query_tel[0]["stage_latency_ms"])
@@ -821,7 +821,7 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
                 self.assertEqual(rec["total_tokens"], 575)
                 self.assertEqual(rec["llm_calls"], 2)
                 self.assertEqual(rec["tool_calls_count"], 1)
-                self.assertEqual(rec["retrieved_passages"], 1)
+                self.assertEqual(rec["retrieved_chunks"], 1)
                 self.assertIsNotNone(rec["top_similarity_score"])
                 self.assertIsNotNone(rec["mean_similarity_score"])
                 self.assertTrue(rec["grounded"])

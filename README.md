@@ -5,7 +5,7 @@
 Instead of combining unrelated documents into a single shared database, InteractiveRAG gives every signed-in user an isolated workspace where they can organize PDFs into domain-specific vector collections (for example, separating annual financial reports from clinical research). Through the web dashboard or REST APIs, users can:
 
 - **Ingest PDF Documents (`POST /ingest`)**: Upload PDF documents that are parsed page-by-page, split into overlapping text chunks, converted into vector embeddings using Vertex AI, and indexed into a named vector collection.
-- **Run Direct Semantic Search (`POST /query`)**: Perform top-$k$ similarity searches scoped strictly to a selected collection to inspect relevant document passages, similarity scores, and page numbers directly.
+- **Run Direct Semantic Search (`POST /query`)**: Perform top-$k$ similarity searches scoped strictly to a selected collection to inspect relevant document chunks, similarity scores, and page numbers directly.
 - **Chat with a Grounded AI Agent (`POST /agent`, `POST /agent/stream`)**: Ask questions in a multi-turn conversation with a stateful LangGraph agent that dynamically queries the user's chosen collection, grounds every factual statement in retrieved evidence with inline `[filename.pdf, p.X]` citations, and streams each workflow step in real time over Server-Sent Events (SSE).
 - **Manage Document Collections (`GET /collections`, `DELETE /collections/{collection_name}`)**: List all vector collections in the user's workspace along with their indexed chunk counts, or delete a collection when it is no longer needed.
 - **Exercise Self-Service Privacy Controls (`GET /compliance/my-data`, `DELETE /compliance/my-data`)**: Export a complete inventory of stored collections, uploaded PDFs, storage bytes, and active conversation threads, or permanently erase all personal data—including live and archived Cloud Storage object versions, local vector caches, and conversation memory—in a single action.
@@ -25,7 +25,7 @@ InteractiveRAG organizes its backend into **4 modular Python packages** (`src/in
 - **Page-Aware PDF Extraction (`PyPDFLoader`):** Staged PDFs are loaded page-by-page using `PyPDFLoader`, preserving the source document filename (`source`) and page index (`page`) on every extracted page.  
   — *Implemented in [`src/ingest/splitter.py`](src/ingest/splitter.py)*  
   — *Called in [`src/ingest/service.py`](src/ingest/service.py)*
-- **Overlapping Recursive Text Chunking (`RecursiveCharacterTextSplitter`):** Extracted pages are split into `1,000`-character passages with a `200`-character sliding overlap along paragraph and sentence boundaries so key facts or tables at chunk boundaries are never cut in half.  
+- **Overlapping Recursive Text Chunking (`RecursiveCharacterTextSplitter`):** Extracted pages are split into `1,000`-character chunks with a `200`-character sliding overlap along paragraph and sentence boundaries so key facts or tables at chunk boundaries are never cut in half.  
   — *Implemented in [`src/ingest/splitter.py`](src/ingest/splitter.py)*  
   — *Called in [`src/ingest/service.py`](src/ingest/service.py)*
 - **Sequential Batched Vector Indexing:** Extracted text chunks are embedded and written into the target ChromaDB collection sequentially in batches of `100` chunks per operation so multi-PDF uploads are indexed reliably.  
@@ -39,7 +39,7 @@ InteractiveRAG organizes its backend into **4 modular Python packages** (`src/in
 - **Domain-Scoped Named Collections:** Instead of pooling all uploaded files into a single flat vector index (which degrades retrieval accuracy when documents cover different topics), documents are organized into separate named **ChromaDB** collections (for example, separating financial reports from clinical studies) that can be listed or deleted independently.  
   — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
   — *Called in [`src/ingest/service.py`](src/ingest/service.py), [`src/query/service.py`](src/query/service.py) & [`src/manage/collections.py`](src/manage/collections.py)*
-- **ChromaDB SQLite Metadata & HNSW Vector Index Storage:** Each collection persists its passage text and page metadata in a SQLite catalog paired with a Hierarchical Navigable Small World (HNSW) approximate nearest-neighbor vector index for fast similarity lookups.  
+- **ChromaDB SQLite Metadata & HNSW Vector Index Storage:** Each collection persists its chunk text and page metadata in a SQLite catalog paired with a Hierarchical Navigable Small World (HNSW) approximate nearest-neighbor vector index for fast similarity lookups.  
   — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
   — *Called in [`src/ingest/service.py`](src/ingest/service.py) & [`src/query/service.py`](src/query/service.py)*
 - **Collection-Targeted Search & Agent Retrieval:** Every similarity search (`POST /query`) and agent conversation (`POST /agent`, `POST /agent/stream`) targets one explicitly chosen collection at a time to keep retrieval focused and free of cross-topic noise.  
@@ -50,30 +50,30 @@ InteractiveRAG organizes its backend into **4 modular Python packages** (`src/in
 - **Why Agentic RAG Instead of Fixed Single-Shot Retrieval:** Traditional RAG pipelines run a single similarity search using the user's raw prompt, which often struggles with conversational follow-up questions, multi-part questions, or queries that require rephrasing search terms. InteractiveRAG uses **LangGraph** to orchestrate a stateful, cyclic tool-calling workflow powered by **Vertex AI Gemini** (`gemini-2.5-flash`, `gemini-2.5-pro`, or `gemini-2.5-flash-lite` at `temperature=0` for deterministic, factual responses).  
   — *Implemented in [`src/agent/graph.py`](src/agent/graph.py)*  
   — *Called in [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
-- **Dynamic Collection-Scoped Retriever Tool:** On each request, the backend builds a structured retriever tool (retrieving the top-$k=5$ most relevant passages per call) bound strictly to the user's selected collection.  
+- **Dynamic Collection-Scoped Retriever Tool:** On each request, the backend builds a structured retriever tool (retrieving the top-$k=5$ most relevant chunks per call) bound strictly to the user's selected collection.  
   — *Implemented in [`src/agent/tools.py`](src/agent/tools.py)*  
   — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
-- **Iterative Query Formulation & Multi-Step Search:** Gemini autonomously decides when to call the retriever tool, formulates targeted search queries based on the conversation history, inspects the returned passages, and can perform additional search steps with refined queries if the initial passages are insufficient before synthesizing its final answer.  
+- **Iterative Query Formulation & Multi-Step Search:** Gemini autonomously decides when to call the retriever tool, formulates targeted search queries based on the conversation history, inspects the returned chunks, and can perform additional search steps with refined queries if the initial chunks are insufficient before synthesizing its final answer.  
   — *Implemented in [`src/agent/graph.py`](src/agent/graph.py)*  
   — *Called in [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
 - **Multi-Turn Conversation Memory (`InMemorySaver`):** Conversation history is persisted across turns using an in-memory LangGraph checkpointer keyed by conversation thread so users can ask natural follow-up questions without repeating earlier context.  
   — *Implemented in [`src/agent/memory.py`](src/agent/memory.py)*  
   — *Called in [`src/agent/graph.py`](src/agent/graph.py), [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
-- **Real-Time Step-by-Step SSE Event Streaming:** During execution, the streaming engine deduplicates graph state transitions and streams each completed workflow step—retriever tool invocations, retrieved evidence passages, and the final AI answer—in real time over Server-Sent Events (SSE).  
+- **Real-Time Step-by-Step SSE Event Streaming:** During execution, the streaming engine deduplicates graph state transitions and streams each completed workflow step—retriever tool invocations, retrieved evidence chunks, and the final AI answer—in real time over Server-Sent Events (SSE).  
   — *Implemented in [`src/agent/service.py`](src/agent/service.py)*  
   — *Called in [`src/agent/routes.py`](src/agent/routes.py)*
 
 ### 4. Document Grounding & Inline Page Citations
-- **1-Indexed Page Number Normalization:** PDF parsers number pages starting at `0`, which causes off-by-one confusion when cited directly. Before returning passages to the language model, the retrieval guardrail formatter converts `0`-based page metadata into human-readable `1`-indexed page numbers (`p.1`, `p.2`, ...) and attaches the exact `source` filename and `page` number to each passage.  
+- **1-Indexed Page Number Normalization:** PDF parsers number pages starting at `0`, which causes off-by-one confusion when cited directly. Before returning chunks to the language model, the retrieval guardrail formatter converts `0`-based page metadata into human-readable `1`-indexed page numbers (`p.1`, `p.2`, ...) and attaches the exact `source` filename and `page` number to each chunk.  
   — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
   — *Called in [`src/agent/tools.py`](src/agent/tools.py)*
-- **Mandatory Document Grounding:** The system prompt enforces a strict grounding contract requiring the agent to call the retriever tool before answering factual questions and base every factual claim *exclusively* on the retrieved document passages rather than pretraining memory or assumptions.  
+- **Mandatory Document Grounding:** The system prompt enforces a strict grounding contract requiring the agent to call the retriever tool before answering factual questions and base every factual claim *exclusively* on the retrieved document chunks rather than pretraining memory or assumptions.  
   — *Implemented in [`src/agent/graph.py`](src/agent/graph.py)*  
   — *Called in [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
-- **Explicit Abstention When Evidence Is Missing:** Whenever the retriever returns no matching chunks or the retrieved passages lack sufficient evidence to answer the question, the agent explicitly states that the answer cannot be found in the available documents rather than guessing.  
+- **Explicit Abstention When Evidence Is Missing:** Whenever the retriever returns no matching chunks or the retrieved chunks lack sufficient evidence to answer the question, the agent explicitly states that the answer cannot be found in the available documents rather than guessing.  
   — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py) & [`src/agent/graph.py`](src/agent/graph.py)*  
   — *Called in [`src/agent/tools.py`](src/agent/tools.py), [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
-- **Inline `[source, p.X]` Page Citations:** Every factual statement in the assistant's answer must include an inline citation matching the exact `source` filename and `1`-indexed `page` number of the supporting passage (for example, `[annual_report.pdf, p.4]`) so users can verify every claim against the source PDF.  
+- **Inline `[source, p.X]` Page Citations:** Every factual statement in the assistant's answer must include an inline citation matching the exact `source` filename and `1`-indexed `page` number of the supporting chunk (for example, `[annual_report.pdf, p.4]`) so users can verify every claim against the source PDF.  
   — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py) & [`src/agent/graph.py`](src/agent/graph.py)*  
   — *Called in [`src/agent/tools.py`](src/agent/tools.py), [`src/core/compliance/provenance.py`](src/core/compliance/provenance.py) & [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*
 
@@ -205,14 +205,14 @@ All external user traffic enters through a single HTTPS Load Balancer, while bac
 
 ### 3. AI-Specific Security — 5 Pillars ([`docs/AI_SECURITY_PLAN.md`](docs/AI_SECURITY_PLAN.md))
 
-Every user question, retrieved document passage, and AI reply flows through a multi-stage security pipeline (prompt screening, iterative retrieval and reasoning, and output screening) organized around five pillars:
+Every user question, retrieved document chunk, and AI reply flows through a multi-stage security pipeline (prompt screening, iterative retrieval and reasoning, and output screening) organized around five pillars:
 
 - **3.1 Pillar 1 — Prompt Injection Mitigation**
   - **Front-Door Prompt Screening:** Before calling Gemini, the agent's input screening stage sends the user's question to **Google Cloud Model Armor** to detect prompt-injection attempts, jailbreaks, and malicious links. Unsafe prompts are blocked immediately with a polite refusal without spending LLM tokens.  
     — *Provisioned in [`infra/ai_security.tf`](infra/ai_security.tf)*  
     — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
     — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
-  - **XML Spotlighting for Retrieved PDF Passages:** Because malicious instructions hidden inside a PDF could try to impersonate system commands, every retrieved document chunk is wrapped inside `<retrieved_chunk source="..." page="...">` tags with any internal `<` or `>` characters escaped first so a document can never break out of its quotation box, and the system prompt instructs Gemini to treat all chunk content strictly as untrusted reference data.  
+  - **XML Spotlighting for Retrieved PDF Chunks:** Because malicious instructions hidden inside a PDF could try to impersonate system commands, every retrieved document chunk is wrapped inside `<retrieved_chunk source="..." page="...">` tags with any internal `<` or `>` characters escaped first so a document can never break out of its quotation box, and the system prompt instructs Gemini to treat all chunk content strictly as untrusted reference data.  
     — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
     — *Called in [`src/agent/tools.py`](src/agent/tools.py) & [`src/agent/graph.py`](src/agent/graph.py)*
   - **Safe Collection Naming:** Collection names are validated against a strict alphanumeric pattern across all endpoints and sanitized before binding to tool identifiers so attackers cannot smuggle prompt instructions into retriever tool descriptions via collection names.  
@@ -245,7 +245,7 @@ Every user question, retrieved document passage, and AI reply flows through a mu
   - **Automated PII & Secret Redaction Templates:** Terraform provisions **Google Cloud Sensitive Data Protection (Cloud DLP)** inspection and de-identification templates wired into **Model Armor** to automatically mask emails, phone numbers, credit card numbers, US Social Security numbers, IBAN codes, API keys, and auth tokens with `[INFO_TYPE]` placeholders (such as `[EMAIL_ADDRESS]`).  
     — *Provisioned in [`infra/ai_security.tf`](infra/ai_security.tf)*  
     — *Called in [`infra/cloud_run.tf`](infra/cloud_run.tf)*
-  - **Two-Stage Redaction Across Search, JSON & Live Streaming:** Sensitive data is masked both when document passages are retrieved from ChromaDB (protecting direct `/query` searches and retriever tool traces) and again on the final AI answer in the output screening stage before responses are returned or streamed over SSE.  
+  - **Two-Stage Redaction Across Search, JSON & Live Streaming:** Sensitive data is masked both when document chunks are retrieved from ChromaDB (protecting direct `/query` searches and retriever tool traces) and again on the final AI answer in the output screening stage before responses are returned or streamed over SSE.  
     — *Provisioned in [`infra/ai_security.tf`](infra/ai_security.tf)*  
     — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
     — *Called in [`src/query/service.py`](src/query/service.py), [`src/agent/tools.py`](src/agent/tools.py), [`src/agent/graph.py`](src/agent/graph.py) & [`src/agent/service.py`](src/agent/service.py)*
@@ -295,7 +295,7 @@ Enterprise governance controls ensure that all data and AI calls stay within app
     — *Provisioned in [`infra/compliance.tf`](infra/compliance.tf)*
 
 - **4.3 Pillar 3 — Regulatory Compliance (GDPR Self-Service Rights & EU AI Act Art. 50 Provenance)**
-  - **GDPR Art. 15 Right of Access (`GET /compliance/my-data`):** Authenticated users can view a complete inventory of their stored collections, passage counts, uploaded PDF filenames, live and archived Cloud Storage object counts, total storage bytes, and active chat threads via the API or the **"My Data & Privacy"** modal in the web interface.  
+  - **GDPR Art. 15 Right of Access (`GET /compliance/my-data`):** Authenticated users can view a complete inventory of their stored collections, chunk counts, uploaded PDF filenames, live and archived Cloud Storage object counts, total storage bytes, and active chat threads via the API or the **"My Data & Privacy"** modal in the web interface.  
     — *Implemented in [`src/core/compliance/dsar.py`](src/core/compliance/dsar.py)*  
     — *Called in [`src/manage/compliance.py`](src/manage/compliance.py) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*
   - **GDPR Art. 17 Right to Erasure (`DELETE /compliance/my-data`) & Storage Hygiene:** Users can permanently erase all of their data in one action—deleting every live and archived object version in Cloud Storage, wiping local vector and upload caches, and clearing all conversation history from agent memory—complemented by Cloud Storage lifecycle rules that automatically prune archived object versions after 7 days.  
@@ -304,7 +304,7 @@ Enterprise governance controls ensure that all data and AI calls stay within app
     — *Called in [`src/manage/compliance.py`](src/manage/compliance.py) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*
   - **EU AI Act Art. 50 AI Provenance & Transparency Badges:** Every `/agent` JSON response and `/agent/stream` SSE completion event includes structured provenance metadata and renders visual verification badges in the chat UI allowing the user to see:
     - **AI Generation, Model & Region:** Whether the reply was AI-generated or stopped by a guardrail, which exact **Gemini model** and **cloud region** produced it, and the correlating request ID.
-    - **Citation Grounding:** Whether document grounding was enforced, whether the answer is backed by inline `[filename.pdf, p.X]` citations, and how many passages were retrieved.
+    - **Citation Grounding:** Whether document grounding was enforced, whether the answer is backed by inline `[filename.pdf, p.X]` citations, and how many chunks were retrieved.
     - **PII Redaction & Content Safety Activation:** Whether sensitive personal data (PII) was detected and redacted, whether Model Armor screening was active, which security filters ran, and whether any content safety or prompt-protection guardrails were triggered.  
     — *Implemented in [`src/core/compliance/provenance.py`](src/core/compliance/provenance.py) & [`src/core/compliance/state.py`](src/core/compliance/state.py)*  
     — *Called in [`src/agent/schemas.py`](src/agent/schemas.py), [`src/agent/routes.py`](src/agent/routes.py), [`src/agent/service.py`](src/agent/service.py) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*
@@ -371,7 +371,7 @@ While compliance audit logging records *who* performed *what* action and *when* 
   - **Multi-Step Gemini Token Accounting:** Because an agent turn may invoke Gemini multiple times across iterative tool-calling steps, the backend extracts prompt, completion, and total token counts from each model call and aggregates total token usage and LLM call counts across the entire conversation turn for accurate cost tracking.  
     — *Implemented in [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*  
     — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
-  - **Deterministic Retrieval & Grounding Quality Signals:** Every search and agent turn records normalized vector similarity scores (top and average match quality), the number of retriever tool calls and passages fetched, the number of inline `[filename.pdf, p.X]` citations produced, and whether the final answer was properly grounded—providing continuous retrieval quality signals without paying for extra LLM-as-a-judge calls.  
+  - **Deterministic Retrieval & Grounding Quality Signals:** Every search and agent turn records normalized vector similarity scores (top and average match quality), the number of retriever tool calls and chunks fetched, the number of inline `[filename.pdf, p.X]` citations produced, and whether the final answer was properly grounded—providing continuous retrieval quality signals without paying for extra LLM-as-a-judge calls.  
     — *Implemented in [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*  
     — *Called in [`src/agent/tools.py`](src/agent/tools.py), [`src/query/service.py`](src/query/service.py), [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
 
@@ -409,7 +409,7 @@ InteractiveRAG combines workload-isolated microservice packaging with horizontal
     — *Called in [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py)*
 
 - **6.3 API Throughput, Incremental Storage Sync & Scaling Observability**
-  - **Parallel Retrieval-Time Privacy Screening:** When a similarity search or agent tool call retrieves top-$k$ passages from ChromaDB, the backend screens all retrieved passages for sensitive personal data concurrently across a bounded pool of up to `8` worker threads (`1` passage per thread) instead of scanning them one after another—cutting retrieval-stage screening latency to the duration of a single passage scan.  
+  - **Parallel Retrieval-Time Privacy Screening:** When a similarity search or agent tool call retrieves top-$k$ chunks from ChromaDB, the backend screens all retrieved chunks for sensitive personal data concurrently across a bounded pool of up to `8` worker threads (`1` chunk per thread) instead of scanning them one after another—cutting retrieval-stage screening latency to the duration of a single chunk scan.  
     — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
     — *Called in [`src/query/service.py`](src/query/service.py) & [`src/agent/tools.py`](src/agent/tools.py)*
   - **Incremental MD5 Cloud Storage Delta Synchronization:** When pushing updated ChromaDB files back to Cloud Storage after an upload or collection deletion, the backend compares local file MD5 checksums against remote Cloud Storage object metadata and uploads only new or modified files, avoiding redundant multi-megabyte uploads as user vector databases grow.  
@@ -718,5 +718,5 @@ curl -s "http://localhost:8001/compliance/my-data" | python3 -m json.tool
 ### 4. Interactive Web Dashboard Workflow
 1. Open **http://localhost:3000** (or your deployed `https://<LB-IP-with-dashes>.sslip.io` URL and sign in via **Identity Platform**).
 2. **Ingest PDFs**: Upload one or more PDF files into a named collection using an approved embedding model.
-3. **Manage Collections & Privacy**: View your isolated collections and passage counts, delete collections you no longer need, or open **"My Data & Privacy"** to inspect your full data footprint or erase all account data.
+3. **Manage Collections & Privacy**: View your isolated collections and chunk counts, delete collections you no longer need, or open **"My Data & Privacy"** to inspect your full data footprint or erase all account data.
 4. **Chat & Verify Provenance Badges**: Select an approved Gemini model and ask questions in the chat panel to watch real-time retriever tool calls, grounded `[filename.pdf, p.X]` citations, DLP-filtered responses, and EU AI Act transparency badges.

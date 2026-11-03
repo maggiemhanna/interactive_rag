@@ -83,7 +83,7 @@ def similarity_search_with_scores(
     Args:
         vectorstore: Initialized `Chroma` vectorstore (or retriever-compatible mock).
         query: Validated search query string.
-        k: Maximum number of passages to retrieve.
+        k: Maximum number of chunks to retrieve.
 
     Returns:
         Tuple of `(docs, scored_items)` where `docs` is `List[Document]` and `scored_items`

@@ -1,9 +1,9 @@
 """XML-spotlighted and Cloud DLP-sanitized LangChain retriever tool builder.
 
 Constructs a Gemini-compatible `StructuredTool` over a tenant's Chroma collection that:
-1. Retrieves top-`k` passages via similarity search.
+1. Retrieves top-`k` chunks via similarity search.
 2. Masks sensitive PII/secrets concurrently through Cloud Model Armor + Cloud DLP.
-3. Records retrieved passage counts on the active request context for EU AI Act grounding provenance.
+3. Records retrieved chunk counts on the active request context for EU AI Act grounding provenance.
 4. Encloses untrusted document text inside `<retrieved_chunk source="..." page="...">` XML tags
    with angle-bracket escaping to prevent indirect prompt injection tag breakout.
 """
@@ -36,7 +36,7 @@ class RetrieverInput(BaseModel):
 
     query: str = Field(
         ...,
-        description="Search query used to retrieve relevant passages from the document collection.",
+        description="Search query used to retrieve relevant chunks from the document collection.",
     )
 
 
@@ -47,7 +47,7 @@ def get_retriever_tool(
     embedding_model: Optional[str] = None,
     description: str = (
         "Search and retrieve relevant document chunks from collection '{collection_name}'. "
-        "Passages are returned inside <retrieved_chunk source=\"...\" page=\"...\"> XML tags."
+        "Chunks are returned inside <retrieved_chunk source=\"...\" page=\"...\"> XML tags."
     ),
 ) -> StructuredTool:
     """Loads a Chroma collection and creates an XML-spotlighted LangChain `StructuredTool`.

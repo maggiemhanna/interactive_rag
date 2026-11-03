@@ -340,7 +340,7 @@ def format_retrieved_chunks(docs: Sequence[Document]) -> str:
         docs: Sequence of sanitized LangChain `Document` chunks.
 
     Returns:
-        XML-spotlighted passage string, or `EMPTY_RETRIEVAL_MARKER` when `docs` is empty.
+        XML-spotlighted chunk string, or `EMPTY_RETRIEVAL_MARKER` when `docs` is empty.
     """
     if not docs:
         return EMPTY_RETRIEVAL_MARKER

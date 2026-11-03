@@ -3,7 +3,7 @@
 Captures per-turn stage latency breakdowns, streaming Time-To-First-Token (`ttft_ms`),
 Vertex AI Gemini token consumption (`input_tokens`, `output_tokens`, `total_tokens`, `llm_calls`),
 and retrieval/grounding quality signals (`top_similarity_score`, `mean_similarity_score`,
-`retrieved_passages`, `tool_calls_count`, `citation_count`, `grounded`), publishing one
+`retrieved_chunks`, `tool_calls_count`, `citation_count`, `grounded`), publishing one
 structured JSON record per completed request to `interactiverag-telemetry`.
 """
 
@@ -218,7 +218,7 @@ def emit_telemetry_event(
     Automatically enriches the record with `request_id`, `trace_id`, `span_id`, `service`,
     `region`, `total_latency_ms`, `ttft_ms`, `stage_latency_ms`, `span_count`, `spans`,
     token usage (`input_tokens`, `output_tokens`, `total_tokens`, `llm_calls`), and
-    retrieval quality metrics (`tool_calls_count`, `retrieved_passages`,
+    retrieval quality metrics (`tool_calls_count`, `retrieved_chunks`,
     `top_similarity_score`, `mean_similarity_score`) from `src.core.observability.state`.
 
     Args:
@@ -284,7 +284,7 @@ def emit_telemetry_event(
         record["tool_calls_count"] = get_tool_calls_count()
 
     if is_agent_or_query or get_retrieved_chunks_count() > 0 or scores["top_similarity_score"] is not None:
-        record["retrieved_passages"] = get_retrieved_chunks_count()
+        record["retrieved_chunks"] = get_retrieved_chunks_count()
         record["top_similarity_score"] = scores["top_similarity_score"]
         record["mean_similarity_score"] = scores["mean_similarity_score"]
 

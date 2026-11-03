@@ -858,7 +858,7 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         self.assertEqual(inv["region"], "us-central1")
         self.assertEqual(inv["storage_backend"], "gcs")
         self.assertEqual(inv["collection_count"], 1)
-        self.assertEqual(inv["total_passages"], 2)
+        self.assertEqual(inv["total_chunks"], 2)
         self.assertEqual(inv["uploaded_pdf_count"], 2)
         self.assertEqual(
             [p["filename"] for p in inv["uploaded_pdfs"]],
@@ -961,7 +961,7 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
                 "grounding_enforced": True,
                 "grounded": True,
                 "citation_count": 1,
-                "retrieved_passages": 1,
+                "retrieved_chunks": 1,
                 "pii_filtered": False,
                 "model_armor_active": False,
                 "filters_checked": [],
@@ -1002,7 +1002,7 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         self.assertTrue(sse_comp["grounding_enforced"])
         self.assertTrue(sse_comp["grounded"])
         self.assertEqual(sse_comp["citation_count"], 1)
-        self.assertEqual(sse_comp["retrieved_passages"], 1)
+        self.assertEqual(sse_comp["retrieved_chunks"], 1)
         self.assertTrue(sse_comp["pii_filtered"])
         self.assertTrue(sse_comp["model_armor_active"])
         self.assertEqual(

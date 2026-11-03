@@ -35,7 +35,7 @@ def search_collection(
         uid: Verified tenant user identifier.
         query: Validated user search query string.
         collection_name: Validated Chroma collection identifier.
-        k: Number of top matching passages to retrieve (`1..50`).
+        k: Number of top matching chunks to retrieve (`1..50`).
         embedding_model: Optional approved Vertex AI embedding model identifier.
 
     Returns:

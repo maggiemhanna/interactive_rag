@@ -69,7 +69,7 @@ def record_retrieval_scores(scores: Sequence[float]) -> None:
     """Appends normalized vector similarity scores (`0.0` to `1.0`) to the active request context.
 
     Args:
-        scores: Sequence of similarity scores returned for retrieved document passages.
+        scores: Sequence of similarity scores returned for retrieved document chunks.
     """
     ctx = get_request_context()
     if ctx is None or not scores:

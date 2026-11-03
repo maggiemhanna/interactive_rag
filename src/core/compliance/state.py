@@ -143,10 +143,10 @@ def get_guardrail_actions() -> List[Dict[str, Any]]:
 
 
 def record_retrieved_chunks(count: int) -> None:
-    """Accumulates the number of vectorstore passages retrieved during the active request.
+    """Accumulates the number of vectorstore chunks retrieved during the active request.
 
     Args:
-        count: Number of passages returned by a retriever tool invocation.
+        count: Number of chunks returned by a retriever tool invocation.
     """
     ctx = get_request_context()
     if ctx is not None and count > 0:
@@ -155,7 +155,7 @@ def record_retrieved_chunks(count: int) -> None:
 
 
 def get_retrieved_chunks_count() -> int:
-    """Returns the total number of passages retrieved during the active request."""
+    """Returns the total number of chunks retrieved during the active request."""
     ctx = get_request_context()
     if ctx is None:
         return 0

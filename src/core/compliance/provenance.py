@@ -1,6 +1,6 @@
 """EU AI Act Art. 50 AI transparency, citation grounding, and Model Armor provenance (Pillar 4: Compliance & Governance).
 
-Evaluates final agent responses against retrieved document passages, counts inline `[source, p.X]`
+Evaluates final agent responses against retrieved document chunks, counts inline `[source, p.X]`
 citations, and packages machine-readable provenance metadata (`ComplianceMetadata`) for JSON
 (`POST /agent`) and SSE (`POST /agent/stream`) responses.
 """
@@ -59,7 +59,7 @@ def has_thread_retrieved_chunks(
     scoped_thread_id: Optional[str] = None,
     checkpointer: Any = None,
 ) -> bool:
-    """Checks whether XML-spotlighted `<retrieved_chunk>` passages exist in the turn or thread memory.
+    """Checks whether XML-spotlighted `<retrieved_chunk>` chunks exist in the turn or thread memory.
 
     Args:
         messages: Optional sequence of serialized message dicts emitted during the current turn.
@@ -129,15 +129,15 @@ class ComplianceMetadata(BaseModel):
     )
     grounded: bool = Field(
         default=False,
-        description="True when the answer cites retrieved document passages and was not blocked by guardrails",
+        description="True when the answer cites retrieved document chunks and was not blocked by guardrails",
     )
     citation_count: int = Field(
         default=0,
         description="Number of inline document page citations present in the final answer",
     )
-    retrieved_passages: int = Field(
+    retrieved_chunks: int = Field(
         default=0,
-        description="Number of vectorstore passages retrieved during this turn",
+        description="Number of vectorstore chunks retrieved during this turn",
     )
     pii_filtered: bool = Field(
         default=False,
@@ -179,9 +179,9 @@ def build_compliance_metadata(
     """
     raw_actions = get_guardrail_actions()
     was_blocked = any(item.get("action") == "blocked" for item in raw_actions)
-    retrieved_passages = get_retrieved_chunks_count()
+    retrieved_chunks = get_retrieved_chunks_count()
     citation_count = 0 if was_blocked else count_inline_citations(answer)
-    has_evidence = (retrieved_passages > 0) or has_thread_retrieved_chunks(
+    has_evidence = (retrieved_chunks > 0) or has_thread_retrieved_chunks(
         messages=messages,
         scoped_thread_id=scoped_thread_id,
         checkpointer=checkpointer,
@@ -196,7 +196,7 @@ def build_compliance_metadata(
         grounding_enforced=True,
         grounded=grounded,
         citation_count=citation_count,
-        retrieved_passages=retrieved_passages,
+        retrieved_chunks=retrieved_chunks,
         pii_filtered=was_pii_filtered(),
         model_armor_active=armor_active,
         filters_checked=list(MODEL_ARMOR_DEFAULT_FILTERS) if armor_active else [],

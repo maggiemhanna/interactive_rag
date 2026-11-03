@@ -3,7 +3,7 @@
 Implements tenant-scoped Data Subject Access Request (DSAR) storage and memory operations:
 - `list_user_memory_threads(uid, checkpointer)`: Enumerates user-scoped `{uid}:*` conversation threads in `checkpointer`.
 - `clear_user_memory(uid, checkpointer)`: Purges all `{uid}:*` conversation checkpoints, writes, and blobs from `checkpointer`.
-- `get_user_data_inventory(uid, checkpointer)`: Enumerates collections, passage counts, archived PDF uploads,
+- `get_user_data_inventory(uid, checkpointer)`: Enumerates collections, chunk counts, archived PDF uploads,
   live and noncurrent GCS object generations, disk/cloud byte totals, and active memory thread count.
 - `purge_all_user_data(uid, checkpointer)`: Acquires the user's distributed GCS write lock, wipes local
   `/tmp/chroma_db/{uid}` and `/tmp/uploads/{uid}` directories, permanently deletes every live and
@@ -161,7 +161,7 @@ def get_user_data_inventory(uid: str, checkpointer: Optional[Any] = None) -> Dic
         checkpointer: Optional LangGraph checkpointer (`InMemorySaver`) to count user memory threads.
 
     Returns:
-        Structured inventory dictionary detailing collections, total passages, archived PDF
+        Structured inventory dictionary detailing collections, total chunks, archived PDF
         filenames/timestamps, live vs. noncurrent GCS object counts, storage byte totals,
         and active conversation memory thread count.
     """
@@ -177,7 +177,7 @@ def get_user_data_inventory(uid: str, checkpointer: Optional[Any] = None) -> Dic
             for item in raw_details
             if isinstance(item, dict) and item.get("name")
         ]
-        total_passages = sum(item["count"] for item in collections)
+        total_chunks = sum(item["count"] for item in collections)
         local_chroma_bytes = directory_size_bytes(persist_directory)
 
     local_uploads_bytes = directory_size_bytes(get_upload_user_dir(safe_uid))
@@ -235,7 +235,7 @@ def get_user_data_inventory(uid: str, checkpointer: Optional[Any] = None) -> Dic
         "storage_backend": "gcs" if bucket_name else "local",
         "gcs_bucket": bucket_name or None,
         "collection_count": len(collections),
-        "total_passages": total_passages,
+        "total_chunks": total_chunks,
         "collections": collections,
         "uploaded_pdf_count": len(uploaded_pdfs),
         "uploaded_pdfs": uploaded_pdfs,

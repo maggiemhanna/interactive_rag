@@ -1151,7 +1151,7 @@ function describeLiveAgentStep(events, endpointMode, turnNumber) {
       stage:
         totalChunks > 0
           ? `Writing answer using ${totalChunks} matching ${
-              totalChunks === 1 ? 'passage' : 'passages'
+              totalChunks === 1 ? 'chunk' : 'chunks'
             }…`
           : 'Writing your answer…',
       detail: latestToolQuery ? `Searched for: "${latestToolQuery}"` : '',
@@ -1187,10 +1187,10 @@ function parseTurnSteps(turn, turnNumber) {
         .filter(Boolean);
       pendingQueries = queries.length > 0 ? queries : ['Document lookup'];
     } else if (t === 'tool' || t === 'function') {
-      const passages = parseRetrievedChunksXml(evt.content);
+      const chunks = parseRetrievedChunksXml(evt.content);
       searchRounds.push({
         queries: pendingQueries.length > 0 ? [...pendingQueries] : [],
-        passages,
+        chunks,
         rawContent: evt.content || '',
       });
       pendingQueries = [];
@@ -1201,7 +1201,7 @@ function parseTurnSteps(turn, turnNumber) {
   if (pendingQueries.length > 0) {
     searchRounds.push({
       queries: [...pendingQueries],
-      passages: null, // pending
+      chunks: null, // pending
       rawContent: '',
     });
   }
@@ -1359,10 +1359,10 @@ function AgentComplianceFooter({ turn, groundingEvents = [] }) {
   }
 
   const groundingTitle = isGrounded
-    ? 'Answer is grounded in retrieved document passages with inline page citations'
+    ? 'Answer is grounded in retrieved document chunks with inline page citations'
     : wasBlocked
       ? 'Blocked by safety/security guardrails before grounded output'
-      : 'Response does not contain inline citations to retrieved document passages';
+      : 'Response does not contain inline citations to retrieved document chunks';
 
   return (
     <div
@@ -1441,7 +1441,7 @@ function TurnStepsTimelineCard({
   turn,
   turnIndex,
   allPriorEvents,
-  defaultExpandPassages = true,
+  defaultExpandChunks = true,
   onBackToChat,
 }) {
   const [expandedRounds, setExpandedRounds] = useState({});
@@ -1458,7 +1458,7 @@ function TurnStepsTimelineCard({
       : null;
 
   const isRoundExpanded = (rIdx) =>
-    expandedRounds[rIdx] !== undefined ? expandedRounds[rIdx] : defaultExpandPassages;
+    expandedRounds[rIdx] !== undefined ? expandedRounds[rIdx] : defaultExpandChunks;
 
   const toggleRound = (rIdx) => {
     setExpandedRounds((prev) => ({
@@ -1502,12 +1502,12 @@ function TurnStepsTimelineCard({
           </div>
         </div>
 
-        {/* Step 2..N: Search Rounds & Matched Passages */}
+        {/* Step 2..N: Search Rounds & Matched Chunks */}
         {searchRounds.map((round, rIdx) => {
           const primaryQuery = round.queries[0] || turn.query || '';
           const highlightTerms = extractQueryTerms(primaryQuery);
           const expanded = isRoundExpanded(rIdx);
-          const passageCount = Array.isArray(round.passages) ? round.passages.length : 0;
+          const chunkCount = Array.isArray(round.chunks) ? round.chunks.length : 0;
 
           return (
             <React.Fragment key={`round-${rIdx}`}>
@@ -1534,21 +1534,21 @@ function TurnStepsTimelineCard({
                 </div>
               )}
 
-              {round.passages !== null && (
+              {round.chunks !== null && (
                 <div className="step-node">
-                  <div className="step-node-indicator passages">
+                  <div className="step-node-indicator chunks">
                     <BookOpen size={14} />
                   </div>
                   <div className="step-node-body">
-                    <div className="step-passages-header-row">
+                    <div className="step-chunks-header-row">
                       <div className="step-node-label" style={{ margin: 0 }}>
-                        {passageCount > 0
-                          ? `Matched ${passageCount} ${
-                              passageCount === 1 ? 'Passage' : 'Passages'
+                        {chunkCount > 0
+                          ? `Matched ${chunkCount} ${
+                              chunkCount === 1 ? 'Chunk' : 'Chunks'
                             }`
-                          : 'No Matching Passages Found'}
+                          : 'No Matching Chunks Found'}
                       </div>
-                      {passageCount > 0 && (
+                      {chunkCount > 0 && (
                         <button
                           type="button"
                           className="step-collapse-btn"
@@ -1557,30 +1557,30 @@ function TurnStepsTimelineCard({
                           {expanded ? (
                             <>
                               <ChevronUp size={13} />
-                              <span>Hide passages</span>
+                              <span>Hide chunks</span>
                             </>
                           ) : (
                             <>
                               <ChevronDown size={13} />
-                              <span>Show {passageCount} passages</span>
+                              <span>Show {chunkCount} chunks</span>
                             </>
                           )}
                         </button>
                       )}
                     </div>
 
-                    {passageCount > 0 && expanded && (
-                      <div className="step-passages-grid">
-                        {round.passages.map((chunk, cIdx) => {
+                    {chunkCount > 0 && expanded && (
+                      <div className="step-chunks-grid">
+                        {round.chunks.map((chunk, cIdx) => {
                           const wordCount = (chunk.content || '').trim()
                             ? chunk.content.trim().split(/\s+/).length
                             : 0;
                           return (
-                            <div key={cIdx} className="step-passage-card">
-                              <div className="step-passage-card-header">
-                                <div className="step-passage-card-left">
-                                  <span className="step-passage-index">
-                                    Passage #{cIdx + 1}
+                            <div key={cIdx} className="step-chunk-card">
+                              <div className="step-chunk-card-header">
+                                <div className="step-chunk-card-left">
+                                  <span className="step-chunk-index">
+                                    Chunk #{cIdx + 1}
                                   </span>
                                   <span className="result-stats-pill">
                                     {wordCount} words
@@ -1659,7 +1659,7 @@ function TurnStepsTimelineCard({
               </>
             ) : (
               <>
-                <div className="step-passages-header-row">
+                <div className="step-chunks-header-row">
                   <div className="step-node-label" style={{ margin: 0 }}>
                     Answer Ready
                   </div>
@@ -1750,7 +1750,7 @@ function AgentSearchStepsView({
         <h3 className="agent-empty-title">No Search Steps Yet</h3>
         <p className="agent-empty-desc">
           Ask a question in <strong>Chat</strong> first — then toggle here anytime to see
-          the exact search phrases and document passages used to write each answer.
+          the exact search phrases and document chunks used to write each answer.
         </p>
         <button
           type="button"
@@ -1904,7 +1904,7 @@ function AgentSearchStepsView({
                 turn={turn}
                 turnIndex={idx}
                 allPriorEvents={priorEventsReversed}
-                defaultExpandPassages={
+                defaultExpandChunks={
                   resolvedFilter !== 'all' || idx === turns.length - 1
                 }
                 onBackToChat={onBackToChat}
@@ -1930,7 +1930,7 @@ function ConversationTurnCard({
   const [copied, setCopied] = useState(false);
 
   const turnEvents = Array.isArray(turn.events) ? turn.events : [];
-  // Prioritize passages retrieved in the current turn, falling back to earlier turns in this conversation
+  // Prioritize chunks retrieved in the current turn, falling back to earlier turns in this conversation
   const priorEventsReversed = [...priorTurns]
     .reverse()
     .flatMap((t) => (Array.isArray(t.events) ? t.events : []));
@@ -1975,15 +1975,15 @@ function ConversationTurnCard({
                 type="button"
                 className="agent-grounding-badge clickable"
                 onClick={() => onOpenSteps && onOpenSteps(turn.id)}
-                title="Click to inspect the search steps and matched passages"
+                title="Click to inspect the search steps and matched chunks"
               >
                 <span>
                   {retrievalStats.chunksCount}{' '}
-                  {retrievalStats.chunksCount === 1 ? 'passage' : 'passages'} used
+                  {retrievalStats.chunksCount === 1 ? 'chunk' : 'chunks'} used
                 </span>
               </button>
             ) : retrievalStats.toolCallsCount > 0 && turn.status === 'done' ? (
-              <span className="agent-grounding-badge muted">No matching passages</span>
+              <span className="agent-grounding-badge muted">No matching chunks</span>
             ) : turnIndex > 0 && turn.status === 'done' ? (
               <span
                 className="agent-grounding-badge memory"
@@ -2226,7 +2226,7 @@ function PrivacyDataModal({
                   <span className="privacy-stat-value">
                     {inventory.collection_count ?? 0}{' '}
                     <span className="privacy-stat-sub">
-                      ({inventory.total_passages ?? 0} passages)
+                      ({inventory.total_chunks ?? 0} chunks)
                     </span>
                   </span>
                 </div>
@@ -2270,7 +2270,7 @@ function PrivacyDataModal({
                           <span>{col.name}</span>
                         </span>
                         <span className="collection-badge">
-                          {col.count ?? 0} {col.count === 1 ? 'passage' : 'passages'}
+                          {col.count ?? 0} {col.count === 1 ? 'chunk' : 'chunks'}
                         </span>
                       </div>
                     ))}
@@ -3319,7 +3319,7 @@ export default function App() {
           </div>
           <div>
             <h1 className="brand-title">Interactive RAG</h1>
-            <p className="brand-subtitle">Upload PDFs, search passages, and chat with your documents</p>
+            <p className="brand-subtitle">Upload PDFs, search chunks, and chat with your documents</p>
           </div>
         </div>
 
@@ -3376,7 +3376,7 @@ export default function App() {
           onClick={() => setActiveTab('query')}
         >
           <Search size={18} />
-          Search Passages
+          Search Chunks
         </button>
         <button
           className={`nav-tab-btn ${activeTab === 'agent' ? 'active' : ''}`}
@@ -3407,7 +3407,7 @@ export default function App() {
             {notification.details && (
               <p style={{ fontSize: '0.8rem', marginTop: '4px', opacity: 0.9 }}>
                 Indexed {notification.details.chunks_added}{' '}
-                {notification.details.chunks_added === 1 ? 'passage' : 'passages'} from{' '}
+                {notification.details.chunks_added === 1 ? 'chunk' : 'chunks'} from{' '}
                 {notification.details.processed_files?.length || 0} file(s).
               </p>
             )}
@@ -3588,12 +3588,12 @@ export default function App() {
           </div>
         )}
 
-        {/* Search Passages Tab Content */}
+        {/* Search Chunks Tab Content */}
         {activeTab === 'query' && (
           <div className="glass-card">
             <h2 className="card-title">
               <Search size={22} color="var(--accent-cyan)" />
-              Search Document Passages
+              Search Document Chunks
             </h2>
 
             <form onSubmit={handleQuerySubmit}>
@@ -3636,7 +3636,7 @@ export default function App() {
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
                   <label className="form-label" style={{ margin: 0 }}>Number of Results</label>
                   <span style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--accent-cyan)' }}>
-                    {topK} {Number(topK) === 1 ? 'passage' : 'passages'}
+                    {topK} {Number(topK) === 1 ? 'chunk' : 'chunks'}
                   </span>
                 </div>
                 <input
@@ -3658,7 +3658,7 @@ export default function App() {
                 ) : (
                   <>
                     <Search size={20} />
-                    Search Passages
+                    Search Chunks
                   </>
                 )}
               </button>
@@ -3672,7 +3672,7 @@ export default function App() {
                   <div className="results-toolbar">
                     <div className="results-toolbar-left">
                       <h3 className="results-heading">
-                        Matching Passages
+                        Matching Chunks
                         <span className="results-count-pill">{queryResults.length}</span>
                       </h3>
                       <span className="results-collection-label">
@@ -3694,7 +3694,7 @@ export default function App() {
                           </button>
                         )}
 
-                        <div className="chunk-view-segmented" role="group" aria-label="Passage layout">
+                        <div className="chunk-view-segmented" role="group" aria-label="Chunk layout">
                           <button
                             type="button"
                             className={`chunk-view-btn ${chunkViewMode === 'reflowed' ? 'active' : ''}`}
@@ -3720,7 +3720,7 @@ export default function App() {
 
                   {queryResults.length === 0 ? (
                     <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', margin: '1.5rem 0' }}>
-                      No matching passages found. Try phrasing your search differently.
+                      No matching chunks found. Try phrasing your search differently.
                     </p>
                   ) : (
                     <div className="results-container">
@@ -3745,7 +3745,7 @@ export default function App() {
                             <div className="result-header">
                               <div className="result-header-left">
                                 <span className="result-rank-badge">
-                                  Passage #{idx + 1}
+                                  Chunk #{idx + 1}
                                 </span>
                                 <span className="result-stats-pill">
                                   {wordCount} words
@@ -3770,7 +3770,7 @@ export default function App() {
                                   title={
                                     isCopied
                                       ? 'Copied!'
-                                      : `Copy ${chunkViewMode === 'raw' ? 'original' : 'formatted'} passage`
+                                      : `Copy ${chunkViewMode === 'raw' ? 'original' : 'formatted'} chunk`
                                   }
                                 >
                                   {isCopied ? <Check size={13} /> : <Copy size={13} />}
@@ -4202,7 +4202,7 @@ export default function App() {
               </button>
             </div>
             <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '1.5rem' }}>
-              Browse your document collections, search passages, start a chat, or remove collections you no longer need.
+              Browse your document collections, search chunks, start a chat, or remove collections you no longer need.
             </p>
 
             {collectionDetails.length === 0 ? (
@@ -4247,7 +4247,7 @@ export default function App() {
                             </h3>
                             <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', margin: '2px 0 0 0' }}>
                               {col.count !== undefined
-                                ? `${col.count} ${col.count === 1 ? 'passage' : 'passages'} indexed`
+                                ? `${col.count} ${col.count === 1 ? 'chunk' : 'chunks'} indexed`
                                 : 'Document collection'}
                             </p>
                           </div>
@@ -4307,7 +4307,7 @@ export default function App() {
                           border: '1px solid rgba(239, 68, 68, 0.3)',
                           display: 'flex',
                           alignItems: 'center',
-                          justify: 'space-between',
+                          justifyContent: 'space-between',
                           gap: '1rem'
                         }}>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#fca5a5', fontSize: '0.85rem' }}>
@@ -4407,7 +4407,7 @@ export default function App() {
                     </div>
                     <span className="collection-badge">
                       {detail?.count !== undefined
-                        ? `${detail.count} ${detail.count === 1 ? 'passage' : 'passages'}`
+                        ? `${detail.count} ${detail.count === 1 ? 'chunk' : 'chunks'}`
                         : isSelected
                         ? 'Selected'
                         : 'Ready'}
@@ -4423,7 +4423,7 @@ export default function App() {
               💡 Tip
             </h4>
             <p style={{ fontSize: '0.8rem', color: 'var(--text-dim)', lineHeight: 1.4 }}>
-              Select any collection to search specific passages or open <strong>AI Assistant</strong> to ask questions, follow up naturally, and click any page reference to preview the source text.
+              Select any collection to search specific chunks or open <strong>AI Assistant</strong> to ask questions, follow up naturally, and click any page reference to preview the source text.
             </p>
           </div>
         </div>

@@ -2851,7 +2851,7 @@ h1, h2, h3, h4 {
   border-color: rgba(6, 182, 212, 0.38);
 }
 
-.step-node-indicator.passages {
+.step-node-indicator.chunks {
   color: #6ee7b7;
   background: rgba(16, 185, 129, 0.14);
   border-color: rgba(16, 185, 129, 0.38);
@@ -2929,7 +2929,7 @@ h1, h2, h3, h4 {
   flex-shrink: 0;
 }
 
-.step-passages-header-row {
+.step-chunks-header-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -2959,14 +2959,14 @@ h1, h2, h3, h4 {
   border-color: rgba(255, 255, 255, 0.2);
 }
 
-.step-passages-grid {
+.step-chunks-grid {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
   margin-top: 0.2rem;
 }
 
-.step-passage-card {
+.step-chunk-card {
   padding: 0.9rem 1.05rem;
   border-radius: 10px;
   background: rgba(8, 12, 22, 0.7);
@@ -2977,11 +2977,11 @@ h1, h2, h3, h4 {
   transition: border-color 0.16s ease;
 }
 
-.step-passage-card:hover {
+.step-chunk-card:hover {
   border-color: rgba(16, 185, 129, 0.32);
 }
 
-.step-passage-card-header {
+.step-chunk-card-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -2991,13 +2991,13 @@ h1, h2, h3, h4 {
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
 }
 
-.step-passage-card-left {
+.step-chunk-card-left {
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
 }
 
-.step-passage-index {
+.step-chunk-index {
   font-family: var(--font-heading);
   font-size: 0.75rem;
   font-weight: 700;

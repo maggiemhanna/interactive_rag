@@ -53,7 +53,7 @@ To prevent CPU- and memory-intensive PDF ingestion from blocking interactive que
 ### `src/core/ai_security/` - Model Armor, Content Safety & Guardrails
 - **`armor.py`**: Regional Google Cloud Model Armor + Cloud Data Loss Prevention (SDP) screening for user prompts (`screen_user_prompt`), retrieved document chunks (`sanitize_chunk_text`, `sanitize_retrieved_documents`), and final LLM responses (`sanitize_model_output`) with fail-closed behavior in Cloud Run.
 - **`safety.py`**: Vertex AI Gemini `HarmBlockThreshold` safety configuration (`get_gemini_safety_settings`), `finish_reason="SAFETY"` refusal detection (`is_safety_blocked`), and standardized user-safe refusal/error messages.
-- **`guardrails.py`**: Server-enforced LLM and embedding model allowlists (`validate_llm_model`, `validate_embedding_model`), collection and tool identifier sanitization (`validate_collection_name`, `safe_tool_name`), query/upload/chunk ceilings (`validate_query_text`, `validate_file_count`, `validate_chunk_count`), PDF file-signature and upload path guardrails (`sanitize_filename`, `validate_pdf_bytes`, `validate_server_pdf_paths`), and XML spotlighting for retrieved passages (`EMPTY_RETRIEVAL_MARKER`, `format_retrieved_chunks`).
+- **`guardrails.py`**: Server-enforced LLM and embedding model allowlists (`validate_llm_model`, `validate_embedding_model`), collection and tool identifier sanitization (`validate_collection_name`, `safe_tool_name`), query/upload/chunk ceilings (`validate_query_text`, `validate_file_count`, `validate_chunk_count`), PDF file-signature and upload path guardrails (`sanitize_filename`, `validate_pdf_bytes`, `validate_server_pdf_paths`), and XML spotlighting for retrieved chunks (`EMPTY_RETRIEVAL_MARKER`, `format_retrieved_chunks`).
 
 ### `src/core/compliance/` - Data Residency, Audit Logging, Provenance & DSAR
 - **`residency.py`**: Enforces single-region GCP locations (`validate_gcp_region`), rejecting `global` and multi-region specifiers (`us`, `eu`, `asia`, `nam4`, `eur4`) before any Vertex AI or Model Armor client call.
@@ -127,7 +127,7 @@ curl -X POST "http://localhost:8000/ingest" \
 
 ### Core Responsibilities
 `src/agent/` runs the stateful, safety-screened LangGraph RAG workflow and mounts `src/query` + `src/manage` + `src/agent` onto `agent-api`:
-1. **XML-Spotlighted Retriever Tool (`tools.py`)**: Queries the user's Chroma collection, applies Cloud DLP `[INFO_TYPE]` chunk redaction, and formats retrieved passages into `<retrieved_chunk source="..." page="...">` tags via `format_retrieved_chunks` and `safe_tool_name` from `src/core/ai_security/guardrails.py` (`get_retriever_tool`).
+1. **XML-Spotlighted Retriever Tool (`tools.py`)**: Queries the user's Chroma collection, applies Cloud DLP `[INFO_TYPE]` chunk redaction, and formats retrieved chunks into `<retrieved_chunk source="..." page="...">` tags via `format_retrieved_chunks` and `safe_tool_name` from `src/core/ai_security/guardrails.py` (`get_retriever_tool`).
 2. **Tenant-Isolated Memory (`memory.py`)**: Owns the `MEMORY_SAVER` (`InMemorySaver`) checkpointer and namespaces checkpoint threads under `{uid}:{thread_id}` (`make_user_thread_id`).
 3. **Safety-Screened LangGraph StateGraph (`graph.py`)**: Compiles `input_guard` $\rightarrow$ `model_call` $\leftrightarrow$ `tools` $\rightarrow$ `output_guard` with regional `ChatGoogleGenerativeAI`, Gemini safety thresholds, and `[source, p.X]` citation rules.
 4. **SSE & Interactive Streaming (`service.py`, `display.py`)**: Streams sanitized message events, tool traces, and EU AI Act Art. 50 `compliance` frames over SSE (`stream_sse`), emits canonical `agent.query` audit/telemetry events (`emit_agent_query_events`), or renders rich terminal panels (`run_interactive`).
@@ -145,7 +145,7 @@ curl -X POST "http://localhost:8000/ingest" \
 | :--- | :--- | :--- | :--- |
 | `GET` | `/health` | N/A | Unauthenticated readiness/liveness probe (`agent-api`). |
 | `POST` | `/query` | `application/json` | Performs top-$k$ similarity search with DLP chunk sanitization (`src/query`). |
-| `GET` | `/collections` | N/A | Lists the authenticated user's ChromaDB collections and passage counts (`src/manage`). |
+| `GET` | `/collections` | N/A | Lists the authenticated user's ChromaDB collections and chunk counts (`src/manage`). |
 | `DELETE` | `/collections/{collection_name}` | N/A | Deletes a ChromaDB collection from local cache and GCS (`src/manage`). |
 | `GET` | `/compliance/my-data` | N/A | Returns GDPR Art. 15 personal data inventory across GCS, Chroma, and memory threads (`src/manage`). |
 | `DELETE` | `/compliance/my-data` | N/A | Executes GDPR Art. 17 hard erasure across GCS, `/tmp`, and memory threads (`src/manage`). |
@@ -162,7 +162,7 @@ data: {"event": "message", "message": {"type": "tool", "name": "stock_market_vs_
 
 data: {"event": "message", "message": {"type": "ai", "content": "ARM Holdings is a semiconductor design company [report.pdf, p.1]."}}
 
-data: {"event": "compliance", "message": {"type": "compliance", "content": ""}, "compliance": {"ai_generated": true, "model": "gemini-2.5-flash", "region": "us-central1", "grounding_enforced": true, "grounded": true, "citation_count": 1, "retrieved_passages": 1, "pii_filtered": false, "model_armor_active": true, "filters_checked": ["pi_and_jailbreak", "malicious_uri", "rai", "sdp"], "guardrail_actions": [], "request_id": "req-..."}}
+data: {"event": "compliance", "message": {"type": "compliance", "content": ""}, "compliance": {"ai_generated": true, "model": "gemini-2.5-flash", "region": "us-central1", "grounding_enforced": true, "grounded": true, "citation_count": 1, "retrieved_chunks": 1, "pii_filtered": false, "model_armor_active": true, "filters_checked": ["pi_and_jailbreak", "malicious_uri", "rai", "sdp"], "guardrail_actions": [], "request_id": "req-..."}}
 
 data: [DONE]
 ```
