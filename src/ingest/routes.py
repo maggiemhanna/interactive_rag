@@ -22,7 +22,7 @@ from src.core.storage import LockTimeoutError
 from src.ingest.service import ingest_documents
 from src.ingest.upload_parser import prepare_payload
 
-logger = setup_logging(name="ingest")
+logger = setup_logging(name="ingest.routes")
 
 ingest_router = APIRouter()
 
@@ -41,12 +41,13 @@ async def ingest(
     Returns:
         JSON confirmation containing `chunks_added`, `collection_name`, and `processed_files`.
     """
+    payload = None
     try:
         payload = await prepare_payload(request=request, uid=uid)
 
         logger.info(
             f"Ingesting {len(payload.chunks)} chunks for uid='{uid}' into collection '{payload.collection_name}' "
-            f"(embedding_model='{payload.embedding_model}', files={payload.processed_files})"
+            f"(embedding_model='{payload.embedding_model}', files={payload.processed_files})."
         )
 
         ingest_documents(
@@ -89,6 +90,7 @@ async def ingest(
             reason=e.reason,
             http_status=503,
             uid=uid,
+            collection_name=payload.collection_name if payload else None,
         )
         raise HTTPException(status_code=503, detail=SCREENING_UNAVAILABLE_MESSAGE)
     except LockTimeoutError as e:
@@ -96,17 +98,20 @@ async def ingest(
             "document.ingest",
             severity="WARNING",
             status="lock_timeout",
+            http_status=409,
             uid=uid,
-            collection_name=getattr(locals().get("payload"), "collection_name", None),
+            collection_name=payload.collection_name if payload else None,
         )
         raise HTTPException(status_code=409, detail=str(e))
     except FileNotFoundError as e:
-        logger.error(f"File not found error: {e}")
+        logger.error(f"File not found error during ingestion for uid='{uid}': {e}")
         emit_audit_event(
             "document.ingest",
             severity="WARNING",
             status="not_found",
+            http_status=404,
             uid=uid,
+            collection_name=payload.collection_name if payload else None,
         )
         raise HTTPException(status_code=404, detail=str(e))
     except HTTPException as e:
@@ -116,17 +121,21 @@ async def ingest(
             status="rejected",
             uid=uid,
             http_status=e.status_code,
+            collection_name=payload.collection_name if payload else None,
         )
         raise
     except Exception:
-        logger.exception(f"Failed to ingest documents for uid='{uid}'")
+        logger.exception(f"Failed to ingest documents for uid='{uid}'.")
         emit_audit_event(
             "document.ingest",
             severity="ERROR",
             status="error",
+            http_status=500,
             uid=uid,
+            collection_name=payload.collection_name if payload else None,
         )
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_MESSAGE)
 
 
 __all__ = ["ingest", "ingest_router"]
+

@@ -15,14 +15,14 @@ from src.core.ai_security.safety import (
     SCREENING_UNAVAILABLE_MESSAGE,
 )
 from src.core.auth import get_current_user
-from src.core.compliance.audit import emit_audit_event, hash_query
+from src.core.compliance.audit import emit_audit_event
 from src.core.compliance.policy import enforce_query_rate_limit
 from src.core.logger import setup_logging
 from src.core.observability.telemetry import emit_telemetry_event
 from src.query.schemas import QueryRequest
 from src.query.service import search_collection
 
-logger = setup_logging(name="query")
+logger = setup_logging(name="query.routes")
 
 query_router = APIRouter()
 
@@ -41,8 +41,6 @@ def query(
     Returns:
         JSON response containing sanitized passage `results` and `results_count`.
     """
-    query_digest = hash_query(request.query)
-    query_len = len(request.query)
     try:
         enforce_query_rate_limit(uid)
         results = search_collection(
@@ -59,8 +57,7 @@ def query(
             embedding_model=request.embedding_model,
             k=request.k,
             results_count=len(results),
-            query_sha256=query_digest,
-            query_chars=query_len,
+            query=request.query,
         )
         emit_telemetry_event(
             "vectorstore.query",
@@ -69,8 +66,7 @@ def query(
             embedding_model=request.embedding_model,
             k=request.k,
             results_count=len(results),
-            query_sha256=query_digest,
-            query_chars=query_len,
+            query=request.query,
         )
         return {
             "status": "success",
@@ -88,8 +84,7 @@ def query(
             http_status=503,
             uid=uid,
             collection_name=request.collection_name,
-            query_sha256=query_digest,
-            query_chars=query_len,
+            query=request.query,
         )
         raise HTTPException(status_code=503, detail=SCREENING_UNAVAILABLE_MESSAGE)
     except FileNotFoundError as e:
@@ -97,28 +92,29 @@ def query(
             "vectorstore.query",
             severity="WARNING",
             status="not_found",
+            http_status=404,
             uid=uid,
             collection_name=request.collection_name,
-            query_sha256=query_digest,
-            query_chars=query_len,
+            query=request.query,
         )
         raise HTTPException(status_code=404, detail=str(e))
     except HTTPException:
         raise
     except Exception:
         logger.exception(
-            f"Failed to query vectorstore collection '{request.collection_name}' for uid='{uid}'"
+            f"Failed to query vectorstore collection '{request.collection_name}' for uid='{uid}'."
         )
         emit_audit_event(
             "vectorstore.query",
             severity="ERROR",
             status="error",
+            http_status=500,
             uid=uid,
             collection_name=request.collection_name,
-            query_sha256=query_digest,
-            query_chars=query_len,
+            query=request.query,
         )
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_MESSAGE)
 
 
 __all__ = ["query", "query_router"]
+

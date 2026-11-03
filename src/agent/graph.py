@@ -5,7 +5,6 @@ and pre/post Google Cloud Model Armor + Cloud DLP guardrail nodes so unscreened 
 reach Gemini and unsanitized answers never stream out.
 """
 
-import os
 from typing import Any, Dict, Optional, Sequence
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -21,6 +20,7 @@ from src.core.ai_security.guardrails import validate_llm_model, validate_query_t
 from src.core.compliance.audit import emit_audit_event
 from src.core.compliance.residency import validate_gcp_region
 from src.core.compliance.state import record_guardrail_action
+from src.core.config import get_google_cloud_project
 from src.core.logger import setup_logging
 from src.core.observability.telemetry import record_llm_usage
 from src.core.observability.tracing import start_span
@@ -46,7 +46,7 @@ SYSTEM_PROMPT = (
 )
 
 
-def _extract_message_text(content: Any) -> str:
+def extract_message_text(content: Any) -> str:
     """Normalizes string or multimodal list message content into plain text.
 
     Args:
@@ -79,7 +79,7 @@ def _latest_human_text(messages: Sequence[BaseMessage]) -> str:
     """
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage) or getattr(msg, "type", "") == "human":
-            return _extract_message_text(getattr(msg, "content", ""))
+            return extract_message_text(getattr(msg, "content", ""))
     return ""
 
 
@@ -107,7 +107,7 @@ def build_agent(
     llm = ChatGoogleGenerativeAI(
         model=safe_model_name,
         temperature=0,
-        project=os.getenv("GOOGLE_CLOUD_PROJECT"),
+        project=get_google_cloud_project() or None,
         location=safe_location,
     )
 
@@ -128,7 +128,7 @@ def build_agent(
                     severity="WARNING",
                     status="blocked",
                     reason="invalid_query_text",
-                    query_chars=len(raw_query or ""),
+                    query=raw_query or "",
                 )
                 span["attributes"]["blocked"] = True
                 return {
@@ -185,7 +185,7 @@ def build_agent(
             return {}
 
         with start_span("agent.output_guard", stage="output_guard") as span:
-            raw_text = _extract_message_text(getattr(pending, "content", ""))
+            raw_text = extract_message_text(getattr(pending, "content", ""))
             latest_query = _latest_human_text(state["messages"])
             decision = sanitize_model_output(raw_text, user_prompt=latest_query or None)
 
@@ -230,4 +230,5 @@ def build_agent(
     return graph.compile(checkpointer=checkpointer or MEMORY_SAVER)
 
 
-__all__ = ["SYSTEM_PROMPT", "build_agent"]
+__all__ = ["SYSTEM_PROMPT", "build_agent", "extract_message_text"]
+

@@ -46,11 +46,12 @@ def get_collections(uid: str = Depends(get_current_user)) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception:
-        logger.exception(f"Error fetching collections for uid='{uid}'")
+        logger.exception(f"Error fetching collections for uid='{uid}'.")
         emit_audit_event(
             "collection.list",
             severity="ERROR",
             status="error",
+            http_status=500,
             uid=uid,
         )
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_MESSAGE)
@@ -92,6 +93,7 @@ def delete_collection(
             "collection.delete",
             severity="WARNING",
             status="invalid_request",
+            http_status=422,
             uid=uid,
             reason="invalid_collection_name",
         )
@@ -101,6 +103,7 @@ def delete_collection(
             "collection.delete",
             severity="WARNING",
             status="not_found",
+            http_status=404,
             uid=uid,
             collection_name=collection_name,
         )
@@ -110,6 +113,7 @@ def delete_collection(
             "collection.delete",
             severity="WARNING",
             status="lock_timeout",
+            http_status=409,
             uid=uid,
             collection_name=collection_name,
         )
@@ -117,14 +121,16 @@ def delete_collection(
     except HTTPException:
         raise
     except Exception:
-        logger.exception(f"Error deleting collection '{collection_name}' for uid='{uid}'")
+        logger.exception(f"Error deleting collection '{collection_name}' for uid='{uid}'.")
         emit_audit_event(
             "collection.delete",
             severity="ERROR",
             status="error",
+            http_status=500,
             uid=uid,
         )
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_MESSAGE)
 
 
 __all__ = ["collections_router", "delete_collection", "get_collections"]
+

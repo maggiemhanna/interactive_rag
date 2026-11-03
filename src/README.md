@@ -38,22 +38,22 @@ To prevent CPU- and memory-intensive PDF ingestion from blocking interactive que
 `src/core/` centralizes cross-cutting platform infrastructure and domain packages shared by both Cloud Run backend services (`ingest-api` and `agent-api`).
 
 ### Core Infrastructure
-- **`config.py`**: Loads `.env` settings and exposes runtime environment helpers (`is_cloud_run`, `get_allowed_origins`, `get_google_cloud_location`, `get_model_armor_location`, `get_allowed_llm_models`, `get_allowed_embedding_models`, `get_chroma_tmp_max_bytes`, `get_chroma_tmp_min_free_bytes`) plus local service ports.
-- **`context.py`**: Manages per-request `contextvars` correlation state (`RequestContext`, `RequestCorrelationMiddleware`) tracking sanitized `X-Request-Id`, Cloud Trace ID, active span ID, authenticated `uid`, and a thread-safe `data` store for domain modules.
+- **`config.py`**: Single canonical source of truth for loading `.env` settings and parsing all environment variables across `src/` via typed runtime getters (`is_cloud_run`, `get_google_cloud_project`, `get_google_cloud_location`, `get_model_armor_location`, `get_allowed_origins`, `get_allowed_llm_models`, `get_allowed_embedding_models`, `get_bucket_name`, `get_chroma_tmp_max_bytes`, `get_chroma_tmp_min_free_bytes`, etc.) plus local service ports.
+- **`context.py`**: Manages per-request `contextvars` correlation state (`RequestContext`, `RequestCorrelationMiddleware`, `hash_query`, `scrub_query_fields`) tracking sanitized `X-Request-Id`, Cloud Trace ID, active span ID, authenticated `uid`, and a thread-safe `data` store for domain modules.
 - **`auth.py`**: Verifies Google Identity Platform / Firebase Bearer JWTs (`verify_bearer_token`, `get_current_user`, `get_current_user_info`), enforces path-safe `uid` validation (`validate_uid`), and blocks `AUTH_DISABLED` bypasses when running on Cloud Run.
-- **`logger.py`**: Configures structured ANSI-colored console logging (`setup_logging`, `format_dict_for_logs`).
-- **`app_factory.py`**: Provides `create_app()` to wire CORS middleware, `RequestCorrelationMiddleware`, and `/health` readiness probes, with `include_manage_routes` so `ingest-api` mounts only `/ingest` + `/health` while `agent-api` mounts `query`, `manage`, and `agent` routes.
+- **`logger.py`**: Configures structured ANSI-colored console and GCP JSON logging (`setup_logging`, `format_dict_for_logs`).
+- **`app_factory.py`**: Provides `create_app()` to wire CORS middleware, `RequestCorrelationMiddleware`, `/health` readiness probes, and an explicit `routers` sequence so `ingest-api` mounts only `[ingest_router]` while `agent-api` mounts `[agent_router, query_router, manage_router]`.
 
 ### `src/core/storage/` - Multi-Tenant Persistence, Incremental Delta Sync & Distributed Locking
 - **`paths.py`**: Isolates per-user local directories (`/tmp/chroma_db/{uid}`, `/tmp/uploads/{uid}`), constructs GCS object prefixes, checkpoints SQLite WAL files, and evicts cached Chroma `SharedSystemClient` registries (`release_client_cache`).
 - **`gcs_sync.py`**: Pulls and pushes per-user ChromaDB snapshots between `/tmp` and `gs://<bucket>/users/{uid}/chroma_db/` with incremental MD5 delta sync (`_compute_file_md5_base64`, uploading only new or changed files and deleting stale remote blobs), `version.json` invalidation, and raw PDF upload archiving (`archive_upload`).
 - **`locks.py`**: Coordinates per-user `threading.RLock` instances, distributed `if_generation_match` GCS write locks with TTL stale-lock recovery (`user_write_lock`, `user_read_lock`), and bounded `/tmp` `tmpfs` LRU cache eviction (`evict_tmp_cache` enforcing `CHROMA_TMP_MAX_BYTES=512 MiB` and `CHROMA_TMP_MIN_FREE_BYTES=256 MiB`).
-- **`chroma.py`**: Instantiates regional Vertex AI `GoogleGenerativeAIEmbeddings` and manages per-user Chroma collections (`get_vectorstore`, `require_collection`, `list_collections`, `remove_collection`).
+- **`chroma.py`**: Instantiates regional Vertex AI `GoogleGenerativeAIEmbeddings`, executes normalized similarity search (`similarity_search_with_scores`), and manages per-user Chroma collections (`get_vectorstore`, `require_collection`, `list_collections`, `remove_collection`).
 
 ### `src/core/ai_security/` - Model Armor, Content Safety & Guardrails
 - **`armor.py`**: Regional Google Cloud Model Armor + Cloud Data Loss Prevention (SDP) screening for user prompts (`screen_user_prompt`), retrieved document chunks (`sanitize_chunk_text`, `sanitize_retrieved_documents`), and final LLM responses (`sanitize_model_output`) with fail-closed behavior in Cloud Run.
 - **`safety.py`**: Vertex AI Gemini `HarmBlockThreshold` safety configuration (`get_gemini_safety_settings`), `finish_reason="SAFETY"` refusal detection (`is_safety_blocked`), and standardized user-safe refusal/error messages.
-- **`guardrails.py`**: Server-enforced LLM and embedding model allowlists (`validate_llm_model`, `validate_embedding_model`), collection identifier sanitization (`validate_collection_name`), query/upload/chunk ceilings (`validate_query_text`, `validate_file_count`, `validate_chunk_count`), and bounded LangGraph tool-loop recursion limits (`get_bounded_recursion_limit`).
+- **`guardrails.py`**: Server-enforced LLM and embedding model allowlists (`validate_llm_model`, `validate_embedding_model`), collection identifier sanitization (`validate_collection_name`), and query/upload/chunk ceilings (`validate_query_text`, `validate_file_count`, `validate_chunk_count`).
 
 ### `src/core/compliance/` - Data Residency, Audit Logging, Provenance & DSAR
 - **`residency.py`**: Enforces single-region GCP locations (`validate_gcp_region`), rejecting `global` and multi-region specifiers (`us`, `eu`, `asia`, `nam4`, `eur4`) before any Vertex AI or Model Armor client call.
@@ -128,14 +128,14 @@ curl -X POST "http://localhost:8000/ingest" \
 ### Core Responsibilities
 `src/agent/` runs the stateful, safety-screened LangGraph RAG workflow and mounts `src/query` + `src/manage` + `src/agent` onto `agent-api`:
 1. **XML-Spotlighted Retriever Tool (`tools.py`)**: Queries the user's Chroma collection, applies Cloud DLP `[INFO_TYPE]` chunk redaction, and wraps retrieved passages in `<retrieved_chunk source="..." page="...">` tags (`format_retrieved_chunks`, `get_retriever_tool`).
-2. **Tenant-Isolated Memory (`memory.py`)**: Namespaces `InMemorySaver` checkpoint threads under `{uid}:{thread_id}` and supports GDPR Art. 17 thread purging (`purge_user_memory_threads`).
-3. **Safety-Screened LangGraph StateGraph (`graph.py`)**: Compiles `input_guard` $\rightarrow$ `llm` $\rightarrow$ `tools` $\rightarrow$ `output_guard` with regional `ChatGoogleGenerativeAI`, Gemini safety thresholds, and `[source, p.X]` citation rules.
-4. **SSE & Interactive Streaming (`service.py`, `display.py`)**: Streams sanitized message events, tool traces, and EU AI Act Art. 50 `compliance` frames over SSE (`stream_sse`) or rich terminal panels (`run_interactive`).
+2. **Tenant-Isolated Memory (`memory.py`)**: Namespaces `InMemorySaver` checkpoint threads under `{uid}:{thread_id}` and supports GDPR Art. 17 thread purging (`clear_user_memory`).
+3. **Safety-Screened LangGraph StateGraph (`graph.py`)**: Compiles `input_guard` $\rightarrow$ `model_call` $\leftrightarrow$ `tools` $\rightarrow$ `output_guard` with regional `ChatGoogleGenerativeAI`, Gemini safety thresholds, and `[source, p.X]` citation rules.
+4. **SSE & Interactive Streaming (`service.py`, `display.py`)**: Streams sanitized message events, tool traces, and EU AI Act Art. 50 `compliance` frames over SSE (`stream_sse`), emits canonical `agent.query` audit/telemetry events (`emit_agent_query_events`), or renders rich terminal panels (`run_interactive`).
 5. **Unified Interactive FastAPI Service (`routes.py`, `app.py`, `schemas.py`)**: Defines `agent_router` (`POST /agent`, `POST /agent/stream`) in `routes.py` and mounts `agent_router`, `query_router` (`POST /query`), and `manage_router` (`GET /collections`, `DELETE /collections/{collection_name}`, `GET/DELETE /compliance/my-data`) plus `GET /health` in `app.py`.
 
 ### LangGraph Agent Workflow
 - **`input_guard` (`graph.py`)**: Screens the latest user turn via Model Armor (`screen_user_prompt`) before any LLM call.
-- **`llm` (`graph.py`)**: Prepends `SYSTEM_PROMPT`, binds the user's retriever tool, and invokes regional Vertex AI Gemini.
+- **`model_call` (`graph.py`)**: Prepends `SYSTEM_PROMPT`, binds the user's retriever tool, and invokes regional Vertex AI Gemini.
 - **`tools` (`graph.py`)**: Executes `ToolNode` retrieval against the user's synced ChromaDB snapshot.
 - **`output_guard` (`graph.py`)**: Screens final `AIMessage` text via Model Armor + Cloud DLP (`sanitize_model_output`).
 

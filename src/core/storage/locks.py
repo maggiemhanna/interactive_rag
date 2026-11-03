@@ -22,7 +22,13 @@ from google.api_core import exceptions as gcs_exceptions
 from google.cloud import storage
 
 from src.core.auth import validate_uid
-from src.core.config import get_chroma_tmp_max_bytes, get_chroma_tmp_min_free_bytes
+from src.core.config import (
+    get_chroma_lock_timeout_seconds,
+    get_chroma_lock_ttl_seconds,
+    get_chroma_tmp_max_bytes,
+    get_chroma_tmp_min_free_bytes,
+    get_cloud_run_revision,
+)
 from src.core.logger import setup_logging
 from src.core.storage import gcs_sync
 from src.core.storage.paths import (
@@ -181,24 +187,6 @@ def evict_tmp_cache(exclude_uid: Optional[str] = None) -> List[str]:
     return evicted
 
 
-def sync_user_dir(uid: str) -> str:
-    """Ensures the user's local ChromaDB directory matches the latest snapshot in GCS.
-
-    Args:
-        uid: Verified tenant user identifier.
-
-    Returns:
-        Local `persist_directory` path (which will not exist on disk yet for brand-new users).
-    """
-    safe_uid = validate_uid(uid)
-    user_lock = get_user_thread_lock(safe_uid)
-    with user_lock, track_active_user(safe_uid):
-        return gcs_sync._sync_from_gcs_unlocked(
-            safe_uid,
-            on_before_download=lambda u: evict_tmp_cache(exclude_uid=u),
-        )
-
-
 @contextlib.contextmanager
 def user_read_lock(uid: str) -> Generator[str, None, None]:
     """Context manager synchronizing a user's Chroma snapshot and pinning `/tmp` against eviction.
@@ -220,6 +208,19 @@ def user_read_lock(uid: str) -> Generator[str, None, None]:
         yield user_dir
 
 
+def sync_user_dir(uid: str) -> str:
+    """Ensures the user's local ChromaDB directory matches the latest snapshot in GCS.
+
+    Args:
+        uid: Verified tenant user identifier.
+
+    Returns:
+        Local `persist_directory` path (which will not exist on disk yet for brand-new users).
+    """
+    with user_read_lock(uid) as user_dir:
+        return user_dir
+
+
 def acquire_gcs_write_lock(bucket: storage.Bucket, uid: str) -> storage.Blob:
     """Acquires `users/{uid}/locks/chroma.lock` via atomic `if_generation_match=0` with TTL recovery.
 
@@ -234,9 +235,9 @@ def acquire_gcs_write_lock(bucket: storage.Bucket, uid: str) -> storage.Blob:
         LockTimeoutError: If another live writer holds the lock beyond `CHROMA_LOCK_TIMEOUT_SECONDS`.
     """
     lock_blob_name = user_lock_gcs_blob_name(uid)
-    lock_ttl_seconds = float(os.getenv("CHROMA_LOCK_TTL_SECONDS", "300"))
-    acquire_timeout_seconds = float(os.getenv("CHROMA_LOCK_TIMEOUT_SECONDS", "60"))
-    owner_id = f"{os.getenv('K_REVISION', 'local')}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+    lock_ttl_seconds = get_chroma_lock_ttl_seconds()
+    acquire_timeout_seconds = get_chroma_lock_timeout_seconds()
+    owner_id = f"{get_cloud_run_revision()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
     deadline = time.monotonic() + acquire_timeout_seconds
     backoff = 0.25

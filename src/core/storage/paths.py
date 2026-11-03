@@ -12,7 +12,12 @@ import sqlite3
 from typing import Optional
 
 from src.core.auth import validate_uid
-from src.core.config import is_cloud_run
+from src.core.config import (
+    get_bucket_name,
+    get_local_chroma_root,
+    get_upload_tmp_root,
+    is_cloud_run,
+)
 from src.core.logger import setup_logging
 
 logger = setup_logging(name="storage.paths")
@@ -21,11 +26,6 @@ VERSION_FILENAME = "version.json"
 SQLITE_FILENAME = "chroma.sqlite3"
 TRANSIENT_SQLITE_SUFFIXES = ("-wal", "-shm", "-journal")
 SAFE_FILENAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
-
-
-def get_bucket_name() -> str:
-    """Returns the configured `GCS_BUCKET_NAME`, or an empty string in local-only disk mode."""
-    return os.getenv("GCS_BUCKET_NAME", "").strip()
 
 
 def get_chroma_root() -> str:
@@ -37,7 +37,7 @@ def get_chroma_root() -> str:
     Returns:
         Absolute filesystem path to the multi-tenant ChromaDB root directory.
     """
-    configured = os.getenv("LOCAL_CHROMA_ROOT", "").strip()
+    configured = get_local_chroma_root()
     if configured:
         return os.path.abspath(configured)
     if is_cloud_run():
@@ -80,7 +80,7 @@ def get_upload_user_dir(uid: str) -> str:
         ValueError: If the resolved upload directory escapes `UPLOAD_TMP_ROOT`.
     """
     safe_uid = validate_uid(uid)
-    upload_root = os.path.abspath(os.getenv("UPLOAD_TMP_ROOT", "/tmp/uploads"))
+    upload_root = os.path.abspath(get_upload_tmp_root())
     user_upload_dir = os.path.abspath(os.path.join(upload_root, safe_uid))
     if (
         os.path.commonpath([upload_root, user_upload_dir]) != upload_root

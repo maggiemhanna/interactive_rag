@@ -8,6 +8,7 @@ Submodules and subpackages:
 - `app_factory`: Shared FastAPI application factory wiring middleware, probes, and routers.
 - `storage`: Multi-tenant local `/tmp` isolation, GCS snapshot sync, distributed locks, and ChromaDB.
 - `ai_security`: Cloud Model Armor + DLP screening (`armor`), Gemini safety (`safety`), and model/input ceilings (`guardrails`).
-- `compliance`: Regional residency (`residency`), Cloud Logging (`audit`), GDPR DSAR (`dsar`), EU AI Act provenance (`provenance`), and `/compliance` routes (`routes`).
+- `compliance`: Regional residency (`residency`), Cloud Logging (`audit`), GDPR DSAR (`dsar`), EU AI Act provenance (`provenance`), and compliance policy builder (`policy`).
 - `observability`: Structured cloud logging (`logging`), hierarchical tracing (`tracing`), and AI performance telemetry (`telemetry`).
 """
+

@@ -29,7 +29,11 @@ from src.core.compliance.policy import (
     enforce_collection_quota,
     enforce_ingest_rate_limit,
 )
-from src.core.config import get_max_upload_mb, is_cloud_run
+from src.core.config import (
+    get_max_upload_mb,
+    is_archive_uploads_enabled,
+    is_cloud_run,
+)
 from src.core.logger import setup_logging
 from src.core.storage import archive_upload, get_bucket_name, get_upload_user_dir
 from src.ingest.splitter import sanitize_filename, split_pdfs
@@ -86,12 +90,14 @@ def _parse_json_body(
 
 
 def _validate_ingest_params(
+    uid: str,
     collection_name: Optional[str],
     embedding_model: Optional[str],
 ) -> Tuple[str, str]:
-    """Validates `collection_name` and `embedding_model`, raising HTTP 422 on invalid input.
+    """Validates `collection_name` and `embedding_model` (HTTP 422) and enforces rate limits (HTTP 429) and collection quotas (HTTP 403).
 
     Args:
+        uid: Verified tenant user identifier.
         collection_name: Candidate Chroma collection identifier.
         embedding_model: Optional candidate Vertex AI embedding model identifier.
 
@@ -99,25 +105,16 @@ def _validate_ingest_params(
         Tuple `(safe_collection_name, safe_embedding_model)`.
 
     Raises:
-        HTTPException: HTTP 422 when either parameter fails guardrail validation.
+        HTTPException: HTTP 422/429/403 when parameter validation, rate-limit, or quota checks fail.
     """
     try:
         safe_col = validate_collection_name(collection_name)
         safe_emb = validate_embedding_model(embedding_model)
-        return safe_col, safe_emb
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
-
-
-def _enforce_ingest_policies(uid: str, collection_name: str) -> None:
-    """Enforces per-UID ingestion rate limits (HTTP 429) and new-collection quotas (HTTP 403).
-
-    Args:
-        uid: Verified tenant user identifier.
-        collection_name: Validated target Chroma collection identifier.
-    """
     enforce_ingest_rate_limit(uid)
-    enforce_collection_quota(uid, collection_name)
+    enforce_collection_quota(uid, safe_col)
+    return safe_col, safe_emb
 
 
 def _enforce_file_ceiling(count: int) -> None:
@@ -167,9 +164,8 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
             body = await request.json()
             raw_server_paths, raw_col, raw_emb = _parse_json_body(body)
             collection_name, embedding_model = _validate_ingest_params(
-                raw_col, raw_emb
+                uid, raw_col, raw_emb
             )
-            _enforce_ingest_policies(uid=uid, collection_name=collection_name)
         elif "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
             async with request.form() as form:
                 raw_col = form.get("collection_name")
@@ -183,9 +179,8 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                 emb_str = raw_embedding if isinstance(raw_embedding, str) else None
 
                 collection_name, embedding_model = _validate_ingest_params(
-                    col_str, emb_str
+                    uid, col_str, emb_str
                 )
-                _enforce_ingest_policies(uid=uid, collection_name=collection_name)
 
                 # Handle pdf_paths field if provided in form
                 paths_param = form.getlist("pdf_paths")
@@ -207,10 +202,7 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                 if valid_uploads:
                     request_upload_dir = os.path.join(user_upload_dir, uuid.uuid4().hex)
                     os.makedirs(request_upload_dir, exist_ok=True)
-                    should_archive = bool(get_bucket_name()) and (
-                        os.getenv("ARCHIVE_UPLOADS_TO_GCS", "true").strip().lower()
-                        in {"1", "true", "yes"}
-                    )
+                    should_archive = bool(get_bucket_name()) and is_archive_uploads_enabled()
 
                     used_names = set()
                     for idx, file_item in enumerate(valid_uploads):
@@ -261,9 +253,8 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                     detail="Unsupported Content-Type. Please send application/json or multipart/form-data.",
                 )
             collection_name, embedding_model = _validate_ingest_params(
-                raw_col, raw_emb
+                uid, raw_col, raw_emb
             )
-            _enforce_ingest_policies(uid=uid, collection_name=collection_name)
 
         # Security guard: never allow arbitrary container filesystem reads in Cloud Run
         if raw_server_paths and is_cloud_run():

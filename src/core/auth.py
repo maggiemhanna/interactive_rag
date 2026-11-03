@@ -7,7 +7,6 @@ Implements Pillar 1 & Pillar 2 identity enforcement for FastAPI endpoints:
 - Records structured `auth.failure` compliance audit events and binds verified UIDs to request state.
 """
 
-import os
 import re
 import threading
 from typing import Any, Dict, Optional
@@ -18,11 +17,17 @@ from firebase_admin import auth as firebase_auth
 from pydantic import BaseModel
 
 from src.core.compliance.audit import emit_audit_event
-from src.core.config import get_allowed_origins, is_cloud_run
+from src.core.config import (
+    get_allowed_origins,
+    get_dev_user_id,
+    get_firebase_project_id,
+    is_auth_disabled,
+    is_cloud_run,
+)
 from src.core.context import set_request_uid
 from src.core.logger import setup_logging
 
-logger = setup_logging(name="auth")
+logger = setup_logging(name="core.auth")
 
 # Strict allowlist pattern preventing path traversal when constructing `/tmp/chroma_db/{uid}` or GCS prefixes
 UID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
@@ -83,8 +88,7 @@ def is_auth_bypassed() -> bool:
     Returns:
         True only when `AUTH_DISABLED` is truthy and the service is not running in Cloud Run.
     """
-    auth_disabled = os.getenv("AUTH_DISABLED", "").strip().lower() in {"1", "true", "yes"}
-    if not auth_disabled:
+    if not is_auth_disabled():
         return False
 
     if is_cloud_run():
@@ -113,10 +117,7 @@ def init_firebase() -> firebase_admin.App:
         if firebase_admin._apps:
             return firebase_admin.get_app()
 
-        project_id = (
-            os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
-            or os.getenv("FIREBASE_PROJECT_ID", "").strip()
-        )
+        project_id = get_firebase_project_id()
         if not project_id:
             logger.error(
                 "GOOGLE_CLOUD_PROJECT (or FIREBASE_PROJECT_ID) must be configured to verify ID tokens."
@@ -277,7 +278,7 @@ def get_current_user_info(
         Verified `AuthenticatedUser` model instance.
     """
     if is_auth_bypassed():
-        raw_dev_uid = (x_dev_user_id or os.getenv("DEV_USER_ID", "local-dev")).strip()
+        raw_dev_uid = (x_dev_user_id or get_dev_user_id()).strip()
         uid = validate_uid(raw_dev_uid)
         set_request_uid(uid)
         return AuthenticatedUser(

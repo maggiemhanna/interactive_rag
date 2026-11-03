@@ -24,7 +24,11 @@ from src.core.ai_security.guardrails import (
 from src.core.compliance.state import record_retrieved_chunks
 from src.core.observability.telemetry import record_retrieval_metrics
 from src.core.observability.tracing import start_span
-from src.core.storage import get_vectorstore, require_collection
+from src.core.storage import (
+    get_vectorstore,
+    require_collection,
+    similarity_search_with_scores,
+)
 
 EMPTY_RETRIEVAL_MARKER = (
     '<retrieved_context status="empty">'
@@ -174,10 +178,6 @@ def get_retriever_tool(
         embedding_model=safe_embedding,
     )
 
-    retriever = vectorstore.as_retriever(
-        search_type="similarity", search_kwargs={"k": k}
-    )
-
     tool_description = (
         description.format(collection_name=safe_collection)
         if "{collection_name}" in description
@@ -192,16 +192,7 @@ def get_retriever_tool(
             collection_name=safe_collection,
             k=k,
         ) as span:
-            if hasattr(vectorstore, "similarity_search_with_score"):
-                raw_pairs = vectorstore.similarity_search_with_score(query, k=k)
-                docs = [doc for doc, _ in raw_pairs]
-                scored = [
-                    (doc, round(1.0 / (1.0 + max(0.0, float(dist))), 4))
-                    for doc, dist in raw_pairs
-                ]
-            else:
-                docs = retriever.invoke(query)
-                scored = docs
+            docs, scored = similarity_search_with_scores(vectorstore, query, k=k)
             metrics = record_retrieval_metrics(scored, is_tool_call=True)
             safe_docs = sanitize_retrieved_documents(docs)
             record_retrieved_chunks(len(safe_docs))
@@ -225,3 +216,4 @@ __all__ = [
     "get_retriever_tool",
     "safe_tool_name",
 ]
+

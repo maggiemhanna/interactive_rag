@@ -54,11 +54,12 @@ def export_my_data_inventory(uid: str = Depends(get_current_user)) -> Dict[str, 
     except HTTPException:
         raise
     except Exception:
-        logger.exception(f"Error building DSAR data inventory for uid='{uid}'")
+        logger.exception(f"Error building DSAR data inventory for uid='{uid}'.")
         emit_audit_event(
             "dsar.export_inventory",
             severity="ERROR",
             status="error",
+            http_status=500,
             uid=uid,
         )
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_MESSAGE)
@@ -104,20 +105,23 @@ def erase_my_data(uid: str = Depends(get_current_user)) -> Dict[str, Any]:
             "dsar.erase_user_data",
             severity="WARNING",
             status="lock_timeout",
+            http_status=409,
             uid=uid,
         )
         raise HTTPException(status_code=409, detail=str(e))
     except HTTPException:
         raise
     except Exception:
-        logger.exception(f"Error erasing DSAR user data for uid='{uid}'")
+        logger.exception(f"Error erasing DSAR user data for uid='{uid}'.")
         emit_audit_event(
             "dsar.erase_user_data",
             severity="ERROR",
             status="error",
+            http_status=500,
             uid=uid,
         )
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_MESSAGE)
 
 
 __all__ = ["compliance_router", "erase_my_data", "export_my_data_inventory"]
+

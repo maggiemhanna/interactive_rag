@@ -18,6 +18,7 @@ if TYPE_CHECKING:
         list_collections,
         remove_collection,
         require_collection,
+        similarity_search_with_scores,
     )
     from src.core.storage.gcs_sync import archive_upload
     from src.core.storage.locks import (
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
         user_write_lock,
     )
     from src.core.storage.paths import (
+        SAFE_FILENAME_RE,
         SQLITE_FILENAME,
         VERSION_FILENAME,
         checkpoint_sqlite_wal,
@@ -46,12 +48,14 @@ _EXPORT_MAP: dict[str, str] = {
     "list_collections": "src.core.storage.chroma",
     "remove_collection": "src.core.storage.chroma",
     "require_collection": "src.core.storage.chroma",
+    "similarity_search_with_scores": "src.core.storage.chroma",
     "archive_upload": "src.core.storage.gcs_sync",
     "LockTimeoutError": "src.core.storage.locks",
     "evict_tmp_cache": "src.core.storage.locks",
     "sync_user_dir": "src.core.storage.locks",
     "user_read_lock": "src.core.storage.locks",
     "user_write_lock": "src.core.storage.locks",
+    "SAFE_FILENAME_RE": "src.core.storage.paths",
     "SQLITE_FILENAME": "src.core.storage.paths",
     "VERSION_FILENAME": "src.core.storage.paths",
     "checkpoint_sqlite_wal": "src.core.storage.paths",

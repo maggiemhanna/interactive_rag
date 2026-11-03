@@ -20,7 +20,6 @@ if TYPE_CHECKING:
         screen_user_prompt,
     )
     from src.core.ai_security.guardrails import (
-        get_bounded_recursion_limit,
         validate_chunk_count,
         validate_collection_name,
         validate_embedding_model,
@@ -46,7 +45,6 @@ _EXPORT_MAP: dict[str, str] = {
     "sanitize_model_output": "src.core.ai_security.armor",
     "sanitize_retrieved_documents": "src.core.ai_security.armor",
     "screen_user_prompt": "src.core.ai_security.armor",
-    "get_bounded_recursion_limit": "src.core.ai_security.guardrails",
     "validate_chunk_count": "src.core.ai_security.guardrails",
     "validate_collection_name": "src.core.ai_security.guardrails",
     "validate_embedding_model": "src.core.ai_security.guardrails",

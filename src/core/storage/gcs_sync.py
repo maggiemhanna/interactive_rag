@@ -20,6 +20,7 @@ from google.api_core import exceptions as gcs_exceptions
 from google.cloud import storage
 
 from src.core.auth import validate_uid
+from src.core.config import get_google_cloud_project
 from src.core.logger import setup_logging
 from src.core.observability.tracing import start_span
 from src.core.storage.paths import (
@@ -69,7 +70,7 @@ def _get_gcs_client() -> storage.Client:
         return _gcs_client
     with _gcs_client_lock:
         if _gcs_client is None:
-            project = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip() or None
+            project = get_google_cloud_project() or None
             _gcs_client = storage.Client(project=project)
         return _gcs_client
 

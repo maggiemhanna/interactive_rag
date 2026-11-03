@@ -113,6 +113,42 @@ def reset_rate_limiters(uid: Optional[str] = None) -> None:
     _QUERY_RATE_LIMITER.reset(uid=uid)
 
 
+def _enforce_rate_limit(
+    uid: str,
+    *,
+    limiter: SlidingWindowRateLimiter,
+    limit: int,
+    scope: str,
+    log_label: str,
+    detail_label: str,
+) -> None:
+    """Checks `limiter` for `uid` against `limit`, emitting an audit event and raising HTTP 429 on overflow."""
+    allowed, retry_after = limiter.check_and_record(uid=uid, limit=limit)
+    if allowed:
+        return
+
+    logger.warning(
+        f"{log_label} rate limit exceeded for uid='{uid}' (limit={limit}/min, retry_after={retry_after}s)."
+    )
+    emit_audit_event(
+        "policy.rate_limit_exceeded",
+        severity="WARNING",
+        status="blocked",
+        uid=uid,
+        scope=scope,
+        limit_per_minute=limit,
+        retry_after_seconds=retry_after,
+    )
+    raise HTTPException(
+        status_code=429,
+        detail=(
+            f"{detail_label} rate limit exceeded ({limit} requests per minute). "
+            f"Please retry after {retry_after} seconds."
+        ),
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
 def enforce_ingest_rate_limit(uid: str) -> None:
     """Enforces `RATE_LIMIT_INGEST_PER_MINUTE` for `uid`, raising HTTP 429 with `Retry-After` if exceeded.
 
@@ -122,30 +158,13 @@ def enforce_ingest_rate_limit(uid: str) -> None:
     Raises:
         HTTPException: HTTP 429 (`Too Many Requests`) with `Retry-After` header when rate-limited.
     """
-    limit = get_rate_limit_ingest_per_minute()
-    allowed, retry_after = _INGEST_RATE_LIMITER.check_and_record(uid=uid, limit=limit)
-    if allowed:
-        return
-
-    logger.warning(
-        f"Ingest rate limit exceeded for uid='{uid}' (limit={limit}/min, retry_after={retry_after}s)."
-    )
-    emit_audit_event(
-        "policy.rate_limit_exceeded",
-        severity="WARNING",
-        status="blocked",
-        uid=uid,
+    _enforce_rate_limit(
+        uid,
+        limiter=_INGEST_RATE_LIMITER,
+        limit=get_rate_limit_ingest_per_minute(),
         scope="ingest",
-        limit_per_minute=limit,
-        retry_after_seconds=retry_after,
-    )
-    raise HTTPException(
-        status_code=429,
-        detail=(
-            f"Ingestion rate limit exceeded ({limit} requests per minute). "
-            f"Please retry after {retry_after} seconds."
-        ),
-        headers={"Retry-After": str(retry_after)},
+        log_label="Ingest",
+        detail_label="Ingestion",
     )
 
 
@@ -158,30 +177,13 @@ def enforce_query_rate_limit(uid: str) -> None:
     Raises:
         HTTPException: HTTP 429 (`Too Many Requests`) with `Retry-After` header when rate-limited.
     """
-    limit = get_rate_limit_query_per_minute()
-    allowed, retry_after = _QUERY_RATE_LIMITER.check_and_record(uid=uid, limit=limit)
-    if allowed:
-        return
-
-    logger.warning(
-        f"Query rate limit exceeded for uid='{uid}' (limit={limit}/min, retry_after={retry_after}s)."
-    )
-    emit_audit_event(
-        "policy.rate_limit_exceeded",
-        severity="WARNING",
-        status="blocked",
-        uid=uid,
+    _enforce_rate_limit(
+        uid,
+        limiter=_QUERY_RATE_LIMITER,
+        limit=get_rate_limit_query_per_minute(),
         scope="query",
-        limit_per_minute=limit,
-        retry_after_seconds=retry_after,
-    )
-    raise HTTPException(
-        status_code=429,
-        detail=(
-            f"Query rate limit exceeded ({limit} requests per minute). "
-            f"Please retry after {retry_after} seconds."
-        ),
-        headers={"Retry-After": str(retry_after)},
+        log_label="Query",
+        detail_label="Query",
     )
 
 

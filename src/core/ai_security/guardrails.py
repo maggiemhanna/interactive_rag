@@ -1,18 +1,16 @@
-"""Model access controls, input/ingestion ceilings, and bounded search loops (Pillar 3: AI Security).
+"""Model access controls and input/ingestion ceilings (Pillar 3: AI Security).
 
 Enforces server-side allowlists and resource guardrails across all API endpoints:
 - Approved generative LLM and embedding model catalogs (`ALLOWED_LLM_MODELS`, `ALLOWED_EMBEDDING_MODELS`).
 - Strict collection identifier validation preventing prompt smuggling or path traversal.
 - Query character length ceilings (`MAX_QUERY_CHARS`).
 - Ingestion file-count (`MAX_FILES_PER_REQUEST`) and chunk-count (`MAX_CHUNKS_PER_INGEST`) ceilings.
-- Bounded LangGraph tool-calling loop limits (`AGENT_RECURSION_LIMIT`).
 """
 
-from typing import Optional
+from typing import Any, Optional
 
 from src.core.config import (
     COLLECTION_NAME_PATTERN,
-    get_agent_recursion_limit,
     get_allowed_embedding_models,
     get_allowed_llm_models,
     get_max_chunks_per_ingest,
@@ -49,7 +47,7 @@ def validate_collection_name(collection_name: Optional[str]) -> str:
     return cleaned
 
 
-def validate_llm_model(model_name: Optional[str] = None) -> str:
+def validate_llm_model(model_name: Optional[Any] = None) -> str:
     """Validates `model_name` against the server-enforced `ALLOWED_LLM_MODELS` catalog.
 
     Defaults to the first approved model in `ALLOWED_LLM_MODELS` when `model_name` is omitted
@@ -62,8 +60,10 @@ def validate_llm_model(model_name: Optional[str] = None) -> str:
         Approved generative LLM model identifier.
 
     Raises:
-        ValueError: If `model_name` is not in `ALLOWED_LLM_MODELS` or the catalog env var is unset.
+        ValueError: If `model_name` is not a string, not in `ALLOWED_LLM_MODELS`, or the catalog env var is unset.
     """
+    if model_name is not None and not isinstance(model_name, str):
+        raise ValueError("model_name must be a string.")
     allowed = get_allowed_llm_models()
     cleaned = (model_name or "").strip() or allowed[0]
     if cleaned not in allowed:
@@ -74,7 +74,7 @@ def validate_llm_model(model_name: Optional[str] = None) -> str:
     return cleaned
 
 
-def validate_embedding_model(embedding_model: Optional[str] = None) -> str:
+def validate_embedding_model(embedding_model: Optional[Any] = None) -> str:
     """Validates `embedding_model` against the server-enforced `ALLOWED_EMBEDDING_MODELS` catalog.
 
     Defaults to the first approved model in `ALLOWED_EMBEDDING_MODELS` when `embedding_model`
@@ -87,8 +87,10 @@ def validate_embedding_model(embedding_model: Optional[str] = None) -> str:
         Approved embedding model identifier.
 
     Raises:
-        ValueError: If `embedding_model` is not in `ALLOWED_EMBEDDING_MODELS` or the catalog is unset.
+        ValueError: If `embedding_model` is not a string, not in `ALLOWED_EMBEDDING_MODELS`, or the catalog is unset.
     """
+    if embedding_model is not None and not isinstance(embedding_model, str):
+        raise ValueError("embedding_model must be a string.")
     allowed = get_allowed_embedding_models()
     cleaned = (embedding_model or "").strip() or allowed[0]
     if cleaned not in allowed:
@@ -166,17 +168,7 @@ def validate_chunk_count(chunk_count: int) -> int:
     return chunk_count
 
 
-def get_bounded_recursion_limit() -> int:
-    """Returns the bounded LangGraph `recursion_limit` preventing runaway agent tool loops.
-
-    Returns:
-        Positive integer `recursion_limit` configured via `AGENT_RECURSION_LIMIT` (default `6`).
-    """
-    return get_agent_recursion_limit()
-
-
 __all__ = [
-    "get_bounded_recursion_limit",
     "validate_chunk_count",
     "validate_collection_name",
     "validate_embedding_model",

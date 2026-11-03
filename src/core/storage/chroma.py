@@ -6,10 +6,11 @@ loading, and deletion operations over a tenant's `persist_directory`.
 """
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import chromadb
 from langchain_chroma import Chroma
+from langchain_core.documents import Document
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 from src.core.ai_security.guardrails import (
@@ -17,6 +18,7 @@ from src.core.ai_security.guardrails import (
     validate_embedding_model,
 )
 from src.core.compliance.residency import validate_gcp_region
+from src.core.config import get_google_cloud_project
 from src.core.storage.paths import SQLITE_FILENAME
 
 
@@ -38,7 +40,7 @@ def get_embeddings(
     safe_location = validate_gcp_region()
     return GoogleGenerativeAIEmbeddings(
         model=safe_model,
-        project=os.getenv("GOOGLE_CLOUD_PROJECT"),
+        project=get_google_cloud_project() or None,
         location=safe_location,
         vertexai=True,
     )
@@ -65,6 +67,43 @@ def get_vectorstore(
         embedding_function=get_embeddings(embedding_model=embedding_model),
         collection_name=safe_collection,
     )
+
+
+def similarity_search_with_scores(
+    vectorstore: Any,
+    query: str,
+    k: int = 5,
+) -> Tuple[List[Document], List[Any]]:
+    """Executes top-k similarity search and converts raw distances into normalized `[0.0, 1.0]` scores.
+
+    Falls back to `vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": k})`
+    when `vectorstore` is a lightweight test double that does not implement
+    `similarity_search_with_score`.
+
+    Args:
+        vectorstore: Initialized `Chroma` vectorstore (or retriever-compatible mock).
+        query: Validated search query string.
+        k: Maximum number of passages to retrieve.
+
+    Returns:
+        Tuple of `(docs, scored_items)` where `docs` is `List[Document]` and `scored_items`
+        is suitable for `record_retrieval_metrics(...)`.
+    """
+    if hasattr(vectorstore, "similarity_search_with_score"):
+        raw_pairs = vectorstore.similarity_search_with_score(query, k=k)
+        docs = [doc for doc, _ in raw_pairs]
+        scored: List[Any] = [
+            (doc, round(1.0 / (1.0 + max(0.0, float(dist))), 4))
+            for doc, dist in raw_pairs
+        ]
+        return docs, scored
+
+    retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": k},
+    )
+    docs = list(retriever.invoke(query))
+    return docs, docs
 
 
 def has_sqlite(persist_directory: str) -> bool:
@@ -146,4 +185,6 @@ __all__ = [
     "list_collections",
     "remove_collection",
     "require_collection",
+    "similarity_search_with_scores",
 ]
+

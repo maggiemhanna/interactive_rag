@@ -10,7 +10,6 @@ structured JSON record per completed request to `interactiverag-telemetry`.
 from datetime import datetime, timezone
 import json
 import math
-import os
 import sys
 import threading
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -19,12 +18,18 @@ import uuid
 from google.cloud import logging as cloud_logging
 
 from src.core.compliance.state import get_retrieved_chunks_count
-from src.core.config import get_google_cloud_location
+from src.core.config import (
+    DEFAULT_TELEMETRY_LOG_NAME,
+    get_google_cloud_location,
+    get_google_cloud_project,
+    get_telemetry_log_name,
+    is_telemetry_cloud_logging_enabled,
+)
 from src.core.context import (
     get_active_span_id,
     get_request_context,
     get_service_name,
-    hash_query,
+    scrub_query_fields,
 )
 from src.core.logger import setup_logging
 from src.core.observability.state import (
@@ -40,21 +45,11 @@ from src.core.observability.state import (
     record_tool_call,
 )
 
-logger = setup_logging(name="telemetry")
-
-DEFAULT_TELEMETRY_LOG_NAME = "interactiverag-telemetry"
+logger = setup_logging(name="observability.telemetry")
 
 _cloud_loggers: Dict[Tuple[str, str], Any] = {}
 _cloud_loggers_lock = threading.Lock()
 _telemetry_listeners: List[Callable[[Dict[str, Any]], None]] = []
-
-
-def get_telemetry_log_name() -> str:
-    """Returns the target GCP Cloud Logging telemetry log name (defaults to `'interactiverag-telemetry'`)."""
-    return (
-        os.getenv("TELEMETRY_LOG_NAME", DEFAULT_TELEMETRY_LOG_NAME).strip()
-        or DEFAULT_TELEMETRY_LOG_NAME
-    )
 
 
 def _is_cloud_logging_enabled() -> bool:
@@ -63,16 +58,10 @@ def _is_cloud_logging_enabled() -> bool:
     Honors explicit `TELEMETRY_CLOUD_LOGGING_ENABLED` overrides and disables live network calls
     automatically under `unittest`/`pytest` unless explicitly opted in.
     """
-    explicit = os.getenv("TELEMETRY_CLOUD_LOGGING_ENABLED", "").strip().lower()
-    if explicit in {"1", "true", "yes"}:
-        return bool(os.getenv("GOOGLE_CLOUD_PROJECT", "").strip())
-    if explicit in {"0", "false", "no"}:
-        return False
-
-    if "unittest" in sys.modules or "pytest" in sys.modules:
-        return False
-
-    return bool(os.getenv("GOOGLE_CLOUD_PROJECT", "").strip())
+    default_enabled = not ("unittest" in sys.modules or "pytest" in sys.modules)
+    return is_telemetry_cloud_logging_enabled(default=default_enabled) and bool(
+        get_google_cloud_project()
+    )
 
 
 def _get_cloud_logger(project_id: str, log_name: str) -> Any:
@@ -258,23 +247,14 @@ def emit_telemetry_event(
         Complete structured telemetry record dictionary that was published.
     """
     state = get_request_context()
-    project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+    project_id = get_google_cloud_project()
     resolved_uid = uid or (state.uid if state is not None else None)
     request_id = state.request_id if state is not None else f"req-{uuid.uuid4().hex}"
     trace_id = state.trace_id if state is not None else ""
     span_id = get_active_span_id()
     service_name = state.service_name if state is not None else get_service_name()
     normalized_severity = (severity or "INFO").strip().upper()
-
-    safe_fields: Dict[str, Any] = {}
-    for key, value in fields.items():
-        if value is None:
-            continue
-        if key in {"query", "prompt", "raw_query", "user_prompt"} and isinstance(value, str):
-            safe_fields["query_sha256"] = hash_query(value)
-            safe_fields["query_chars"] = len(value)
-            continue
-        safe_fields[key] = value
+    safe_fields = scrub_query_fields(fields)
 
     spans = get_recorded_spans()
     stage_latency_ms = get_stage_latency_ms()

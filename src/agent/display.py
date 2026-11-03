@@ -16,6 +16,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from src.agent.graph import extract_message_text
+
 logging.getLogger().setLevel(logging.ERROR)
 warnings.filterwarnings("ignore")
 
@@ -60,21 +62,17 @@ def print_event(message: BaseMessage) -> None:
 
     if isinstance(message, SystemMessage):
         print_message_header("System Message", "blue")
-        console.print(Markdown(str(message.content)))
+        console.print(Markdown(extract_message_text(message.content)))
 
     if isinstance(message, HumanMessage):
         print_message_header("Human Message", "green")
-        console.print(Markdown(str(message.content)))
+        console.print(Markdown(extract_message_text(message.content)))
 
     elif isinstance(message, AIMessage):
         print_message_header("AI Message", "magenta")
-        if message.content:
-            if isinstance(message.content, list):
-                for item in message.content:
-                    if isinstance(item, dict) and "text" in item:
-                        console.print(Markdown(str(item["text"])))
-            else:
-                console.print(Markdown(str(message.content)))
+        text = extract_message_text(message.content)
+        if text:
+            console.print(Markdown(text))
 
         # Handle tool calls if they exist
         if message.tool_calls:

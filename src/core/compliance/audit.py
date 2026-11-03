@@ -6,7 +6,6 @@ with automatic Cloud Trace correlation and graceful stdout JSON fallback when ru
 
 from datetime import datetime, timezone
 import json
-import os
 import sys
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -14,22 +13,26 @@ import uuid
 
 from google.cloud import logging as cloud_logging
 
-from src.core.config import get_google_cloud_location
-from src.core.context import get_request_context, get_service_name, hash_query
+from src.core.config import (
+    DEFAULT_AUDIT_LOG_NAME,
+    get_audit_log_name,
+    get_google_cloud_location,
+    get_google_cloud_project,
+    is_audit_cloud_logging_enabled,
+)
+from src.core.context import (
+    get_request_context,
+    get_service_name,
+    hash_query,
+    scrub_query_fields,
+)
 from src.core.logger import setup_logging
 
-logger = setup_logging(name="audit")
-
-DEFAULT_AUDIT_LOG_NAME = "interactiverag-audit"
+logger = setup_logging(name="compliance.audit")
 
 _cloud_loggers: Dict[Tuple[str, str], Any] = {}
 _cloud_loggers_lock = threading.Lock()
 _audit_listeners: List[Callable[[Dict[str, Any]], None]] = []
-
-
-def get_audit_log_name() -> str:
-    """Returns the target GCP Cloud Logging log name (defaults to `'interactiverag-audit'`)."""
-    return os.getenv("AUDIT_LOG_NAME", DEFAULT_AUDIT_LOG_NAME).strip() or DEFAULT_AUDIT_LOG_NAME
 
 
 def _is_cloud_logging_enabled() -> bool:
@@ -41,17 +44,10 @@ def _is_cloud_logging_enabled() -> bool:
     Returns:
         True when Cloud Logging publishing is active and `GOOGLE_CLOUD_PROJECT` is configured.
     """
-    explicit = os.getenv("AUDIT_CLOUD_LOGGING_ENABLED", "").strip().lower()
-    if explicit in {"1", "true", "yes"}:
-        return bool(os.getenv("GOOGLE_CLOUD_PROJECT", "").strip())
-    if explicit in {"0", "false", "no"}:
-        return False
-
-    # Keep offline unit test suites fast and side-effect-free unless explicitly enabled
-    if "unittest" in sys.modules or "pytest" in sys.modules:
-        return False
-
-    return bool(os.getenv("GOOGLE_CLOUD_PROJECT", "").strip())
+    default_enabled = not ("unittest" in sys.modules or "pytest" in sys.modules)
+    return is_audit_cloud_logging_enabled(default=default_enabled) and bool(
+        get_google_cloud_project()
+    )
 
 
 def _get_cloud_logger(project_id: str, log_name: str) -> Any:
@@ -125,23 +121,13 @@ def emit_audit_event(
         Complete structured audit record dictionary that was published.
     """
     state = get_request_context()
-    project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+    project_id = get_google_cloud_project()
     resolved_uid = uid or (state.uid if state is not None else None)
     request_id = state.request_id if state is not None else f"req-{uuid.uuid4().hex}"
     trace_id = state.trace_id if state is not None else ""
     service_name = state.service_name if state is not None else get_service_name()
     normalized_severity = (severity or "INFO").strip().upper()
-
-    safe_fields: Dict[str, Any] = {}
-    for key, value in fields.items():
-        if value is None:
-            continue
-        # Defense-in-depth: never allow raw query or prompt strings inside audit payloads
-        if key in {"query", "prompt", "raw_query", "user_prompt"} and isinstance(value, str):
-            safe_fields["query_sha256"] = hash_query(value)
-            safe_fields["query_chars"] = len(value)
-            continue
-        safe_fields[key] = value
+    safe_fields = scrub_query_fields(fields)
 
     record: Dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),

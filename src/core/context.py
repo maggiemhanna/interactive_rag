@@ -9,17 +9,21 @@ downstream `compliance` and `observability` modules.
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 import hashlib
-import os
 import re
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 import uuid
+
+from src.core.config import get_cloud_run_service
 
 # Allow safe, single-line correlation IDs and prevent CRLF / header log injection
 REQUEST_ID_PATTERN = re.compile(r"^[a-zA-Z0-9._:-]{1,128}$")
 TRACE_ID_PATTERN = re.compile(r"^[a-fA-F0-9]{16,64}$")
 SPAN_ID_HEX_PATTERN = re.compile(r"^[a-fA-F0-9]{1,16}$")
+
+# Field names containing raw query/prompt text that must always be hashed in logs/spans/events
+RAW_QUERY_KEYS: frozenset[str] = frozenset({"query", "prompt", "raw_query", "user_prompt"})
 
 
 def hash_query(text: Optional[str]) -> str:
@@ -33,6 +37,31 @@ def hash_query(text: Optional[str]) -> str:
     """
     normalized = (text or "").strip().encode("utf-8")
     return hashlib.sha256(normalized).hexdigest()
+
+
+def scrub_query_fields(fields: Mapping[str, Any]) -> Dict[str, Any]:
+    """Replaces raw query/prompt keys with `query_sha256` and `query_chars` and omits `None` values.
+
+    Guarantees that raw user queries or prompts are never persisted in compliance audit records,
+    telemetry payloads, structured logs, or trace span attributes.
+
+    Args:
+        fields: Arbitrary key-value metadata mapping.
+
+    Returns:
+        Sanitized dictionary with raw query keys converted to `query_sha256` and `query_chars`.
+    """
+    safe_fields: Dict[str, Any] = {}
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if key in RAW_QUERY_KEYS:
+            text = str(value)
+            safe_fields["query_sha256"] = hash_query(text)
+            safe_fields["query_chars"] = len(text)
+        else:
+            safe_fields[key] = value
+    return safe_fields
 
 
 def generate_span_id() -> str:
@@ -113,7 +142,7 @@ class RequestContext:
         trace_id: Extracted hex trace identifier from `X-Cloud-Trace-Context`, if present.
         root_span_id: Root 16-char hex span ID for the HTTP request.
         active_span_id: Currently active 16-char hex span ID (updated as child spans enter/exit).
-        service_name: Logical service identifier (`ingestion-api` or `agent-api`).
+        service_name: Logical service identifier (`'ingest-api'` or `'agent-api'`).
         uid: Verified tenant user identifier bound during JWT authentication.
         method: HTTP request method (e.g., `'POST'`).
         path: HTTP request path (e.g., `'/agent/stream'`).
@@ -217,7 +246,7 @@ def get_service_name() -> str:
     state = _request_context_var.get()
     if state is not None and state.service_name:
         return state.service_name
-    return os.getenv("K_SERVICE", "").strip() or "interactiverag"
+    return get_cloud_run_service() or "interactiverag"
 
 
 def set_request_uid(uid: Optional[str]) -> None:
@@ -250,7 +279,7 @@ class RequestCorrelationMiddleware:
 
         Args:
             app: Downstream ASGI application.
-            service_name: Logical service name (`'ingestion-api'` or `'agent-api'`).
+            service_name: Logical service name (`'ingest-api'` or `'agent-api'`).
         """
         self.app = app
         self.service_name = service_name
@@ -313,6 +342,7 @@ class RequestCorrelationMiddleware:
 
 
 __all__ = [
+    "RAW_QUERY_KEYS",
     "REQUEST_ID_PATTERN",
     "SPAN_ID_HEX_PATTERN",
     "TRACE_ID_PATTERN",
@@ -331,6 +361,8 @@ __all__ = [
     "hash_query",
     "reset_request_context",
     "sanitize_request_id",
+    "scrub_query_fields",
     "set_active_span_id",
     "set_request_uid",
 ]
+

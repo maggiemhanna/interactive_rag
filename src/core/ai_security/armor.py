@@ -13,7 +13,6 @@ Provides regional, fail-closed runtime inspection across three RAG stages:
 from concurrent.futures import ThreadPoolExecutor
 import contextvars
 from dataclasses import dataclass
-import os
 import re
 import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -26,7 +25,7 @@ from src.core.ai_security.safety import (
     PROMPT_BLOCKED_MESSAGE,
     SAFETY_REFUSAL_MESSAGE,
 )
-from src.core.compliance.audit import emit_audit_event, hash_query
+from src.core.compliance.audit import emit_audit_event
 from src.core.compliance.residency import validate_gcp_region
 from src.core.compliance.state import (
     mark_model_armor_active,
@@ -34,6 +33,7 @@ from src.core.compliance.state import (
     record_guardrail_action,
 )
 from src.core.config import (
+    get_google_cloud_project,
     get_model_armor_location,
     get_model_armor_template_id,
     is_cloud_run,
@@ -41,7 +41,7 @@ from src.core.config import (
 )
 from src.core.logger import setup_logging
 
-logger = setup_logging(name="security")
+logger = setup_logging(name="ai_security.armor")
 
 _TEMPLATE_PATH_RE = re.compile(
     r"^projects/(?P<project>[^/]+)/locations/(?P<location>[^/]+)/templates/(?P<template>[^/]+)$"
@@ -106,7 +106,7 @@ def _resolve_model_armor_target() -> Optional[Tuple[str, str]]:
     if match:
         return raw_template, validate_gcp_region(match.group("location"))
 
-    project = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+    project = get_google_cloud_project()
     location = validate_gcp_region(get_model_armor_location())
     if not project:
         raise RuntimeError(
@@ -392,14 +392,11 @@ def screen_user_prompt(prompt: str) -> ScreeningDecision:
         SecurityScreeningUnavailableError: When `MODEL_ARMOR_FAIL_CLOSED=true` and Model Armor
             is unconfigured or returns an upstream API error.
     """
-    prompt_digest = hash_query(prompt)
-    prompt_len = len(prompt)
     fail_closed = is_model_armor_fail_closed()
     target = ensure_screening_available(
         stage="input",
         audit_event_type="security.prompt_screening_error",
-        query_sha256=prompt_digest,
-        query_chars=prompt_len,
+        prompt=prompt,
     )
     if target is None:
         return ScreeningDecision(allowed=True, text=prompt)
@@ -431,8 +428,7 @@ def screen_user_prompt(prompt: str) -> ScreeningDecision:
                 severity="WARNING",
                 status="blocked",
                 reason=decision.blocked_reason,
-                query_sha256=prompt_digest,
-                query_chars=prompt_len,
+                prompt=prompt,
             )
         return decision
     except SecurityScreeningUnavailableError:
@@ -445,8 +441,7 @@ def screen_user_prompt(prompt: str) -> ScreeningDecision:
             severity="ERROR",
             status="screening_unavailable" if fail_closed else "error",
             reason="model_armor_error",
-            query_sha256=prompt_digest,
-            query_chars=prompt_len,
+            prompt=prompt,
         )
         if fail_closed:
             raise SecurityScreeningUnavailableError(

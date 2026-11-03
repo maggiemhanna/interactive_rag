@@ -26,11 +26,37 @@ load_env()
 INGEST_PORT = 8000
 AGENT_PORT = 8001
 
+DEFAULT_AUDIT_LOG_NAME = "interactiverag-audit"
+DEFAULT_TELEMETRY_LOG_NAME = "interactiverag-telemetry"
+
 # Strict collection name pattern preventing prompt/schema smuggling via collection labels
 COLLECTION_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 # Concrete single-region GCP identifier pattern (rejects 'global' and multi-regions like 'us'/'eu')
 GCP_REGION_PATTERN = re.compile(r"^[a-z]+-[a-z]+[0-9]+$")
+
+TRUE_ENV_VALUES = frozenset({"1", "true", "yes"})
+FALSE_ENV_VALUES = frozenset({"0", "false", "no"})
+
+
+def parse_bool_env(env_var: str, default: bool = False) -> bool:
+    """Parses a boolean flag from an environment variable with a safe fallback.
+
+    Recognizes truthy values (`'1'`, `'true'`, `'yes'`) and falsy values (`'0'`, `'false'`, `'no'`).
+
+    Args:
+        env_var: Name of the boolean environment variable to read.
+        default: Fallback boolean returned when unset or unrecognized.
+
+    Returns:
+        Parsed boolean value from the environment or `default`.
+    """
+    raw = os.getenv(env_var, "").strip().lower()
+    if raw in TRUE_ENV_VALUES:
+        return True
+    if raw in FALSE_ENV_VALUES:
+        return False
+    return default
 
 
 def _parse_required_csv_models(env_var: str) -> Tuple[str, ...]:
@@ -96,13 +122,68 @@ def _parse_non_negative_int(env_var: str, default: int) -> int:
         return default
 
 
+def _parse_positive_float(env_var: str, default: float) -> float:
+    """Parses a positive float (`> 0.0`) from an environment variable with a safe fallback.
+
+    Args:
+        env_var: Name of the floating-point environment variable to read.
+        default: Fallback positive float returned when unset, non-numeric, or `<= 0.0`.
+
+    Returns:
+        Positive float value from the environment or `default`.
+    """
+    raw = os.getenv(env_var, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+        return value if value > 0.0 else default
+    except ValueError:
+        return default
+
+
+def get_cloud_run_service() -> str:
+    """Returns the Cloud Run service name (`K_SERVICE`), or an empty string when running locally."""
+    return os.getenv("K_SERVICE", "").strip()
+
+
+def get_cloud_run_revision() -> str:
+    """Returns the Cloud Run revision identifier (`K_REVISION`), defaulting to `'local'`."""
+    return os.getenv("K_REVISION", "local").strip() or "local"
+
+
 def is_cloud_run() -> bool:
     """Checks whether the process is executing inside a Google Cloud Run container.
 
     Returns:
         True when Cloud Run's standard `K_SERVICE` environment variable is populated.
     """
-    return bool(os.getenv("K_SERVICE", "").strip())
+    return bool(get_cloud_run_service())
+
+
+def get_service_port(default_port: int) -> int:
+    """Returns the HTTP listener port (`PORT`), falling back to `default_port`."""
+    return _parse_positive_int("PORT", default_port)
+
+
+def get_google_cloud_project() -> str:
+    """Returns the configured `GOOGLE_CLOUD_PROJECT` identifier (or empty string if unset)."""
+    return os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+
+
+def get_firebase_project_id() -> str:
+    """Returns the project ID used by Firebase Admin token verification (`GOOGLE_CLOUD_PROJECT` or `FIREBASE_PROJECT_ID`)."""
+    return get_google_cloud_project() or os.getenv("FIREBASE_PROJECT_ID", "").strip()
+
+
+def get_dev_user_id() -> str:
+    """Returns the local development fallback user ID (`DEV_USER_ID`, defaulting to `'local-dev'`)."""
+    return os.getenv("DEV_USER_ID", "local-dev").strip() or "local-dev"
+
+
+def is_auth_disabled() -> bool:
+    """Returns True when `AUTH_DISABLED` is truthy in the environment (still gated by `is_cloud_run()` in auth)."""
+    return parse_bool_env("AUTH_DISABLED", default=False)
 
 
 def is_structured_logging_enabled() -> bool:
@@ -111,12 +192,7 @@ def is_structured_logging_enabled() -> bool:
     Honors explicit `STRUCTURED_LOGGING` (`true`/`false`), and defaults to `True` on
     Cloud Run (`K_SERVICE` set) and `False` during local terminal development.
     """
-    raw = os.getenv("STRUCTURED_LOGGING", "").strip().lower()
-    if raw in {"1", "true", "yes"}:
-        return True
-    if raw in {"0", "false", "no"}:
-        return False
-    return is_cloud_run()
+    return parse_bool_env("STRUCTURED_LOGGING", default=is_cloud_run())
 
 
 def is_cloud_trace_enabled() -> bool:
@@ -125,12 +201,65 @@ def is_cloud_trace_enabled() -> bool:
     Honors explicit `CLOUD_TRACE_ENABLED` (`true`/`false`), and defaults to `True` on
     Cloud Run (`K_SERVICE` set) and `False` during local development and offline tests.
     """
-    raw = os.getenv("CLOUD_TRACE_ENABLED", "").strip().lower()
-    if raw in {"1", "true", "yes"}:
-        return True
-    if raw in {"0", "false", "no"}:
-        return False
-    return is_cloud_run()
+    return parse_bool_env("CLOUD_TRACE_ENABLED", default=is_cloud_run())
+
+
+def get_audit_log_name() -> str:
+    """Returns the target GCP Cloud Logging audit log name (defaults to `'interactiverag-audit'`)."""
+    return os.getenv("AUDIT_LOG_NAME", DEFAULT_AUDIT_LOG_NAME).strip() or DEFAULT_AUDIT_LOG_NAME
+
+
+def is_audit_cloud_logging_enabled(default: bool = True) -> bool:
+    """Returns True when `AUDIT_CLOUD_LOGGING_ENABLED` permits network publishing of audit records."""
+    return parse_bool_env("AUDIT_CLOUD_LOGGING_ENABLED", default=default)
+
+
+def get_telemetry_log_name() -> str:
+    """Returns the target GCP Cloud Logging telemetry log name (defaults to `'interactiverag-telemetry'`)."""
+    return (
+        os.getenv("TELEMETRY_LOG_NAME", DEFAULT_TELEMETRY_LOG_NAME).strip()
+        or DEFAULT_TELEMETRY_LOG_NAME
+    )
+
+
+def is_telemetry_cloud_logging_enabled(default: bool = True) -> bool:
+    """Returns True when `TELEMETRY_CLOUD_LOGGING_ENABLED` permits network publishing of telemetry records."""
+    return parse_bool_env("TELEMETRY_CLOUD_LOGGING_ENABLED", default=default)
+
+
+def get_bucket_name() -> str:
+    """Returns the configured `GCS_BUCKET_NAME`, or an empty string in local-only disk mode."""
+    return os.getenv("GCS_BUCKET_NAME", "").strip()
+
+
+def get_local_chroma_root() -> str:
+    """Returns the optional `LOCAL_CHROMA_ROOT` directory override (or empty string if unset)."""
+    return os.getenv("LOCAL_CHROMA_ROOT", "").strip()
+
+
+def get_upload_tmp_root() -> str:
+    """Returns the temporary PDF upload root directory (`UPLOAD_TMP_ROOT`, defaulting to `'/tmp/uploads'`)."""
+    return os.getenv("UPLOAD_TMP_ROOT", "/tmp/uploads").strip() or "/tmp/uploads"
+
+
+def get_chroma_lock_ttl_seconds() -> float:
+    """Returns the GCS distributed write lock lease TTL in seconds (`CHROMA_LOCK_TTL_SECONDS`, default `300.0`)."""
+    return _parse_positive_float("CHROMA_LOCK_TTL_SECONDS", 300.0)
+
+
+def get_chroma_lock_timeout_seconds() -> float:
+    """Returns the GCS distributed write lock acquisition timeout in seconds (`CHROMA_LOCK_TIMEOUT_SECONDS`, default `60.0`)."""
+    return _parse_positive_float("CHROMA_LOCK_TIMEOUT_SECONDS", 60.0)
+
+
+def is_archive_uploads_enabled() -> bool:
+    """Returns True when uploaded PDFs should be archived to GCS (`ARCHIVE_UPLOADS_TO_GCS`, default `True`)."""
+    return parse_bool_env("ARCHIVE_UPLOADS_TO_GCS", default=True)
+
+
+def is_agent_console_trace_enabled() -> bool:
+    """Returns True when `AGENT_CONSOLE_TRACE` enables Rich console trace panels during local agent runs."""
+    return parse_bool_env("AGENT_CONSOLE_TRACE", default=False)
 
 
 def get_allowed_origins() -> List[str]:
@@ -244,7 +373,7 @@ def get_model_armor_location() -> str:
 
 def is_model_armor_fail_closed() -> bool:
     """Returns True when missing or unavailable Model Armor / Cloud DLP screening must fail closed with HTTP 503."""
-    return os.getenv("MODEL_ARMOR_FAIL_CLOSED", "false").strip().lower() in {"1", "true", "yes"}
+    return parse_bool_env("MODEL_ARMOR_FAIL_CLOSED", default=False)
 
 
 def get_rate_limit_ingest_per_minute() -> int:
@@ -292,4 +421,77 @@ CHROMA_TMP_MIN_FREE_BYTES: int = get_chroma_tmp_min_free_bytes()
 
 def is_reload_enabled() -> bool:
     """Returns True when `UVICORN_RELOAD` hot-reloading is enabled in the environment."""
-    return os.getenv("UVICORN_RELOAD", "").strip().lower() in {"1", "true", "yes"}
+    return parse_bool_env("UVICORN_RELOAD", default=False)
+
+
+__all__ = [
+    "AGENT_PORT",
+    "AGENT_RECURSION_LIMIT",
+    "CHROMA_TMP_MAX_BYTES",
+    "CHROMA_TMP_MIN_FREE_BYTES",
+    "COLLECTION_NAME_PATTERN",
+    "DEFAULT_AUDIT_LOG_NAME",
+    "DEFAULT_TELEMETRY_LOG_NAME",
+    "FALSE_ENV_VALUES",
+    "GCP_REGION_PATTERN",
+    "GEMINI_SAFETY_THRESHOLD",
+    "GOOGLE_CLOUD_LOCATION",
+    "INGEST_PORT",
+    "MAX_CHUNKS_PER_INGEST",
+    "MAX_COLLECTIONS_PER_USER",
+    "MAX_FILES_PER_REQUEST",
+    "MAX_QUERY_CHARS",
+    "MAX_UPLOAD_MB",
+    "MODEL_ARMOR_FAIL_CLOSED",
+    "MODEL_ARMOR_LOCATION",
+    "MODEL_ARMOR_TEMPLATE_ID",
+    "RATE_LIMIT_INGEST_PER_MINUTE",
+    "RATE_LIMIT_QUERY_PER_MINUTE",
+    "SRC_DIR",
+    "TRUE_ENV_VALUES",
+    "get_agent_recursion_limit",
+    "get_allowed_embedding_models",
+    "get_allowed_llm_models",
+    "get_allowed_origins",
+    "get_audit_log_name",
+    "get_bucket_name",
+    "get_chroma_lock_timeout_seconds",
+    "get_chroma_lock_ttl_seconds",
+    "get_chroma_tmp_max_bytes",
+    "get_chroma_tmp_min_free_bytes",
+    "get_cloud_run_revision",
+    "get_cloud_run_service",
+    "get_default_embedding_model",
+    "get_default_llm_model",
+    "get_dev_user_id",
+    "get_firebase_project_id",
+    "get_gemini_safety_threshold",
+    "get_google_cloud_location",
+    "get_google_cloud_project",
+    "get_local_chroma_root",
+    "get_max_chunks_per_ingest",
+    "get_max_collections_per_user",
+    "get_max_files_per_request",
+    "get_max_query_chars",
+    "get_max_upload_mb",
+    "get_model_armor_location",
+    "get_model_armor_template_id",
+    "get_rate_limit_ingest_per_minute",
+    "get_rate_limit_query_per_minute",
+    "get_service_port",
+    "get_telemetry_log_name",
+    "get_upload_tmp_root",
+    "is_agent_console_trace_enabled",
+    "is_archive_uploads_enabled",
+    "is_audit_cloud_logging_enabled",
+    "is_auth_disabled",
+    "is_cloud_run",
+    "is_cloud_trace_enabled",
+    "is_model_armor_fail_closed",
+    "is_reload_enabled",
+    "is_structured_logging_enabled",
+    "is_telemetry_cloud_logging_enabled",
+    "load_env",
+    "parse_bool_env",
+]
+

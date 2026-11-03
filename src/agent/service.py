@@ -6,7 +6,6 @@ emit EU AI Act Art. 50 `compliance` frames, and publish PII-free audit events.
 """
 
 import json
-import os
 from typing import Any, Dict, Generator, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage
@@ -14,20 +13,25 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.errors import GraphRecursionError
 
 from src.agent.display import print_event, print_header
-from src.agent.graph import build_agent
+from src.agent.graph import build_agent, extract_message_text
 from src.agent.memory import MEMORY_SAVER
 from src.agent.schemas import AgentRequest
 from src.agent.tools import get_retriever_tool
 from src.core.ai_security.armor import SecurityScreeningUnavailableError
-from src.core.ai_security.guardrails import get_bounded_recursion_limit
 from src.core.ai_security.safety import (
     INTERNAL_ERROR_MESSAGE,
     RECURSION_LIMIT_MESSAGE,
     SCREENING_UNAVAILABLE_MESSAGE,
 )
-from src.core.compliance.audit import emit_audit_event, hash_query
+from src.core.compliance.audit import emit_audit_event
 from src.core.compliance.provenance import build_compliance_metadata
-from src.core.config import is_cloud_run
+from src.core.config import (
+    get_agent_recursion_limit,
+    get_dev_user_id,
+    is_agent_console_trace_enabled,
+    is_cloud_run,
+)
+from src.core.context import scrub_query_fields
 from src.core.logger import setup_logging
 from src.core.observability.state import record_ttft
 from src.core.observability.telemetry import emit_telemetry_event
@@ -42,31 +46,58 @@ SSE_HEADERS = {
 }
 
 
-def extract_text(content: Any) -> str:
-    """Extracts plain text from a string or multimodal list `BaseMessage.content` payload.
-
-    Args:
-        content: Raw `BaseMessage.content` value.
-
-    Returns:
-        Normalized plain-text string.
-    """
-    if isinstance(content, str):
-        return content
-    elif isinstance(content, list):
-        text_parts = []
-        for part in content:
-            if isinstance(part, str):
-                text_parts.append(part)
-            elif isinstance(part, dict) and "text" in part:
-                text_parts.append(part["text"])
-        return "\n".join(text_parts)
-    return str(content)
-
-
 def _sse_frame(payload: Dict[str, Any]) -> str:
     """Formats a dictionary payload as a Server-Sent Events (`data: <json>\\n\\n`) frame."""
     return f"data: {json.dumps(payload)}\n\n"
+
+
+def emit_agent_query_events(
+    *,
+    uid: str,
+    request: AgentRequest,
+    stream: bool,
+    final_answer: str,
+    compliance_meta: Dict[str, Any],
+) -> None:
+    """Publishes the canonical `'agent.query'` compliance audit and AI telemetry records for a completed turn.
+
+    Args:
+        uid: Verified tenant user identifier.
+        request: Validated `AgentRequest` payload.
+        stream: True when executed via SSE streaming, False for synchronous JSON.
+        final_answer: Sanitized final assistant response text.
+        compliance_meta: Serialized `ComplianceMetadata` dictionary.
+    """
+    guardrail_actions = [
+        f"{action['filter']}:{action['action']}"
+        for action in compliance_meta.get("guardrail_actions", [])
+    ]
+    emit_audit_event(
+        "agent.query",
+        uid=uid,
+        collection_name=request.collection_name,
+        model_name=request.model_name,
+        embedding_model=request.embedding_model,
+        stream=stream,
+        query=request.query,
+        answer_chars=len(final_answer),
+        grounded=compliance_meta["grounded"],
+        citation_count=compliance_meta["citation_count"],
+        pii_filtered=compliance_meta["pii_filtered"],
+        guardrail_actions=guardrail_actions,
+    )
+    emit_telemetry_event(
+        "agent.query",
+        uid=uid,
+        collection_name=request.collection_name,
+        model_name=request.model_name,
+        embedding_model=request.embedding_model,
+        stream=stream,
+        query=request.query,
+        answer_chars=len(final_answer),
+        grounded=compliance_meta["grounded"],
+        citation_count=compliance_meta["citation_count"],
+    )
 
 
 def stream_events(
@@ -96,8 +127,7 @@ def stream_events(
         Dictionaries of the form `{'event': 'message', 'message': {...}}`.
     """
     show_console = not is_cloud_run() and (
-        verbose_console
-        or os.getenv("AGENT_CONSOLE_TRACE", "").strip().lower() in {"1", "true", "yes"}
+        verbose_console or is_agent_console_trace_enabled()
     )
     retriever_tool = get_retriever_tool(
         collection_name=collection_name,
@@ -106,7 +136,7 @@ def stream_events(
     )
     agent = build_agent(retriever_tool, model_name=model_name)
 
-    recursion_limit = get_bounded_recursion_limit()
+    recursion_limit = get_agent_recursion_limit()
     config: RunnableConfig = {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": recursion_limit,
@@ -128,7 +158,7 @@ def stream_events(
                 if msg_id is not None
                 else (
                     getattr(last_msg, "type", "unknown"),
-                    extract_text(getattr(last_msg, "content", "")),
+                    extract_message_text(getattr(last_msg, "content", "")),
                     repr(getattr(last_msg, "tool_calls", None)),
                 )
             )
@@ -141,7 +171,7 @@ def stream_events(
 
             msg_dict: Dict[str, Any] = {
                 "type": getattr(last_msg, "type", "unknown"),
-                "content": extract_text(getattr(last_msg, "content", "")),
+                "content": extract_message_text(getattr(last_msg, "content", "")),
             }
             if getattr(last_msg, "tool_calls", None):
                 msg_dict["tool_calls"] = last_msg.tool_calls
@@ -160,8 +190,7 @@ def stream_events(
             status="truncated",
             collection_name=collection_name,
             recursion_limit=recursion_limit,
-            query_sha256=hash_query(query),
-            query_chars=len(query),
+            query=query,
         )
         if show_console:
             print_event(AIMessage(content=RECURSION_LIMIT_MESSAGE))
@@ -192,8 +221,6 @@ def stream_sse(
     Yields:
         SSE-formatted UTF-8 event strings (`data: <json>\n\n`).
     """
-    query_digest = hash_query(request.query)
-    query_len = len(request.query)
     final_answer = ""
     streamed_messages = []
     try:
@@ -229,35 +256,12 @@ def stream_sse(
             }
         )
 
-        emit_audit_event(
-            "agent.query",
+        emit_agent_query_events(
             uid=uid,
-            collection_name=request.collection_name,
-            model_name=request.model_name,
-            embedding_model=request.embedding_model,
+            request=request,
             stream=True,
-            query_sha256=query_digest,
-            query_chars=query_len,
-            answer_chars=len(final_answer),
-            grounded=compliance_meta["grounded"],
-            citation_count=compliance_meta["citation_count"],
-            pii_filtered=compliance_meta["pii_filtered"],
-            guardrail_actions=[
-                f"{a['filter']}:{a['action']}" for a in compliance_meta["guardrail_actions"]
-            ],
-        )
-        emit_telemetry_event(
-            "agent.query",
-            uid=uid,
-            collection_name=request.collection_name,
-            model_name=request.model_name,
-            embedding_model=request.embedding_model,
-            stream=True,
-            query_sha256=query_digest,
-            query_chars=query_len,
-            answer_chars=len(final_answer),
-            grounded=compliance_meta["grounded"],
-            citation_count=compliance_meta["citation_count"],
+            final_answer=final_answer,
+            compliance_meta=compliance_meta,
         )
         yield "data: [DONE]\n\n"
     except SecurityScreeningUnavailableError as e:
@@ -276,8 +280,7 @@ def stream_sse(
             model_name=request.model_name,
             embedding_model=request.embedding_model,
             stream=True,
-            query_sha256=query_digest,
-            query_chars=query_len,
+            query=request.query,
         )
         yield _sse_frame(
             {
@@ -290,19 +293,19 @@ def stream_sse(
         yield "data: [DONE]\n\n"
     except Exception:
         logger.exception(
-            f"Unexpected error streaming Agentic RAG SSE for uid='{uid}' (thread_id='{scoped_thread_id}')"
+            f"Unexpected error streaming Agentic RAG SSE for uid='{uid}' (thread_id='{scoped_thread_id}')."
         )
         emit_audit_event(
             "agent.query",
             severity="ERROR",
             status="error",
+            http_status=500,
             uid=uid,
             collection_name=request.collection_name,
             model_name=request.model_name,
             embedding_model=request.embedding_model,
             stream=True,
-            query_sha256=query_digest,
-            query_chars=query_len,
+            query=request.query,
         )
         yield _sse_frame(
             {
@@ -325,11 +328,12 @@ def run_interactive(
         query: Sample or custom question to execute against the collection.
     """
     print_header("Agentic RAG Assistant Initialized", "magenta")
+    scrubbed = scrub_query_fields({"query": query})
     logger.info(
         f"Running interactive agent on collection '{collection_name}' "
-        f"(query_sha256='{hash_query(query)}', query_chars={len(query)})"
+        f"(query_sha256='{scrubbed['query_sha256']}', query_chars={scrubbed['query_chars']})."
     )
-    cli_uid = os.getenv("DEV_USER_ID", "local-dev").strip() or "local-dev"
+    cli_uid = get_dev_user_id()
     with user_read_lock(cli_uid) as resolved_dir:
         target_dir = resolved_dir if has_sqlite(resolved_dir) else "chroma_db"
         for _ in stream_events(
@@ -342,4 +346,11 @@ def run_interactive(
             pass
 
 
-__all__ = ["SSE_HEADERS", "extract_text", "run_interactive", "stream_events", "stream_sse"]
+__all__ = [
+    "SSE_HEADERS",
+    "emit_agent_query_events",
+    "run_interactive",
+    "stream_events",
+    "stream_sse",
+]
+

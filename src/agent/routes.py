@@ -11,7 +11,12 @@ from fastapi.responses import StreamingResponse
 
 from src.agent.memory import MEMORY_SAVER
 from src.agent.schemas import AgentRequest
-from src.agent.service import SSE_HEADERS, stream_events, stream_sse
+from src.agent.service import (
+    SSE_HEADERS,
+    emit_agent_query_events,
+    stream_events,
+    stream_sse,
+)
 from src.core.ai_security.armor import (
     SecurityScreeningUnavailableError,
     ensure_screening_available,
@@ -21,14 +26,14 @@ from src.core.ai_security.safety import (
     SCREENING_UNAVAILABLE_MESSAGE,
 )
 from src.core.auth import get_current_user
-from src.core.compliance.audit import emit_audit_event, hash_query
+from src.core.compliance.audit import emit_audit_event
 from src.core.compliance.policy import enforce_query_rate_limit
 from src.core.compliance.provenance import build_compliance_metadata
+from src.core.context import scrub_query_fields
 from src.core.logger import setup_logging
-from src.core.observability.telemetry import emit_telemetry_event
 from src.core.storage import LockTimeoutError, require_collection, user_read_lock
 
-logger = setup_logging(name="agent")
+logger = setup_logging(name="agent.routes")
 
 agent_router = APIRouter()
 
@@ -52,15 +57,14 @@ def agent(
         JSON dictionary (conforming to `AgentResponse`) when `stream=False`, or `StreamingResponse` when `stream=True`.
     """
     scoped_thread_id = f"{uid}:{request.thread_id}"
-    query_digest = hash_query(request.query)
-    query_len = len(request.query)
     try:
         enforce_query_rate_limit(uid)
         ensure_screening_available()
 
+        scrubbed = scrub_query_fields({"query": request.query})
         logger.info(
             f"Received Agentic RAG query from uid='{uid}' for collection '{request.collection_name}' "
-            f"(query_sha256='{query_digest}', query_chars={query_len}, stream={request.stream})"
+            f"(query_sha256='{scrubbed['query_sha256']}', query_chars={scrubbed['query_chars']}, stream={request.stream})."
         )
 
         # Pre-validate user's synced ChromaDB & collection so missing collections return 404 even when stream=True
@@ -105,35 +109,12 @@ def agent(
             checkpointer=MEMORY_SAVER,
         ).model_dump()
 
-        emit_audit_event(
-            "agent.query",
+        emit_agent_query_events(
             uid=uid,
-            collection_name=request.collection_name,
-            model_name=request.model_name,
-            embedding_model=request.embedding_model,
+            request=request,
             stream=False,
-            query_sha256=query_digest,
-            query_chars=query_len,
-            answer_chars=len(final_answer),
-            grounded=compliance_meta["grounded"],
-            citation_count=compliance_meta["citation_count"],
-            pii_filtered=compliance_meta["pii_filtered"],
-            guardrail_actions=[
-                a["filter"] + ":" + a["action"] for a in compliance_meta["guardrail_actions"]
-            ],
-        )
-        emit_telemetry_event(
-            "agent.query",
-            uid=uid,
-            collection_name=request.collection_name,
-            model_name=request.model_name,
-            embedding_model=request.embedding_model,
-            stream=False,
-            query_sha256=query_digest,
-            query_chars=query_len,
-            answer_chars=len(final_answer),
-            grounded=compliance_meta["grounded"],
-            citation_count=compliance_meta["citation_count"],
+            final_answer=final_answer,
+            compliance_meta=compliance_meta,
         )
 
         return {
@@ -156,9 +137,10 @@ def agent(
             http_status=503,
             uid=uid,
             collection_name=request.collection_name,
+            model_name=request.model_name,
+            embedding_model=request.embedding_model,
             stream=request.stream,
-            query_sha256=query_digest,
-            query_chars=query_len,
+            query=request.query,
         )
         raise HTTPException(status_code=503, detail=SCREENING_UNAVAILABLE_MESSAGE)
     except LockTimeoutError as e:
@@ -166,11 +148,13 @@ def agent(
             "agent.query",
             severity="WARNING",
             status="lock_timeout",
+            http_status=409,
             uid=uid,
             collection_name=request.collection_name,
+            model_name=request.model_name,
+            embedding_model=request.embedding_model,
             stream=request.stream,
-            query_sha256=query_digest,
-            query_chars=query_len,
+            query=request.query,
         )
         raise HTTPException(status_code=409, detail=str(e))
     except FileNotFoundError as e:
@@ -179,26 +163,30 @@ def agent(
             "agent.query",
             severity="WARNING",
             status="not_found",
+            http_status=404,
             uid=uid,
             collection_name=request.collection_name,
+            model_name=request.model_name,
+            embedding_model=request.embedding_model,
             stream=request.stream,
-            query_sha256=query_digest,
-            query_chars=query_len,
+            query=request.query,
         )
         raise HTTPException(status_code=404, detail=str(e))
     except HTTPException:
         raise
     except Exception:
-        logger.exception(f"Error running Agentic RAG for uid='{uid}'")
+        logger.exception(f"Error running Agentic RAG for uid='{uid}'.")
         emit_audit_event(
             "agent.query",
             severity="ERROR",
             status="error",
+            http_status=500,
             uid=uid,
             collection_name=request.collection_name,
+            model_name=request.model_name,
+            embedding_model=request.embedding_model,
             stream=request.stream,
-            query_sha256=query_digest,
-            query_chars=query_len,
+            query=request.query,
         )
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_MESSAGE)
 
@@ -221,3 +209,4 @@ def agent_stream(
 
 
 __all__ = ["agent", "agent_router", "agent_stream"]
+

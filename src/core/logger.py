@@ -46,7 +46,7 @@ def setup_logging(
 
     Args:
         level: Minimum Python logging level to emit (defaults to `logging.INFO`).
-        name: Optional logger namespace (e.g., `'ingestion'`, `'agent'`, `'audit'`).
+        name: Optional hierarchical logger namespace (e.g., `'ingest.routes'`, `'agent.service'`).
         force: When `True`, rebuilds root logger handlers even if already configured.
 
     Returns:
@@ -145,3 +145,12 @@ def format_dict_for_logs(state_dict: Any, max_len: int = 100) -> str:
 
     # 5. Pretty print the resulting dictionary as JSON
     return json.dumps(truncated_dict, indent=4)
+
+
+__all__ = [
+    "DATE_FORMAT",
+    "LOG_FORMAT",
+    "format_dict_for_logs",
+    "setup_logging",
+]
+

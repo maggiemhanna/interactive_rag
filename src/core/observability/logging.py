@@ -12,13 +12,16 @@ Provides:
 from datetime import datetime, timezone
 import json
 import logging
-import os
 import re
 from typing import Any, Dict, Set
 
-from src.core.context import get_request_context, get_service_name, hash_query
-
-_RAW_QUERY_KEYS: Set[str] = {"query", "prompt", "raw_query", "user_prompt"}
+from src.core.config import get_google_cloud_project
+from src.core.context import (
+    RAW_QUERY_KEYS,
+    get_request_context,
+    get_service_name,
+    scrub_query_fields,
+)
 
 _INLINE_QUERY_RE = re.compile(
     r"""\b(?P<key>query|prompt|raw_query|user_prompt)\s*=\s*(?P<quote>['"])(?P<val>.*?)(?P=quote)(?=\s*[,)\]}\s]|$)""",
@@ -67,8 +70,8 @@ def _scrub_inline_query_text(text: str) -> str:
         return text
 
     def _replacer(match: re.Match[str]) -> str:
-        raw_val = match.group("val")
-        return f"query_sha256='{hash_query(raw_val)}', query_chars={len(raw_val)}"
+        scrubbed = scrub_query_fields({match.group("key"): match.group("val")})
+        return f"query_sha256='{scrubbed['query_sha256']}', query_chars={scrubbed['query_chars']}"
 
     return _INLINE_QUERY_RE.sub(_replacer, text)
 
@@ -103,26 +106,20 @@ class RequestContextLogFilter(logging.Filter):
             record.http_method = getattr(record, "http_method", "")
             record.http_path = getattr(record, "http_path", "")
 
-        # Scrub any raw query/prompt fields passed via `extra={...}`
-        for key in list(_RAW_QUERY_KEYS):
-            if key in record.__dict__:
-                raw_val = record.__dict__.pop(key)
-                if isinstance(raw_val, str):
-                    record.__dict__["query_sha256"] = hash_query(raw_val)
-                    record.__dict__["query_chars"] = len(raw_val)
+        # Scrub any raw query/prompt fields passed via `extra={...}` using `scrub_query_fields`
+        raw_query_extras = {
+            key: record.__dict__.pop(key)
+            for key in RAW_QUERY_KEYS
+            if key in record.__dict__
+        }
+        if raw_query_extras:
+            record.__dict__.update(scrub_query_fields(raw_query_extras))
 
         # Scrub inline `query='...'` or `prompt="..."` patterns in string log messages
         if isinstance(record.msg, str) and not record.args:
             record.msg = _scrub_inline_query_text(record.msg)
         elif isinstance(record.msg, dict):
-            cleaned_msg: Dict[str, Any] = {}
-            for k, v in record.msg.items():
-                if k in _RAW_QUERY_KEYS and isinstance(v, str):
-                    cleaned_msg["query_sha256"] = hash_query(v)
-                    cleaned_msg["query_chars"] = len(v)
-                else:
-                    cleaned_msg[k] = v
-            record.msg = cleaned_msg
+            record.msg = scrub_query_fields(record.msg)
 
         return True
 
@@ -147,7 +144,7 @@ class GCPJsonFormatter(logging.Formatter):
 
         message = _scrub_inline_query_text(record.getMessage())
         timestamp = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
-        project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+        project_id = get_google_cloud_project()
 
         payload: Dict[str, Any] = {
             "timestamp": timestamp,

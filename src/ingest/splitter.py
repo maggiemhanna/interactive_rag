@@ -6,7 +6,6 @@ Provides pure document-processing helpers independent of FastAPI HTTP request ob
 """
 
 import os
-import re
 from typing import List, Union
 
 from fastapi import HTTPException
@@ -16,10 +15,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.core.logger import setup_logging
 from src.core.observability.tracing import start_span
+from src.core.storage.paths import SAFE_FILENAME_RE
 
 logger = setup_logging(name="ingest.splitter")
-
-_SAFE_UPLOAD_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 
 
 def sanitize_filename(raw_filename: str) -> str:
@@ -35,7 +33,7 @@ def sanitize_filename(raw_filename: str) -> str:
         HTTPException: HTTP 400 if the filename does not have a `.pdf` extension.
     """
     basename = os.path.basename((raw_filename or "").replace("\\", "/")).strip()
-    cleaned = _SAFE_UPLOAD_NAME_RE.sub("_", basename).strip("._")
+    cleaned = SAFE_FILENAME_RE.sub("_", basename).strip("._")
     if not cleaned:
         cleaned = "document.pdf"
     if not cleaned.lower().endswith(".pdf"):

@@ -51,9 +51,8 @@ class QueryRequest(BaseModel):
     @classmethod
     def _check_embedding_model(cls, value: Any) -> str:
         """Validates `embedding_model` against `ALLOWED_EMBEDDING_MODELS`."""
-        if value is not None and not isinstance(value, str):
-            raise ValueError("embedding_model must be a string.")
         return validate_embedding_model(value)
 
 
 __all__ = ["QueryRequest"]
+
