@@ -1,7 +1,9 @@
-"""Shared `/collections` FastAPI router mounted on both ingestion and agent services.
+"""Authenticated `/collections` FastAPI router (`src.manage.collections`).
 
-Exposes authenticated tenant-scoped `GET /collections` and `DELETE /collections/{collection_name}`
+Exposes tenant-scoped `GET /collections` and `DELETE /collections/{collection_name}`
 endpoints backed by GCS-synced per-user ChromaDB locks and compliance audit logging.
+Mounted on `agent-api` so collection listings share the warm `/tmp/chroma_db/{uid}` cache
+with `/query` and `/agent` and remain isolated from heavy PDF ingestion workers.
 """
 
 from typing import Any, Dict
@@ -16,7 +18,7 @@ from src.core.logger import setup_logging
 from src.core.storage.chroma import list_collections, remove_collection
 from src.core.storage.locks import LockTimeoutError, user_read_lock, user_write_lock
 
-logger = setup_logging(name="storage.routes")
+logger = setup_logging(name="manage.collections")
 
 collections_router = APIRouter()
 

@@ -6,24 +6,35 @@ app_name    = "interactive-rag"
 environment = "prod"
 image_tag   = "latest"
 
-# Cloud Run Sizing
-backend_cpu          = "2"
-backend_memory       = "2Gi"
-frontend_cpu         = "1"
-frontend_memory      = "512Mi"
-min_instance_count   = 0
-max_instance_count   = 5
-bucket_force_destroy = false
+# Cloud Run Per-Service Sizing, Concurrency, Autoscaling & /tmp Cache Quotas
+ingest_cpu                 = "2"
+ingest_memory              = "4Gi"
+ingest_concurrency         = 4
+ingest_min_instances       = 0
+ingest_max_instances       = 5
+agent_cpu                  = "2"
+agent_memory               = "2Gi"
+agent_concurrency          = 32
+agent_min_instances        = 0
+agent_max_instances        = 10
+frontend_cpu               = "1"
+frontend_memory            = "512Mi"
+frontend_concurrency       = 80
+frontend_min_instances     = 0
+frontend_max_instances     = 5
+chroma_tmp_max_bytes       = 536870912
+chroma_tmp_min_free_bytes  = 268435456
+bucket_force_destroy       = false
 
 # Google OAuth Sign-In (credentials loaded dynamically from GCP Secret Manager)
 enable_google_oauth                = true
 google_oauth_client_id_secret_name = "google_oauth_client_id"
 google_oauth_client_secret_name    = "google_oauth_client_secret"
 
-# VPC Subnets (Direct VPC Egress for ingestion-api and agent-api + Regional PSC Endpoints)
-ingestion_subnet_cidr = "10.10.1.0/26"
-agent_subnet_cidr     = "10.10.2.0/26"
-psc_subnet_cidr       = "10.10.3.0/28"
+# VPC Subnets (Direct VPC Egress /24 subnets for ingest-api and agent-api + Regional PSC Endpoints)
+ingest_subnet_cidr = "10.10.1.0/24"
+agent_subnet_cidr  = "10.10.2.0/24"
+psc_subnet_cidr    = "10.10.3.0/28"
 
 # AI-Specific Security (Model Allowlists, Model Armor, Content Safety & Guardrail Ceilings)
 allowed_llm_models         = "gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite"
@@ -46,6 +57,8 @@ rate_limit_ingest_per_minute = 10
 rate_limit_query_per_minute  = 30
 max_collections_per_user     = 20
 
-# Observability & AI Monitoring
-observability_log_retention_days = 30
+# Observability, AI Monitoring & Alerting Thresholds
+observability_log_retention_days   = 30
+alert_agent_latency_p95_ms         = 15000
+alert_memory_utilization_threshold = 0.85
 

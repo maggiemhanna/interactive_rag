@@ -23,7 +23,7 @@ def load_env() -> None:
 # Load environment variables once on core config import before deriving defaults
 load_env()
 
-INGESTION_PORT = 8000
+INGEST_PORT = 8000
 AGENT_PORT = 8001
 
 # Strict collection name pattern preventing prompt/schema smuggling via collection labels
@@ -70,6 +70,28 @@ def _parse_positive_int(env_var: str, default: int) -> int:
     try:
         value = int(raw)
         return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+def _parse_non_negative_int(env_var: str, default: int) -> int:
+    """Parses a non-negative integer (`>= 0`) from an environment variable with a safe fallback.
+
+    Allows `0` so callers can explicitly disable optional byte/free-disk thresholds in tests.
+
+    Args:
+        env_var: Name of the integer environment variable to read.
+        default: Fallback non-negative integer returned when unset, non-numeric, or `< 0`.
+
+    Returns:
+        Non-negative integer value from the environment or `default`.
+    """
+    raw = os.getenv(env_var, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        return value if value >= 0 else default
     except ValueError:
         return default
 
@@ -240,6 +262,16 @@ def get_max_collections_per_user() -> int:
     return _parse_positive_int("MAX_COLLECTIONS_PER_USER", 20)
 
 
+def get_chroma_tmp_max_bytes() -> int:
+    """Returns the maximum total bytes permitted in `/tmp/chroma_db` before LRU tenant eviction runs."""
+    return _parse_non_negative_int("CHROMA_TMP_MAX_BYTES", 512 * 1024 * 1024)
+
+
+def get_chroma_tmp_min_free_bytes() -> int:
+    """Returns the minimum free bytes required on the `/tmp` RAM disk before LRU tenant eviction runs."""
+    return _parse_non_negative_int("CHROMA_TMP_MIN_FREE_BYTES", 256 * 1024 * 1024)
+
+
 # Module-level snapshots (for direct constant imports; runtime validators call get_* helpers)
 GOOGLE_CLOUD_LOCATION: str = get_google_cloud_location()
 MAX_QUERY_CHARS: int = get_max_query_chars()
@@ -254,6 +286,8 @@ MODEL_ARMOR_FAIL_CLOSED: bool = is_model_armor_fail_closed()
 RATE_LIMIT_INGEST_PER_MINUTE: int = get_rate_limit_ingest_per_minute()
 RATE_LIMIT_QUERY_PER_MINUTE: int = get_rate_limit_query_per_minute()
 MAX_COLLECTIONS_PER_USER: int = get_max_collections_per_user()
+CHROMA_TMP_MAX_BYTES: int = get_chroma_tmp_max_bytes()
+CHROMA_TMP_MIN_FREE_BYTES: int = get_chroma_tmp_min_free_bytes()
 
 
 def is_reload_enabled() -> bool:

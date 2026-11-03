@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=8080 \
     LOCAL_CHROMA_ROOT=/tmp/chroma_db \
-    APP_MODULE=src.ingestion.app:app
+    APP_MODULE=src.ingest.app:app
 
 WORKDIR /app
 
@@ -21,7 +21,7 @@ COPY requirements.txt ./
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
-# Copy backend source package (core, ingestion, agent)
+# Copy backend source package (core, ingest, manage, query, agent)
 COPY src/ ./src/
 
 # Run as non-root user; /tmp remains world-writable (1777) for Cloud Run tmpfs

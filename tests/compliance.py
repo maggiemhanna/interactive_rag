@@ -24,7 +24,7 @@ from src.core.compliance.residency import validate_gcp_region
 from src.core.config import get_google_cloud_location, get_model_armor_location
 from src.core.storage import chroma as chroma_module
 from src.core.storage import release_client_cache
-from src.ingestion import app as ingestion_app_module
+from src.ingest import app as ingestion_app_module
 from tests.ai_security import (
     DeterministicFakeEmbeddings,
     GroundedCitingChatModel,
@@ -370,11 +370,11 @@ class TestPhase2AuditLogging(unittest.TestCase):
             agent_graph_module, "ChatGoogleGenerativeAI", side_effect=GroundedCitingChatModel
         ):
             # 1. Auto-generated X-Request-Id when omitted, and unsafe X-Request-Id header sanitized
-            r_auto = self.ingestion_client.get("/collections")
+            r_auto = self.agent_client.get("/collections")
             self.assertEqual(r_auto.status_code, 200)
             self.assertTrue(r_auto.headers.get("x-request-id", "").startswith("req-"))
 
-            r_unsafe = self.ingestion_client.get(
+            r_unsafe = self.agent_client.get(
                 "/collections",
                 headers={"X-Request-Id": "bad id with spaces;inject"},
             )
@@ -396,7 +396,7 @@ class TestPhase2AuditLogging(unittest.TestCase):
             self.assertEqual(r_ing.status_code, 200)
             self.assertEqual(r_ing.headers.get("x-request-id"), "req-audit-e2e-001")
 
-            r_q = self.ingestion_client.post(
+            r_q = self.agent_client.post(
                 "/query",
                 headers=corr_headers,
                 json={"query": "audit revenue", "collection_name": "audit_col"},
@@ -420,7 +420,7 @@ class TestPhase2AuditLogging(unittest.TestCase):
             self.assertEqual(r_sse.status_code, 200)
             self.assertEqual(r_sse.headers.get("x-request-id"), "req-audit-e2e-001")
 
-            r_del = self.ingestion_client.delete("/collections/audit_col", headers=corr_headers)
+            r_del = self.agent_client.delete("/collections/audit_col", headers=corr_headers)
             self.assertEqual(r_del.status_code, 200)
             self.assertEqual(r_del.headers.get("x-request-id"), "req-audit-e2e-001")
 
@@ -447,8 +447,12 @@ class TestPhase2AuditLogging(unittest.TestCase):
         monitored_logger_names = [
             "",
             "audit",
-            "ingestion",
-            "ingestion.service",
+            "ingest",
+            "ingest.service",
+            "query",
+            "query.service",
+            "manage.collections",
+            "manage.compliance",
             "agent",
             "agent.stream",
             "agent.graph",
@@ -475,7 +479,7 @@ class TestPhase2AuditLogging(unittest.TestCase):
                 self.captured_events.clear()
                 log_handler.messages.clear()
 
-                r_q = self.ingestion_client.post(
+                r_q = self.agent_client.post(
                     "/query",
                     json={"query": canary, "collection_name": "scrub_col"},
                 )
@@ -526,7 +530,7 @@ class TestPhase2AuditLogging(unittest.TestCase):
             self._env(AUDIT_CLOUD_LOGGING_ENABLED="true", AUDIT_LOG_NAME="interactiverag-audit"),
             clear=False,
         ), patch.object(audit_module.cloud_logging, "Client", return_value=mock_client_instance) as mock_cls:
-            res = self.ingestion_client.get(
+            res = self.agent_client.get(
                 "/collections",
                 headers={
                     "X-Request-Id": "req-gcp-log-01",
@@ -545,7 +549,7 @@ class TestPhase2AuditLogging(unittest.TestCase):
 
             # Transient Cloud Logging error falls back gracefully without failing user requests
             mock_cloud_logger.log_struct.side_effect = RuntimeError("Logging API unavailable")
-            res_fallback = self.ingestion_client.get("/collections")
+            res_fallback = self.agent_client.get("/collections")
             self.assertEqual(res_fallback.status_code, 200)
 
     def test_auth_failures_and_security_guardrails_emit_structured_audit_events(self) -> None:
@@ -1497,7 +1501,7 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
         self.assertEqual(r_seed.status_code, 200)
 
         # 1. Local fail-open mode (MODEL_ARMOR_FAIL_CLOSED="false", template unset) -> HTTP 200
-        r_local_q = self.ingest_client.post(
+        r_local_q = self.agent_client.post(
             "/query",
             json={"query": "revenue summary", "collection_name": "policy_docs"},
         )
@@ -1541,7 +1545,7 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
             self.assertEqual(r_fc_stream.json()["detail"], SCREENING_UNAVAILABLE_MESSAGE)
 
             self.captured_events.clear()
-            r_fc_query = self.ingest_client.post(
+            r_fc_query = self.agent_client.post(
                 "/query",
                 json={"query": "revenue summary", "collection_name": "policy_docs"},
             )
@@ -1584,7 +1588,7 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
             # 3b. Chunk sanitization error on /query -> HTTP 503, zero raw chunk leakage
             self.captured_events.clear()
             mock_armor.sanitize_model_response.side_effect = RuntimeError("Cloud DLP backend unavailable")
-            r_chunk_err = self.ingest_client.post(
+            r_chunk_err = self.agent_client.post(
                 "/query",
                 json={"query": "revenue summary", "collection_name": "policy_docs"},
             )
@@ -1740,7 +1744,7 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
 
             # Query rate limit across /query and /agent (shared query ceiling = 3/min)
             self.assertEqual(
-                self.ingest_client.post(
+                self.agent_client.post(
                     "/query",
                     headers={"X-Dev-User-Id": "alice_policy"},
                     json={"query": "Batch", "collection_name": "rate_col"},
@@ -1781,7 +1785,7 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
 
             # Bob remains unaffected on /query
             self.assertEqual(
-                self.ingest_client.post(
+                self.agent_client.post(
                     "/query",
                     headers={"X-Dev-User-Id": "bob_policy"},
                     json={"query": "Bob", "collection_name": "bob_rate_col"},
@@ -1849,7 +1853,7 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
             self.assertEqual(res_bob.status_code, 200, res_bob.text)
 
             # Deleting 'col_two' frees a slot so 'alice_policy' can now create 'col_three'
-            res_del = self.ingest_client.delete(
+            res_del = self.agent_client.delete(
                 "/collections/col_two",
                 headers={"X-Dev-User-Id": "alice_policy"},
             )

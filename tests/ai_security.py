@@ -31,7 +31,7 @@ from src.core.logger import setup_logging
 from src.core.storage import chroma as chroma_module
 from src.core.storage import gcs_sync as gcs_sync_module
 from src.core.storage import release_client_cache
-from src.ingestion import app as ingestion_module
+from src.ingest import app as ingestion_module
 from tests.multi_tenant_api import DeterministicFakeEmbeddings, make_test_pdf
 from tests.storage import FakeGCSBucket
 
@@ -201,7 +201,7 @@ class TestAISecuritySuite(unittest.TestCase):
                 )
                 self.assertEqual(res_ing.status_code, 200, res_ing.text)
 
-                res_q = self.ingestion_client.post(
+                res_q = self.agent_client.post(
                     "/query",
                     json={"query": "Approved", "collection_name": col, "embedding_model": emb_model},
                 )
@@ -255,7 +255,7 @@ class TestAISecuritySuite(unittest.TestCase):
             self.assertEqual(r_bad_agent_emb.status_code, 422)
             self.assertIn("Unsupported embedding_model", r_bad_agent_emb.text)
 
-            r_bad_query_emb = self.ingestion_client.post(
+            r_bad_query_emb = self.agent_client.post(
                 "/query",
                 json={
                     "query": "hi",
@@ -310,7 +310,7 @@ class TestAISecuritySuite(unittest.TestCase):
                 422,
             )
             self.assertEqual(
-                self.ingestion_client.post("/query", json={"query": "hello"}).status_code,
+                self.agent_client.post("/query", json={"query": "hello"}).status_code,
                 422,
             )
             self.assertEqual(
@@ -341,7 +341,7 @@ class TestAISecuritySuite(unittest.TestCase):
                     f"Expected 422 on multipart /ingest for {bad_col!r}",
                 )
                 self.assertEqual(
-                    self.ingestion_client.post(
+                    self.agent_client.post(
                         "/query",
                         json={"query": "hello", "collection_name": bad_col},
                     ).status_code,
@@ -359,10 +359,6 @@ class TestAISecuritySuite(unittest.TestCase):
 
             # URL-safe path segment check on DELETE /collections/{collection_name}
             for url_bad in ("bad%20col!", "bad;inject", "a" * 65):
-                self.assertEqual(
-                    self.ingestion_client.delete(f"/collections/{url_bad}").status_code,
-                    422,
-                )
                 self.assertEqual(
                     self.agent_client.delete(f"/collections/{url_bad}").status_code,
                     422,
@@ -446,7 +442,7 @@ class TestAISecuritySuite(unittest.TestCase):
 
             # 4. MAX_CHUNKS_PER_INGEST -> 400 Bad Request
             with patch.dict(os.environ, {"MAX_CHUNKS_PER_INGEST": "2"}, clear=False), patch(
-                "src.ingestion.upload_parser.split_pdfs",
+                "src.ingest.upload_parser.split_pdfs",
                 return_value=[
                     Document(page_content="c1", metadata={"page": 0}),
                     Document(page_content="c2", metadata={"page": 0}),
@@ -473,7 +469,7 @@ class TestAISecuritySuite(unittest.TestCase):
                     files=[("files", ("archived.pdf", make_test_pdf("Preserved metadata check"), "application/pdf"))],
                 )
                 self.assertEqual(r_ok.status_code, 200, r_ok.text)
-                r_query = self.ingestion_client.post(
+                r_query = self.agent_client.post(
                     "/query",
                     json={"query": "Preserved metadata", "collection_name": "meta_keep"},
                 )
@@ -654,7 +650,7 @@ class TestAISecuritySuite(unittest.TestCase):
             # Oversized query rejected with 422 on both /query and /agent
             long_query = "q" * 101
             self.assertEqual(
-                self.ingestion_client.post(
+                self.agent_client.post(
                     "/query", json={"query": long_query, "collection_name": "loop_col"}
                 ).status_code,
                 422,
@@ -743,15 +739,15 @@ class TestAISecuritySuite(unittest.TestCase):
             # Verify raw internal exception details never leak in HTTP 500 or SSE error payloads
             secret_exc = RuntimeError("DB_MASTER_PASSWORD_LEAK=hunter2")
 
-            with patch("src.ingestion.app.search_collection", side_effect=secret_exc):
-                r1 = self.ingestion_client.post(
+            with patch("src.query.routes.search_collection", side_effect=secret_exc):
+                r1 = self.agent_client.post(
                     "/query", json={"query": "hello", "collection_name": "safety_col"}
                 )
                 self.assertEqual(r1.status_code, 500)
                 self.assertEqual(r1.json()["detail"], INTERNAL_ERROR_MESSAGE)
                 self.assertNotIn("hunter2", r1.text)
 
-            with patch("src.ingestion.app.ingest_documents", side_effect=secret_exc):
+            with patch("src.ingest.routes.ingest_documents", side_effect=secret_exc):
                 r2 = self.ingestion_client.post(
                     "/ingest",
                     data={"collection_name": "safety_col"},
@@ -761,13 +757,13 @@ class TestAISecuritySuite(unittest.TestCase):
                 self.assertEqual(r2.json()["detail"], INTERNAL_ERROR_MESSAGE)
                 self.assertNotIn("hunter2", r2.text)
 
-            with patch("src.core.storage.routes.list_collections", side_effect=secret_exc):
-                r3 = self.ingestion_client.get("/collections")
+            with patch("src.manage.collections.list_collections", side_effect=secret_exc):
+                r3 = self.agent_client.get("/collections")
                 self.assertEqual(r3.status_code, 500)
                 self.assertEqual(r3.json()["detail"], INTERNAL_ERROR_MESSAGE)
                 self.assertNotIn("hunter2", r3.text)
 
-            with patch("src.agent.app.stream_events", side_effect=secret_exc):
+            with patch("src.agent.routes.stream_events", side_effect=secret_exc):
                 r4 = self.agent_client.post(
                     "/agent",
                     json={"query": "hello", "collection_name": "safety_col", "stream": False},
@@ -865,20 +861,20 @@ class TestAISecuritySuite(unittest.TestCase):
 
             # 1. Invalid k bounds rejected with 422
             self.assertEqual(
-                self.ingestion_client.post(
+                self.agent_client.post(
                     "/query", json={"query": "contact", "collection_name": "pii_query_col", "k": 0}
                 ).status_code,
                 422,
             )
             self.assertEqual(
-                self.ingestion_client.post(
+                self.agent_client.post(
                     "/query", json={"query": "contact", "collection_name": "pii_query_col", "k": 51}
                 ).status_code,
                 422,
             )
 
             # 2. /query masks ONLY sensitive spans with [INFO_TYPE] while keeping other chunk text visible
-            r_query = self.ingestion_client.post(
+            r_query = self.agent_client.post(
                 "/query",
                 json={"query": "ACME Profile", "collection_name": "pii_query_col", "k": 5},
             )
@@ -943,7 +939,7 @@ class TestAISecuritySuite(unittest.TestCase):
                     },
                 )
             )
-            r_inspect_only = self.ingestion_client.post(
+            r_inspect_only = self.agent_client.post(
                 "/query",
                 json={"query": "ACME Profile", "collection_name": "pii_query_col", "k": 5},
             )
@@ -952,7 +948,7 @@ class TestAISecuritySuite(unittest.TestCase):
             self.assertNotIn("alice@corp.example.com", r_inspect_only.text)
 
             mock_armor_client.sanitize_model_response.side_effect = RuntimeError("DLP backend unavailable")
-            r_query_err = self.ingestion_client.post(
+            r_query_err = self.agent_client.post(
                 "/query",
                 json={"query": "ACME Profile", "collection_name": "pii_query_col", "k": 5},
             )

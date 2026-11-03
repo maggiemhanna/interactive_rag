@@ -1,4 +1,4 @@
-"""HTTP upload parser, binary PDF validator, and per-request `/tmp` staging manager.
+"""HTTP upload parser, binary PDF validator, and per-request `/tmp` staging manager (`src.ingest.upload_parser`).
 
 Handles both `multipart/form-data` binary PDF uploads and local-dev `application/json`
 `pdf_paths` payloads for `POST /ingest`:
@@ -32,9 +32,9 @@ from src.core.compliance.policy import (
 from src.core.config import get_max_upload_mb, is_cloud_run
 from src.core.logger import setup_logging
 from src.core.storage import archive_upload, get_bucket_name, get_upload_user_dir
-from src.ingestion.splitter import sanitize_filename, split_pdfs
+from src.ingest.splitter import sanitize_filename, split_pdfs
 
-logger = setup_logging(name="ingestion.upload_parser")
+logger = setup_logging(name="ingest.upload_parser")
 
 _PDF_MAGIC_PREFIX = b"%PDF-"
 

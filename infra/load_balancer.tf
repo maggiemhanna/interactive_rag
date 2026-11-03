@@ -8,7 +8,7 @@
 #           -> URL Map (`https_router`: path routing + `/api/*` prefix stripping)
 #           -> Backend Services (`*_backend`)
 #           -> Serverless NEGs (`*_neg`)
-#           -> Cloud Run (`frontend`, `ingestion-api`, `agent-api`)
+#           -> Cloud Run (`frontend`, `ingest-api`, `agent-api`)
 # ==============================================================================
 
 # ==============================================================================
@@ -79,14 +79,14 @@ resource "google_compute_region_network_endpoint_group" "frontend_neg" {
   }
 }
 
-resource "google_compute_region_network_endpoint_group" "ingestion_neg" {
+resource "google_compute_region_network_endpoint_group" "ingest_neg" {
   name                  = "${var.app_name}-ingest-neg-${var.environment}"
   project               = var.project_id
   region                = var.region
   network_endpoint_type = "SERVERLESS"
 
   cloud_run {
-    service = google_cloud_run_v2_service.ingestion_api.name
+    service = google_cloud_run_v2_service.ingest_api.name
   }
 }
 
@@ -123,15 +123,15 @@ resource "google_compute_backend_service" "frontend_backend" {
   }
 }
 
-resource "google_compute_backend_service" "ingestion_backend" {
+resource "google_compute_backend_service" "ingest_backend" {
   name                  = "${var.app_name}-ingest-backend-${var.environment}"
   project               = var.project_id
   load_balancing_scheme = "EXTERNAL_MANAGED"
   enable_cdn            = false
-  description           = "Backend service routing /api/ingest/* traffic to ingestion-api Cloud Run."
+  description           = "Backend service routing /api/ingest/* traffic to ingest-api Cloud Run."
 
   backend {
-    group = google_compute_region_network_endpoint_group.ingestion_neg.id
+    group = google_compute_region_network_endpoint_group.ingest_neg.id
   }
 
   log_config {
@@ -163,9 +163,9 @@ resource "google_compute_backend_service" "agent_backend" {
 
 # Serves the React UI and both backend APIs under one HTTPS origin:
 # - `/api/ingest/*` -> strips `/api/ingest` (`path_prefix_rewrite = "/"`) and forwards
-#   to `ingestion-api` (e.g., `/api/ingest/collections` arrives at FastAPI as `/collections`).
+#   to `ingest-api` (`src/ingest/app.py`: `POST /ingest` and `GET /health`).
 # - `/api/agent/*`  -> strips `/api/agent` (`path_prefix_rewrite = "/"`) and forwards
-#   to `agent-api` (e.g., `/api/agent/agent/stream` arrives at FastAPI as `/agent/stream`).
+#   to `agent-api` (`src/agent/app.py`: `/agent`, `/agent/stream`, `/query`, `/collections`, `/compliance/my-data`).
 # - `/*` (default)  -> forwards directly to `frontend` (React SPA).
 resource "google_compute_url_map" "https_router" {
   name            = "${var.app_name}-https-urlmap-${var.environment}"
@@ -184,7 +184,7 @@ resource "google_compute_url_map" "https_router" {
 
     path_rule {
       paths   = ["/api/ingest/*"]
-      service = google_compute_backend_service.ingestion_backend.id
+      service = google_compute_backend_service.ingest_backend.id
 
       route_action {
         url_rewrite {

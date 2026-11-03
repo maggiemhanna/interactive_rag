@@ -5,8 +5,10 @@ Synchronizes per-tenant ChromaDB SQLite/HNSW snapshots between Cloud Run's ephem
 `version.json` invalidation, and archives raw uploaded PDFs under `users/{uid}/uploads/`.
 """
 
+import base64
 import contextlib
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 import shutil
@@ -38,6 +40,22 @@ logger = setup_logging(name="storage.gcs_sync")
 
 _gcs_client_lock = threading.Lock()
 _gcs_client: Optional[storage.Client] = None
+
+
+def _compute_file_md5_base64(file_path: str) -> str:
+    """Computes the base64-encoded MD5 digest of a local file matching GCS `blob.md5_hash` format.
+
+    Args:
+        file_path: Local path to the file to hash.
+
+    Returns:
+        Base64-encoded MD5 string.
+    """
+    hasher = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            hasher.update(chunk)
+    return base64.b64encode(hasher.digest()).decode("ascii")
 
 
 def _get_gcs_client() -> storage.Client:
@@ -159,11 +177,12 @@ def _sync_from_gcs_unlocked(
 
 
 def _push_user_dir_to_gcs(bucket: storage.Bucket, uid: str, user_dir: str) -> None:
-    """Flushes local ChromaDB state and uploads the updated snapshot + `version.json` to GCS.
+    """Flushes local ChromaDB state and incrementally uploads changed snapshot files + `version.json` to GCS.
 
-    Uploads all SQLite/HNSW data files first, removes obsolete remote blobs (e.g., deleted
-    collections), and writes `version.json` last so readers only switch after every data
-    blob is durable in GCS.
+    Compares local file MD5 digests against existing remote GCS blob `md5_hash` metadata so
+    unchanged HNSW segment files from untouched collections are skipped. Uploads new/modified
+    data files first, removes obsolete remote blobs (e.g., deleted collections), and writes
+    `version.json` last so readers only switch after every data blob is durable in GCS.
 
     Args:
         bucket: Target GCS `Bucket` instance.
@@ -190,26 +209,40 @@ def _push_user_dir_to_gcs(bucket: storage.Bucket, uid: str, user_dir: str) -> No
                     rel_path = os.path.relpath(full_path, user_dir).replace(os.sep, "/")
                     local_rel_files[rel_path] = full_path
 
-        # 1. Upload all current data files first
-        for rel_path, full_path in local_rel_files.items():
-            blob = bucket.blob(f"{prefix}{rel_path}")
-            blob.upload_from_filename(full_path)
-
-        # 2. Delete remote blobs that were removed locally (e.g., deleted collection HNSW folders)
+        # 1. Index existing remote blobs to support incremental MD5 delta uploads and orphan deletion
         existing_blobs = list(bucket.list_blobs(prefix=prefix))
-        deleted_count = 0
+        remote_blobs_by_rel: Dict[str, storage.Blob] = {}
         for remote_blob in existing_blobs:
             rel_path = remote_blob.name[len(prefix) :]
             if not rel_path or rel_path == VERSION_FILENAME:
                 continue
+            remote_blobs_by_rel[rel_path] = remote_blob
+
+        # 2. Upload only new or modified data files (skipping blobs with identical MD5 digest)
+        uploaded_count = 0
+        skipped_count = 0
+        for rel_path, full_path in local_rel_files.items():
+            existing_blob = remote_blobs_by_rel.get(rel_path)
+            remote_md5 = getattr(existing_blob, "md5_hash", None) if existing_blob is not None else None
+            if remote_md5 and remote_md5 == _compute_file_md5_base64(full_path):
+                skipped_count += 1
+                continue
+            blob = bucket.blob(f"{prefix}{rel_path}")
+            blob.upload_from_filename(full_path)
+            uploaded_count += 1
+
+        # 3. Delete remote blobs that were removed locally (e.g., deleted collection HNSW folders)
+        deleted_count = 0
+        for rel_path, remote_blob in remote_blobs_by_rel.items():
             if rel_path not in local_rel_files:
                 remote_blob.delete()
                 deleted_count += 1
 
-        span["attributes"]["uploaded_files"] = len(local_rel_files)
+        span["attributes"]["uploaded_files"] = uploaded_count
+        span["attributes"]["skipped_files"] = skipped_count
         span["attributes"]["deleted_files"] = deleted_count
 
-        # 3. Write & upload version.json LAST so readers only switch after all data files exist in GCS
+        # 4. Write & upload version.json LAST so readers only switch after all data files exist in GCS
         if SQLITE_FILENAME in local_rel_files:
             new_version = {
                 "version": uuid.uuid4().hex,
@@ -224,8 +257,8 @@ def _push_user_dir_to_gcs(bucket: storage.Bucket, uid: str, user_dir: str) -> No
             version_blob = bucket.blob(f"{prefix}{VERSION_FILENAME}")
             version_blob.upload_from_string(version_json_str, content_type="application/json")
             logger.info(
-                f"Synced {len(local_rel_files)} file(s) to GCS (deleted {deleted_count} obsolete blob(s)) "
-                f"for uid='{uid}' (version={new_version['version']})."
+                f"Synced ChromaDB to GCS for uid='{uid}': uploaded={uploaded_count}, "
+                f"skipped={skipped_count}, deleted={deleted_count} (version={new_version['version']})."
             )
         else:
             # User directory contains no SQLite database; ensure version.json is removed too
@@ -266,6 +299,7 @@ def archive_upload(uid: str, local_file_path: str, original_filename: str) -> Op
 
 
 __all__ = [
+    "_compute_file_md5_base64",
     "_get_bucket",
     "_get_gcs_client",
     "_push_user_dir_to_gcs",

@@ -5,14 +5,14 @@
 #    provision dedicated, minimal runtime identities for the backend and frontend.
 # ==============================================================================
 
-# Shared runtime identity for `ingestion-api` and `agent-api` Cloud Run services.
+# Shared runtime identity for `ingest-api` and `agent-api` Cloud Run services.
 # Note: GCP enforces a 6–30 character limit on `account_id`, so `substr(..., 0, 28)`
 # guarantees valid naming even with longer `app_name` or `environment` values.
 resource "google_service_account" "backend_sa" {
   project      = var.project_id
   account_id   = trimsuffix(substr("${var.app_name}-be-${var.environment}", 0, 28), "-")
   display_name = "InteractiveRAG Backend Service Account (${var.environment})"
-  description  = "Least-privilege identity for ingestion-api and agent-api Cloud Run services."
+  description  = "Least-privilege identity for ingest-api and agent-api Cloud Run services."
 
   depends_on = [
     google_project_service.required_apis["iam.googleapis.com"],
@@ -38,7 +38,7 @@ resource "google_service_account" "frontend_sa" {
 # ==============================================================================
 
 # 1. Vertex AI (`roles/aiplatform.user`):
-#    Allows `ingestion-api` to generate document/query embeddings and `agent-api`
+#    Allows `ingest-api` to generate document/query embeddings and `agent-api`
 #    to invoke regional Gemini chat models.
 resource "google_project_iam_member" "backend_vertex_ai_user" {
   project = var.project_id

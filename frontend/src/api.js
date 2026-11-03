@@ -1,4 +1,4 @@
-import { API_BASE, AGENT_API_BASE } from './firebase';
+import { AGENT_API_BASE } from './firebase';
 
 /**
  * Formats byte counts into human-readable storage strings (e.g., "1.4 MB").
@@ -13,81 +13,32 @@ export function formatStorageBytes(bytes) {
 }
 
 /**
- * GDPR Art. 15 (Right of Access) — fetches the authenticated user's stored data inventory.
- * Queries agent-api first so active LangGraph conversation memory thread counts are included,
- * falling back to ingestion-api if agent-api is unreachable.
+ * GDPR Art. 15 (Right of Access) — fetches the authenticated user's stored data inventory
+ * from the unified `src.manage` control-plane router mounted on `agent-api`.
  */
 export async function fetchUserDataInventory(authFetch) {
-  let lastError = null;
-  const bases =
-    AGENT_API_BASE && AGENT_API_BASE !== API_BASE
-      ? [AGENT_API_BASE, API_BASE]
-      : [API_BASE];
-
-  for (const base of bases) {
-    try {
-      const res = await authFetch(`${base}/compliance/my-data`, {
-        method: 'GET',
-      });
-      if (!res.ok) {
-        const errBody = await res.json().catch(() => ({}));
-        throw new Error(errBody.detail || `Failed to load data inventory (${res.status})`);
-      }
-      return await res.json();
-    } catch (err) {
-      lastError = err;
-    }
+  const res = await authFetch(`${AGENT_API_BASE}/compliance/my-data`, {
+    method: 'GET',
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}));
+    throw new Error(errBody.detail || `Failed to load data inventory (${res.status})`);
   }
-  throw lastError || new Error('Unable to reach compliance inventory endpoint.');
+  return await res.json();
 }
 
 /**
  * GDPR Art. 17 (Right to Erasure) — permanently deletes all live & noncurrent GCS versions,
- * local ChromaDB / upload caches, and LangGraph conversation memory across backend services.
+ * local ChromaDB / upload caches, and LangGraph conversation memory via `agent-api`.
  */
 export async function eraseAllUserData(authFetch) {
-  let primaryResult = null;
-  let primaryError = null;
-
-  try {
-    const agentRes = await authFetch(`${AGENT_API_BASE}/compliance/my-data`, {
-      method: 'DELETE',
-    });
-    if (!agentRes.ok) {
-      const errBody = await agentRes.json().catch(() => ({}));
-      throw new Error(errBody.detail || `Failed to erase user data (${agentRes.status})`);
-    }
-    primaryResult = await agentRes.json();
-  } catch (err) {
-    primaryError = err;
+  const res = await authFetch(`${AGENT_API_BASE}/compliance/my-data`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}));
+    throw new Error(errBody.detail || `Failed to erase user data (${res.status})`);
   }
-
-  if (API_BASE && API_BASE !== AGENT_API_BASE) {
-    try {
-      const ingestRes = await authFetch(`${API_BASE}/compliance/my-data`, {
-        method: 'DELETE',
-      });
-      if (!ingestRes.ok) {
-        const errBody = await ingestRes.json().catch(() => ({}));
-        if (!primaryResult) {
-          throw new Error(errBody.detail || `Failed to erase user data (${ingestRes.status})`);
-        }
-      } else {
-        const ingestJson = await ingestRes.json();
-        if (!primaryResult) {
-          primaryResult = ingestJson;
-        }
-      }
-    } catch (err) {
-      if (!primaryResult) {
-        throw primaryError || err;
-      }
-    }
-  }
-
-  if (!primaryResult) {
-    throw primaryError || new Error('Failed to erase personal data.');
-  }
-
-  return primaryResult;
+  return await res.json();
 }
+

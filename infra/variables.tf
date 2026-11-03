@@ -44,23 +44,87 @@ variable "image_tag" {
 }
 
 # ==============================================================================
-# 2. Cloud Run Sizing, Autoscaling & Storage Lifecycle Settings
+# 2. Cloud Run Per-Service Sizing, Concurrency, Autoscaling & /tmp Cache Quotas
 # ==============================================================================
 
-variable "backend_cpu" {
-  description = "CPU limit for ingestion-api and agent-api Cloud Run containers."
+# Write-heavy ingest service (`ingest-api`: `POST /ingest` + `/health`)
+# Sized with higher memory (`4Gi`) for PyPDF + ChromaDB HNSW segment construction in `/tmp`
+# and low concurrency (`4`) so concurrent PDF uploads do not starve each other on CPU/RAM.
+variable "ingest_cpu" {
+  description = "CPU limit for the ingest-api Cloud Run container."
+  type        = string
+  default     = "2"
+}
+
+variable "ingest_memory" {
+  description = "Memory limit for the ingest-api Cloud Run container (shared with /tmp tmpfs ChromaDB & upload staging)."
+  type        = string
+  default     = "4Gi"
+}
+
+variable "ingest_concurrency" {
+  description = "Maximum concurrent requests per ingest-api Cloud Run container instance (low concurrency isolates CPU-bound PDF parsing)."
+  type        = number
+  default     = 4
+
+  validation {
+    condition     = var.ingest_concurrency >= 1 && var.ingest_concurrency <= 80 && floor(var.ingest_concurrency) == var.ingest_concurrency
+    error_message = "ingest_concurrency must be an integer between 1 and 80."
+  }
+}
+
+variable "ingest_min_instances" {
+  description = "Minimum warm Cloud Run instances for ingest-api (0 enables scale-to-zero when no uploads are active)."
+  type        = number
+  default     = 0
+}
+
+variable "ingest_max_instances" {
+  description = "Maximum Cloud Run instances for ingest-api."
+  type        = number
+  default     = 5
+}
+
+# Interactive read & control-plane service (`agent-api`: `/agent`, `/agent/stream`, `/query`, `/collections`, `/compliance/my-data`)
+# Sized for high-concurrency I/O-bound Vertex AI streaming (`32`) and higher horizontal scale-out (`10`).
+variable "agent_cpu" {
+  description = "CPU limit for the agent-api Cloud Run container."
   type        = string
   default     = "2"
 }
 
 # Note: In Cloud Run Gen2, `/tmp` is an in-memory `tmpfs` filesystem that shares
 # this container memory limit when syncing per-user ChromaDB vector stores.
-variable "backend_memory" {
-  description = "Memory limit for backend containers (shared with /tmp tmpfs ChromaDB cache)."
+variable "agent_memory" {
+  description = "Memory limit for the agent-api Cloud Run container (shared with warm /tmp tmpfs ChromaDB cache)."
   type        = string
   default     = "2Gi"
 }
 
+variable "agent_concurrency" {
+  description = "Maximum concurrent requests per agent-api Cloud Run container instance (tuned for I/O-bound SSE streaming, /query, and /collections)."
+  type        = number
+  default     = 32
+
+  validation {
+    condition     = var.agent_concurrency >= 1 && var.agent_concurrency <= 1000 && floor(var.agent_concurrency) == var.agent_concurrency
+    error_message = "agent_concurrency must be an integer between 1 and 1000."
+  }
+}
+
+variable "agent_min_instances" {
+  description = "Minimum warm Cloud Run instances for agent-api (set >= 1 in latency-sensitive prod to eliminate cold starts)."
+  type        = number
+  default     = 0
+}
+
+variable "agent_max_instances" {
+  description = "Maximum Cloud Run instances for agent-api."
+  type        = number
+  default     = 10
+}
+
+# Static React SPA + Nginx frontend service (`frontend`)
 variable "frontend_cpu" {
   description = "CPU limit for frontend Nginx Cloud Run container."
   type        = string
@@ -73,16 +137,50 @@ variable "frontend_memory" {
   default     = "512Mi"
 }
 
-variable "min_instance_count" {
-  description = "Minimum warm Cloud Run instances per service (0 enables scale-to-zero)."
+variable "frontend_concurrency" {
+  description = "Maximum concurrent requests per frontend Nginx Cloud Run container instance."
+  type        = number
+  default     = 80
+
+  validation {
+    condition     = var.frontend_concurrency >= 1 && var.frontend_concurrency <= 1000 && floor(var.frontend_concurrency) == var.frontend_concurrency
+    error_message = "frontend_concurrency must be an integer between 1 and 1000."
+  }
+}
+
+variable "frontend_min_instances" {
+  description = "Minimum warm Cloud Run instances for frontend (0 enables scale-to-zero)."
   type        = number
   default     = 0
 }
 
-variable "max_instance_count" {
-  description = "Maximum Cloud Run instances per service."
+variable "frontend_max_instances" {
+  description = "Maximum Cloud Run instances for frontend."
   type        = number
   default     = 5
+}
+
+# Ephemeral `/tmp/chroma_db` LRU cache eviction quotas
+variable "chroma_tmp_max_bytes" {
+  description = "Maximum total bytes allowed in /tmp/chroma_db before LRU tenant cache eviction runs (default 512 MiB)."
+  type        = number
+  default     = 536870912
+
+  validation {
+    condition     = var.chroma_tmp_max_bytes >= 67108864 && floor(var.chroma_tmp_max_bytes) == var.chroma_tmp_max_bytes
+    error_message = "chroma_tmp_max_bytes must be an integer >= 67108864 (64 MiB)."
+  }
+}
+
+variable "chroma_tmp_min_free_bytes" {
+  description = "Minimum free bytes required on the /tmp RAM disk before LRU tenant cache eviction runs (default 256 MiB)."
+  type        = number
+  default     = 268435456
+
+  validation {
+    condition     = var.chroma_tmp_min_free_bytes >= 67108864 && floor(var.chroma_tmp_min_free_bytes) == var.chroma_tmp_min_free_bytes
+    error_message = "chroma_tmp_min_free_bytes must be an integer >= 67108864 (64 MiB)."
+  }
 }
 
 variable "bucket_force_destroy" {
@@ -125,27 +223,28 @@ variable "google_oauth_client_secret_name" {
 # 4. Private VPC Subnets (Direct VPC Egress & Regional Private Service Connect)
 # ==============================================================================
 
-# Cloud Run Direct VPC Egress recommends at least a `/26` (64 IPs) subnet per service
-# to support rapid container scaling.
-variable "ingestion_subnet_cidr" {
-  description = "Private CIDR range for the ingestion-api Cloud Run Direct VPC Egress subnet (minimum /26 recommended)."
+# Cloud Run Direct VPC Egress reserves 2x IP addresses per max_instance_count during revision
+# rollouts and autoscaling spikes. Default `/24` (256 IPs) subnets prevent IP exhaustion when
+# scaling `max_instance_count` beyond 25–30 instances.
+variable "ingest_subnet_cidr" {
+  description = "Private CIDR range for the ingest-api Cloud Run Direct VPC Egress subnet (default /24 = 256 IPs; minimum /26)."
   type        = string
-  default     = "10.10.1.0/26"
+  default     = "10.10.1.0/24"
 
   validation {
-    condition     = can(cidrhost(var.ingestion_subnet_cidr, 0))
-    error_message = "ingestion_subnet_cidr must be a valid IPv4 CIDR block (e.g., 10.10.1.0/26)."
+    condition     = can(cidrhost(var.ingest_subnet_cidr, 0)) && tonumber(split("/", var.ingest_subnet_cidr)[1]) <= 26
+    error_message = "ingest_subnet_cidr must be a valid IPv4 CIDR block with prefix length <= 26 (e.g., 10.10.1.0/24)."
   }
 }
 
 variable "agent_subnet_cidr" {
-  description = "Private CIDR range for the agent-api Cloud Run Direct VPC Egress subnet (minimum /26 recommended)."
+  description = "Private CIDR range for the agent-api Cloud Run Direct VPC Egress subnet (default /24 = 256 IPs; minimum /26)."
   type        = string
-  default     = "10.10.2.0/26"
+  default     = "10.10.2.0/24"
 
   validation {
-    condition     = can(cidrhost(var.agent_subnet_cidr, 0))
-    error_message = "agent_subnet_cidr must be a valid IPv4 CIDR block (e.g., 10.10.2.0/26)."
+    condition     = can(cidrhost(var.agent_subnet_cidr, 0)) && tonumber(split("/", var.agent_subnet_cidr)[1]) <= 26
+    error_message = "agent_subnet_cidr must be a valid IPv4 CIDR block with prefix length <= 26 (e.g., 10.10.2.0/24)."
   }
 }
 
@@ -314,7 +413,7 @@ variable "max_collections_per_user" {
 }
 
 # ==============================================================================
-# 7. Observability & AI Monitoring
+# 7. Observability, AI Monitoring & Alerting Thresholds
 # ==============================================================================
 
 variable "observability_log_retention_days" {
@@ -327,3 +426,26 @@ variable "observability_log_retention_days" {
     error_message = "observability_log_retention_days must be between 1 and 3650 days."
   }
 }
+
+variable "alert_agent_latency_p95_ms" {
+  description = "Threshold in milliseconds for the p95 Agentic RAG turn latency Cloud Monitoring alert policy."
+  type        = number
+  default     = 15000
+
+  validation {
+    condition     = var.alert_agent_latency_p95_ms >= 1000
+    error_message = "alert_agent_latency_p95_ms must be >= 1000 ms."
+  }
+}
+
+variable "alert_memory_utilization_threshold" {
+  description = "Threshold ratio (0.50 to 0.99) for the Cloud Run container memory + /tmp tmpfs utilization alert policy."
+  type        = number
+  default     = 0.85
+
+  validation {
+    condition     = var.alert_memory_utilization_threshold >= 0.50 && var.alert_memory_utilization_threshold <= 0.99
+    error_message = "alert_memory_utilization_threshold must be between 0.50 and 0.99."
+  }
+}
+

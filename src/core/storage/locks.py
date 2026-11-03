@@ -22,6 +22,7 @@ from google.api_core import exceptions as gcs_exceptions
 from google.cloud import storage
 
 from src.core.auth import validate_uid
+from src.core.config import get_chroma_tmp_max_bytes, get_chroma_tmp_min_free_bytes
 from src.core.logger import setup_logging
 from src.core.storage import gcs_sync
 from src.core.storage.paths import (
@@ -116,8 +117,8 @@ def evict_tmp_cache(exclude_uid: Optional[str] = None) -> List[str]:
     if not os.path.exists(root):
         return []
 
-    max_cache_bytes = int(os.getenv("CHROMA_TMP_MAX_BYTES", str(512 * 1024 * 1024)))
-    min_free_bytes = int(os.getenv("CHROMA_TMP_MIN_FREE_BYTES", str(256 * 1024 * 1024)))
+    max_cache_bytes = get_chroma_tmp_max_bytes()
+    min_free_bytes = get_chroma_tmp_min_free_bytes()
 
     def _needs_eviction() -> bool:
         """Checks whether `/tmp` Chroma root exceeds byte quota or free-disk threshold."""

@@ -7,7 +7,6 @@ Provides modular regulatory, residency, policy, and audit capabilities:
 - `dsar`: GDPR Art. 15 personal data inventory and Art. 17 complete versioned GCS/local erasure.
 - `provenance`: EU AI Act Art. 50 AI transparency, citation grounding, and Model Armor provenance metadata.
 - `state`: Per-request compliance guardrail and retrieval state helpers stored on `RequestContext`.
-- `routes`: Self-service `GET` and `DELETE /compliance/my-data` FastAPI router.
 """
 
 import importlib
@@ -37,7 +36,6 @@ if TYPE_CHECKING:
         build_compliance_metadata,
     )
     from src.core.compliance.residency import validate_gcp_region
-    from src.core.compliance.routes import build_compliance_router
     from src.core.compliance.state import (
         GUARDRAIL_FILTER_LABELS,
         get_guardrail_actions,
@@ -78,7 +76,6 @@ _EXPORT_MAP: dict[str, str] = {
     "was_model_armor_active": "src.core.compliance.state",
     "was_pii_filtered": "src.core.compliance.state",
     "validate_gcp_region": "src.core.compliance.residency",
-    "build_compliance_router": "src.core.compliance.routes",
 }
 
 __all__ = sorted(_EXPORT_MAP.keys())

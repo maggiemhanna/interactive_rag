@@ -1,10 +1,10 @@
-"""Pydantic request schemas for Document Ingestion and Vectorstore Similarity Search.
+"""Pydantic request schema for Vectorstore Similarity Search (`src.query.schemas`).
 
 Enforces strict collection identifier, query length, top-k (`1..50`), and approved
 Vertex AI embedding model guardrails at API deserialization time.
 """
 
-from typing import Any, List, Union
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -13,38 +13,6 @@ from src.core.ai_security.guardrails import (
     validate_embedding_model,
     validate_query_text,
 )
-
-
-class IngestRequest(BaseModel):
-    """JSON request schema for local-development `POST /ingest` calls using `pdf_paths`."""
-
-    pdf_paths: Union[str, List[str]] = Field(
-        ...,
-        description="Path or list of paths (or a single path) to PDF files to ingest",
-    )
-    collection_name: str = Field(
-        ...,
-        description="Name of the Chroma vectorstore collection",
-    )
-    embedding_model: str = Field(
-        default="",
-        validate_default=True,
-        description="Approved Vertex AI embedding model name (defaults to first entry in ALLOWED_EMBEDDING_MODELS)",
-    )
-
-    @field_validator("collection_name")
-    @classmethod
-    def _check_collection_name(cls, value: str) -> str:
-        """Validates `collection_name` against `COLLECTION_NAME_PATTERN`."""
-        return validate_collection_name(value)
-
-    @field_validator("embedding_model", mode="before")
-    @classmethod
-    def _check_embedding_model(cls, value: Any) -> str:
-        """Validates `embedding_model` against `ALLOWED_EMBEDDING_MODELS`."""
-        if value is not None and not isinstance(value, str):
-            raise ValueError("embedding_model must be a string.")
-        return validate_embedding_model(value)
 
 
 class QueryRequest(BaseModel):
@@ -88,4 +56,4 @@ class QueryRequest(BaseModel):
         return validate_embedding_model(value)
 
 
-__all__ = ["IngestRequest", "QueryRequest"]
+__all__ = ["QueryRequest"]

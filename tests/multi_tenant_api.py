@@ -16,7 +16,7 @@ from src.core.storage import chroma as chroma_module
 from src.core.storage import gcs_sync as gcs_sync_module
 from src.core.logger import setup_logging
 from src.core.storage import release_client_cache
-from src.ingestion import app as ingestion_module
+from src.ingest import app as ingestion_module
 from tests.storage import FakeGCSBucket
 
 logger = setup_logging(name="test_multi_tenant_api")
@@ -160,14 +160,16 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
             self.assertEqual(r_health_1.json()["status"], "ok")
             self.assertEqual(r_health_2.json()["status"], "ok")
 
-            # Every protected endpoint rejects unauthenticated requests with 401
-            self.assertEqual(self.ingestion_client.get("/collections").status_code, 401)
-            self.assertEqual(self.ingestion_client.delete("/collections/secret").status_code, 401)
+            # ingest-api mounts ONLY POST /ingest (+ GET /health)
             self.assertEqual(self.ingestion_client.post("/ingest", json={"pdf_paths": ["a.pdf"]}).status_code, 401)
-            self.assertEqual(self.ingestion_client.post("/query", json={"query": "hi"}).status_code, 401)
+            self.assertEqual(self.ingestion_client.get("/collections").status_code, 404)
+            self.assertEqual(self.ingestion_client.delete("/collections/secret").status_code, 404)
+            self.assertEqual(self.ingestion_client.post("/query", json={"query": "hi"}).status_code, 404)
 
+            # agent-api mounts /collections, /query, /compliance/my-data, /agent, /agent/stream (+ GET /health)
             self.assertEqual(self.agent_client.get("/collections").status_code, 401)
             self.assertEqual(self.agent_client.delete("/collections/secret").status_code, 401)
+            self.assertEqual(self.agent_client.post("/query", json={"query": "hi"}).status_code, 401)
             self.assertEqual(self.agent_client.post("/agent", json={"query": "hi"}).status_code, 401)
             self.assertEqual(self.agent_client.post("/agent/stream", json={"query": "hi"}).status_code, 401)
 
@@ -204,7 +206,7 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
         ), patch.object(
             agent_graph_module, "ChatGoogleGenerativeAI", side_effect=FakeToolCallingChatModel
         ):
-            # 1. Alice uploads a confidential PDF on Container 1 (ingestion-api)
+            # 1. Alice uploads a confidential PDF on Container 1 (ingest-api)
             with patch.dict(os.environ, self._base_env(self.ingestion_tmp), clear=False):
                 alice_pdf = make_test_pdf("Alice confidential acquisition target is Project Helios.")
                 res_ingest = self.ingestion_client.post(
@@ -229,8 +231,8 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
                 ]
                 self.assertEqual(len(archived_blobs), 1)
 
-                # Alice queries her collection -> retrieves her confidential chunk with clean metadata
-                res_query_a = self.ingestion_client.post(
+                # Alice queries her collection via agent-api -> retrieves her confidential chunk with clean metadata
+                res_query_a = self.agent_client.post(
                     "/query",
                     headers=alice_headers,
                     json={"query": "Alice acquisition", "collection_name": "confidential_a", "k": 3},
@@ -241,13 +243,13 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
                 self.assertIn("Project Helios", results[0]["page_content"])
                 self.assertEqual(results[0]["metadata"]["source"], "alice_secret.pdf")
 
-            # 2. Bob connects to ingestion-api -> sees ZERO collections and gets 404 on Alice's collection
+            # 2. Bob connects to agent-api -> sees ZERO collections and gets 404 on Alice's collection
             with patch.dict(os.environ, self._base_env(self.ingestion_tmp), clear=False):
-                res_bob_cols = self.ingestion_client.get("/collections", headers=bob_headers)
+                res_bob_cols = self.agent_client.get("/collections", headers=bob_headers)
                 self.assertEqual(res_bob_cols.status_code, 200)
                 self.assertEqual(res_bob_cols.json()["collections"], [])
 
-                # Bob uploads his own collection so Bob DOES have a Chroma SQLite DB
+                # Bob uploads his own collection via ingest-api so Bob DOES have a Chroma SQLite DB
                 bob_pdf = make_test_pdf("Bob public travel itinerary for Rome.")
                 res_bob_ingest = self.ingestion_client.post(
                     "/ingest",
@@ -259,7 +261,7 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
 
                 # Even with his own DB initialized, Bob gets 404 querying or deleting Alice's `confidential_a`!
                 self.assertEqual(
-                    self.ingestion_client.post(
+                    self.agent_client.post(
                         "/query",
                         headers=bob_headers,
                         json={"query": "Project Helios", "collection_name": "confidential_a"},
@@ -267,7 +269,7 @@ class TestMultiTenantBackendAPIs(unittest.TestCase):
                     404,
                 )
                 self.assertEqual(
-                    self.ingestion_client.delete(
+                    self.agent_client.delete(
                         "/collections/confidential_a", headers=bob_headers
                     ).status_code,
                     404,

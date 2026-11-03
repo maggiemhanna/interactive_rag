@@ -1,5 +1,5 @@
 # ==============================================================================
-# Google Cloud Run Gen2 Microservices (`ingestion-api`, `agent-api`, `frontend`)
+# Google Cloud Run Gen2 Microservices (`ingest-api`, `agent-api`, `frontend`)
 #
 # Shared security & residency properties across all three services:
 # - `location = var.region`: Pinned to a single concrete GCP region.
@@ -13,9 +13,9 @@
 # ==============================================================================
 
 locals {
-  ingestion_service_name = "${var.app_name}-ingestion-${var.environment}"
-  agent_service_name     = "${var.app_name}-agent-${var.environment}"
-  frontend_service_name  = "${var.app_name}-frontend-${var.environment}"
+  ingest_service_name   = "${var.app_name}-ingest-${var.environment}"
+  agent_service_name    = "${var.app_name}-agent-${var.environment}"
+  frontend_service_name = "${var.app_name}-frontend-${var.environment}"
 
   # Deterministic Cloud Run regional hostname (`<service>-<project_number>.<region>.run.app`).
   # Computing this upfront avoids circular dependencies between `frontend`, `auth.tf`,
@@ -31,24 +31,25 @@ locals {
     distinct(concat([local.lb_url, local.frontend_deterministic_url], var.extra_allowed_origins))
   )
 
-  # Backend (`ingestion-api` and `agent-api`) shares a single Python Docker image (`Dockerfile.backend`),
+  # Backend (`ingest-api` and `agent-api`) shares a single Python Docker image (`Dockerfile.backend`),
   # selecting its FastAPI entrypoint via the `APP_MODULE` environment variable.
   backend_image  = "${local.artifact_registry_url}/backend:${var.image_tag}"
   frontend_image = "${local.artifact_registry_url}/frontend:${var.image_tag}"
 }
 
 # ==============================================================================
-# 1. Document Ingestion & Vector Search Service (`src/ingestion/app.py`)
+# 1. Dedicated Write-Path Document Ingestion Service (`src/ingest/app.py`)
 # ==============================================================================
 
-# Handles PDF uploads (`POST /ingest`), similarity search (`POST /query`), collection
-# management (`/collections`), and GDPR self-service data requests (`/compliance/my-data`).
-# - `EXECUTION_ENVIRONMENT_GEN2`: Provides full Linux compatibility and fast in-memory
-#   `/tmp` (`tmpfs`) storage for per-user ChromaDB SQLite/HNSW operations.
-# - `vpc_access` (`egress = "ALL_TRAFFIC"` -> `ingestion-subnet`): Forces 100% of outbound
+# Handles ONLY PDF uploads (`POST /ingest`) and health checks (`GET /health`).
+# - `max_instance_request_concurrency = var.ingest_concurrency` (default `4`):
+#   Prevents CPU-bound PyPDF parsing and Chroma HNSW indexing from starving concurrent requests.
+# - `resources` (`var.ingest_cpu = "2"`, `var.ingest_memory = "4Gi"`): Dedicated
+#   vertical memory headroom for `/tmp` PDF staging and ChromaDB segment writes.
+# - `vpc_access` (`egress = "ALL_TRAFFIC"` -> `ingest-subnet`): Forces 100% of outbound
 #   packets into the zero-internet VPC so untrusted PDFs can never trigger external connections.
-resource "google_cloud_run_v2_service" "ingestion_api" {
-  name                 = local.ingestion_service_name
+resource "google_cloud_run_v2_service" "ingest_api" {
+  name                 = local.ingest_service_name
   location             = var.region
   project              = var.project_id
   ingress              = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
@@ -56,21 +57,22 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
   deletion_protection  = var.environment == "prod"
 
   template {
-    service_account       = google_service_account.backend_sa.email
-    execution_environment = "EXECUTION_ENVIRONMENT_GEN2"
-    timeout               = "300s"
+    service_account                  = google_service_account.backend_sa.email
+    execution_environment            = "EXECUTION_ENVIRONMENT_GEN2"
+    timeout                          = "300s"
+    max_instance_request_concurrency = var.ingest_concurrency
 
     vpc_access {
       egress = "ALL_TRAFFIC"
       network_interfaces {
         network    = google_compute_network.main.name
-        subnetwork = google_compute_subnetwork.ingestion.name
+        subnetwork = google_compute_subnetwork.ingest.name
       }
     }
 
     scaling {
-      min_instance_count = var.min_instance_count
-      max_instance_count = var.max_instance_count
+      min_instance_count = var.ingest_min_instances
+      max_instance_count = var.ingest_max_instances
     }
 
     containers {
@@ -82,8 +84,8 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
 
       resources {
         limits = {
-          cpu    = var.backend_cpu
-          memory = var.backend_memory
+          cpu    = var.ingest_cpu
+          memory = var.ingest_memory
         }
         cpu_idle          = true
         startup_cpu_boost = true
@@ -91,7 +93,7 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
 
       env {
         name  = "APP_MODULE"
-        value = "src.ingestion.app:app"
+        value = "src.ingest.app:app"
       }
       env {
         name  = "GOOGLE_CLOUD_PROJECT"
@@ -108,6 +110,14 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
       env {
         name  = "LOCAL_CHROMA_ROOT"
         value = "/tmp/chroma_db"
+      }
+      env {
+        name  = "CHROMA_TMP_MAX_BYTES"
+        value = tostring(var.chroma_tmp_max_bytes)
+      }
+      env {
+        name  = "CHROMA_TMP_MIN_FREE_BYTES"
+        value = tostring(var.chroma_tmp_min_free_bytes)
       }
       env {
         name  = "ALLOWED_ORIGINS"
@@ -146,16 +156,8 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
         value = tostring(var.max_chunks_per_ingest)
       }
       env {
-        name  = "MAX_QUERY_CHARS"
-        value = tostring(var.max_query_chars)
-      }
-      env {
         name  = "RATE_LIMIT_INGEST_PER_MINUTE"
         value = tostring(var.rate_limit_ingest_per_minute)
-      }
-      env {
-        name  = "RATE_LIMIT_QUERY_PER_MINUTE"
-        value = tostring(var.rate_limit_query_per_minute)
       }
       env {
         name  = "MAX_COLLECTIONS_PER_USER"
@@ -208,16 +210,18 @@ resource "google_cloud_run_v2_service" "ingestion_api" {
 }
 
 # ==============================================================================
-# 2. LangGraph Agentic RAG & SSE Streaming Service (`src/agent/app.py`)
+# 2. Interactive Read & Control-Plane Service (`src/agent/app.py`)
 # ==============================================================================
 
-# Executes the guarded LangGraph pipeline (`input_guard -> model_call <-> tools -> output_guard`),
-# serving both standard JSON (`POST /agent`) and real-time Server-Sent Events (`POST /agent/stream`).
-# - `session_affinity = true`: Routes multi-turn chat requests from the same user browser session
-#   to the same warm Cloud Run container instance so in-memory `MEMORY_SAVER` checkpoints and
-#   synced `/tmp/chroma_db/{uid}` caches remain warm across turns.
-# - `vpc_access` (`egress = "ALL_TRAFFIC"` -> `agent-subnet`): Isolates agent network traffic in
-#   its own private subnet separate from `ingestion-subnet`.
+# Mounts `src.agent` (`POST /agent`, `POST /agent/stream`), `src.query` (`POST /query`),
+# and `src.manage` (`GET`/`DELETE /collections`, `GET`/`DELETE /compliance/my-data`).
+# - `max_instance_request_concurrency = var.agent_concurrency` (default `32`):
+#   High concurrency for I/O-bound Vertex AI streaming, similarity search, and collection management.
+# - `session_affinity = true`: Routes multi-turn chat, search, and collection requests from the
+#   same browser session to the same warm Cloud Run instance so `MEMORY_SAVER` checkpoints,
+#   `_QUERY_RATE_LIMITER`, and synced `/tmp/chroma_db/{uid}` caches remain warm across turns.
+# - `vpc_access` (`egress = "ALL_TRAFFIC"` -> `agent-subnet`): Isolates interactive read/agent
+#   traffic in its own private `/24` subnet separate from `ingest-subnet`.
 resource "google_cloud_run_v2_service" "agent_api" {
   name                 = local.agent_service_name
   location             = var.region
@@ -227,10 +231,11 @@ resource "google_cloud_run_v2_service" "agent_api" {
   deletion_protection  = var.environment == "prod"
 
   template {
-    service_account       = google_service_account.backend_sa.email
-    execution_environment = "EXECUTION_ENVIRONMENT_GEN2"
-    timeout               = "300s"
-    session_affinity      = true
+    service_account                  = google_service_account.backend_sa.email
+    execution_environment            = "EXECUTION_ENVIRONMENT_GEN2"
+    timeout                          = "300s"
+    session_affinity                 = true
+    max_instance_request_concurrency = var.agent_concurrency
 
     vpc_access {
       egress = "ALL_TRAFFIC"
@@ -241,8 +246,8 @@ resource "google_cloud_run_v2_service" "agent_api" {
     }
 
     scaling {
-      min_instance_count = var.min_instance_count
-      max_instance_count = var.max_instance_count
+      min_instance_count = var.agent_min_instances
+      max_instance_count = var.agent_max_instances
     }
 
     containers {
@@ -254,8 +259,8 @@ resource "google_cloud_run_v2_service" "agent_api" {
 
       resources {
         limits = {
-          cpu    = var.backend_cpu
-          memory = var.backend_memory
+          cpu    = var.agent_cpu
+          memory = var.agent_memory
         }
         cpu_idle          = true
         startup_cpu_boost = true
@@ -280,6 +285,14 @@ resource "google_cloud_run_v2_service" "agent_api" {
       env {
         name  = "LOCAL_CHROMA_ROOT"
         value = "/tmp/chroma_db"
+      }
+      env {
+        name  = "CHROMA_TMP_MAX_BYTES"
+        value = tostring(var.chroma_tmp_max_bytes)
+      }
+      env {
+        name  = "CHROMA_TMP_MIN_FREE_BYTES"
+        value = tostring(var.chroma_tmp_min_free_bytes)
       }
       env {
         name  = "ALLOWED_ORIGINS"
@@ -392,13 +405,14 @@ resource "google_cloud_run_v2_service" "frontend" {
   deletion_protection  = var.environment == "prod"
 
   template {
-    service_account       = google_service_account.frontend_sa.email
-    execution_environment = "EXECUTION_ENVIRONMENT_GEN2"
-    timeout               = "60s"
+    service_account                  = google_service_account.frontend_sa.email
+    execution_environment            = "EXECUTION_ENVIRONMENT_GEN2"
+    timeout                          = "60s"
+    max_instance_request_concurrency = var.frontend_concurrency
 
     scaling {
-      min_instance_count = var.min_instance_count
-      max_instance_count = var.max_instance_count
+      min_instance_count = var.frontend_min_instances
+      max_instance_count = var.frontend_max_instances
     }
 
     containers {
@@ -445,3 +459,4 @@ resource "google_cloud_run_v2_service" "frontend" {
     google_identity_platform_config.auth,
   ]
 }
+

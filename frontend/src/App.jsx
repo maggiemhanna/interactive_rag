@@ -2516,17 +2516,12 @@ export default function App() {
     return res;
   };
 
-  // Fetch collections from backend
+  // Fetch collections from backend (mounted via src.manage on agent-api)
   const fetchCollections = async (preferredAgentCol = null) => {
     if (!currentUser) return;
     try {
       setApiStatus('checking');
-      let res;
-      try {
-        res = await authFetch(`${API_BASE}/collections`);
-      } catch (e) {
-        res = await authFetch(`${AGENT_API_BASE}/collections`);
-      }
+      const res = await authFetch(`${AGENT_API_BASE}/collections`);
       if (!res.ok) throw new Error('Failed to fetch collections');
       const data = await res.json();
       const colList = data.collections || [];
@@ -2573,16 +2568,9 @@ export default function App() {
     setNotification(null);
     setLoading(true);
     try {
-      let res;
-      try {
-        res = await authFetch(`${API_BASE}/collections/${encodeURIComponent(colName)}`, {
-          method: 'DELETE',
-        });
-      } catch (e) {
-        res = await authFetch(`${AGENT_API_BASE}/collections/${encodeURIComponent(colName)}`, {
-          method: 'DELETE',
-        });
-      }
+      const res = await authFetch(`${AGENT_API_BASE}/collections/${encodeURIComponent(colName)}`, {
+        method: 'DELETE',
+      });
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data.detail || 'Failed to delete collection');
@@ -2800,7 +2788,7 @@ export default function App() {
     setQueryLoading(true);
 
     try {
-      const response = await authFetch(`${API_BASE}/query`, {
+      const response = await authFetch(`${AGENT_API_BASE}/query`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

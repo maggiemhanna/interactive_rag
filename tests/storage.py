@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import os
 import shutil
@@ -39,6 +41,18 @@ class FakeGCSBlob:
             return self._generation
         entry = self.bucket._objects.get(self.name)
         return entry["generation"] if entry else None
+
+    @property
+    def md5_hash(self) -> Optional[str]:
+        entry = self.bucket._objects.get(self.name)
+        if not entry:
+            return None
+        return base64.b64encode(hashlib.md5(entry["data"]).digest()).decode("ascii")
+
+    @property
+    def size(self) -> int:
+        entry = self.bucket._objects.get(self.name)
+        return len(entry["data"]) if entry else 0
 
     def exists(self) -> bool:
         return self.name in self.bucket._objects

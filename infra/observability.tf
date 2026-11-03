@@ -430,9 +430,9 @@ resource "google_logging_metric" "agent_ungrounded_answers" {
 }
 
 # 10. Document Ingestion Chunks Indexed (`chunks_added` on `document.ingest` events)
-resource "google_logging_metric" "ingestion_chunks_added" {
+resource "google_logging_metric" "ingest_chunks_added" {
   project         = var.project_id
-  name            = "${var.app_name}/ingestion_chunks_added"
+  name            = "${var.app_name}/ingest_chunks_added"
   description     = "Number of PDF text chunks embedded and indexed per document.ingest request."
   filter          = "logName=\"projects/${var.project_id}/logs/interactiverag-telemetry\" AND jsonPayload.event_type=\"document.ingest\" AND jsonPayload.chunks_added > 0"
   value_extractor = "EXTRACT(jsonPayload.chunks_added)"
@@ -696,7 +696,7 @@ resource "google_monitoring_dashboard" "observability_dashboard" {
                 legendTemplate = "{{metric.label.embedding_model}}"
                 timeSeriesQuery = {
                   timeSeriesFilter = {
-                    filter = "metric.type=\"logging.googleapis.com/user/${var.app_name}/ingestion_chunks_added\""
+                    filter = "metric.type=\"logging.googleapis.com/user/${var.app_name}/ingest_chunks_added\""
                     aggregation = {
                       alignmentPeriod    = "60s"
                       perSeriesAligner   = "ALIGN_DELTA"
@@ -730,6 +730,124 @@ resource "google_monitoring_dashboard" "observability_dashboard" {
               }
             ]
           }
+        },
+        {
+          title = "9. Cloud Run Active Container Instances by Service (Horizontal Scaling)"
+          xyChart = {
+            dataSets = [
+              {
+                plotType       = "LINE"
+                legendTemplate = "{{resource.label.service_name}} ({{metric.label.state}})"
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "metric.type=\"run.googleapis.com/container/instance_count\" AND resource.type=\"cloud_run_revision\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_MEAN"
+                      crossSeriesReducer = "REDUCE_SUM"
+                      groupByFields      = ["resource.label.service_name", "metric.label.state"]
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          title = "10. Cloud Run CPU & Memory (+ /tmp tmpfs) Utilization (p95)"
+          xyChart = {
+            dataSets = [
+              {
+                plotType       = "LINE"
+                legendTemplate = "CPU p95 ({{resource.label.service_name}})"
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "metric.type=\"run.googleapis.com/container/cpu/utilizations\" AND resource.type=\"cloud_run_revision\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_PERCENTILE_95"
+                      crossSeriesReducer = "REDUCE_MEAN"
+                      groupByFields      = ["resource.label.service_name"]
+                    }
+                  }
+                }
+              },
+              {
+                plotType       = "LINE"
+                legendTemplate = "Memory + /tmp p95 ({{resource.label.service_name}})"
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "metric.type=\"run.googleapis.com/container/memory/utilizations\" AND resource.type=\"cloud_run_revision\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_PERCENTILE_95"
+                      crossSeriesReducer = "REDUCE_MEAN"
+                      groupByFields      = ["resource.label.service_name"]
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          title = "11. Cloud Run Max Concurrent Requests per Instance (p95)"
+          xyChart = {
+            dataSets = [
+              {
+                plotType       = "LINE"
+                legendTemplate = "Max Concurrency p95 ({{resource.label.service_name}})"
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "metric.type=\"run.googleapis.com/container/max_request_concurrencies\" AND resource.type=\"cloud_run_revision\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_PERCENTILE_95"
+                      crossSeriesReducer = "REDUCE_MEAN"
+                      groupByFields      = ["resource.label.service_name"]
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          title = "12. Cloud Run End-to-End Request Latencies by Service (p50 / p95)"
+          xyChart = {
+            dataSets = [
+              {
+                plotType       = "LINE"
+                legendTemplate = "p95 ({{resource.label.service_name}})"
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "metric.type=\"run.googleapis.com/request_latencies\" AND resource.type=\"cloud_run_revision\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_PERCENTILE_95"
+                      crossSeriesReducer = "REDUCE_MEAN"
+                      groupByFields      = ["resource.label.service_name"]
+                    }
+                  }
+                }
+              },
+              {
+                plotType       = "LINE"
+                legendTemplate = "p50 ({{resource.label.service_name}})"
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "metric.type=\"run.googleapis.com/request_latencies\" AND resource.type=\"cloud_run_revision\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_PERCENTILE_50"
+                      crossSeriesReducer = "REDUCE_MEAN"
+                      groupByFields      = ["resource.label.service_name"]
+                    }
+                  }
+                }
+              }
+            ]
+          }
         }
       ]
     }
@@ -746,6 +864,107 @@ resource "google_monitoring_dashboard" "observability_dashboard" {
     google_logging_metric.agent_total_tokens,
     google_logging_metric.retrieval_mean_similarity_score,
     google_logging_metric.agent_ungrounded_answers,
-    google_logging_metric.ingestion_chunks_added,
+    google_logging_metric.ingest_chunks_added,
   ]
 }
+
+# ==============================================================================
+# 5. Cloud Monitoring Alert Policies (Latency SLO, /tmp Memory Saturation & 5xx)
+# ==============================================================================
+
+# 1. Agent Turn p95 Latency Alert
+resource "google_monitoring_alert_policy" "agent_high_latency_alert" {
+  project      = var.project_id
+  display_name = "InteractiveRAG — High Agent Turn p95 Latency (${var.environment})"
+  combiner     = "OR"
+
+  conditions {
+    display_name = "Agent turn p95 latency > ${var.alert_agent_latency_p95_ms} ms"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/${var.app_name}/agent_turn_latency_ms\" AND resource.type=\"cloud_run_revision\""
+      duration        = "300s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = var.alert_agent_latency_p95_ms
+
+      aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_PERCENTILE_95"
+        cross_series_reducer = "REDUCE_MEAN"
+      }
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  depends_on = [
+    google_project_service.required_apis["monitoring.googleapis.com"],
+    google_logging_metric.agent_turn_latency_ms,
+  ]
+}
+
+# 2. Cloud Run Container + `/tmp` RAM-Disk Memory Saturation Alert
+resource "google_monitoring_alert_policy" "cloud_run_memory_saturation_alert" {
+  project      = var.project_id
+  display_name = "InteractiveRAG — Cloud Run Memory & /tmp Saturation (${var.environment})"
+  combiner     = "OR"
+
+  conditions {
+    display_name = "Cloud Run p95 memory utilization > ${var.alert_memory_utilization_threshold * 100}%"
+    condition_threshold {
+      filter          = "metric.type=\"run.googleapis.com/container/memory/utilizations\" AND resource.type=\"cloud_run_revision\""
+      duration        = "180s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = var.alert_memory_utilization_threshold
+
+      aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_PERCENTILE_95"
+        cross_series_reducer = "REDUCE_MAX"
+        group_by_fields      = ["resource.label.service_name"]
+      }
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  depends_on = [
+    google_project_service.required_apis["monitoring.googleapis.com"],
+  ]
+}
+
+# 3. Cloud Run Elevated HTTP 5xx Error Rate Alert
+resource "google_monitoring_alert_policy" "cloud_run_5xx_error_rate_alert" {
+  project      = var.project_id
+  display_name = "InteractiveRAG — Cloud Run 5xx Server Error Spike (${var.environment})"
+  combiner     = "OR"
+
+  conditions {
+    display_name = "Cloud Run 5xx response rate > 0.05 req/s"
+    condition_threshold {
+      filter          = "metric.type=\"run.googleapis.com/request_count\" AND resource.type=\"cloud_run_revision\" AND metric.label.response_code_class=\"5xx\""
+      duration        = "120s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0.05
+
+      aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_RATE"
+        cross_series_reducer = "REDUCE_SUM"
+        group_by_fields      = ["resource.label.service_name"]
+      }
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  depends_on = [
+    google_project_service.required_apis["monitoring.googleapis.com"],
+  ]
+}
+

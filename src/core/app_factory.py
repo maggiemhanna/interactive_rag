@@ -1,37 +1,32 @@
 """Shared FastAPI application factory for InteractiveRAG microservices.
 
-Constructs standardized FastAPI instances (`ingestion-api` and `agent-api`) wired with
+Constructs standardized FastAPI instances (`ingest-api` and `agent-api`) wired with
 CORS origin policies, `RequestCorrelationMiddleware` (`X-Request-Id` / `X-Cloud-Trace-Context`),
-unauthenticated `/health` readiness probes, shared `/collections` endpoints, and GDPR
-`/compliance/my-data` DSAR routes.
+unauthenticated `/health` readiness probes, and explicit domain routers supplied by each service.
 """
 
-from typing import Callable, Dict, List, Optional
+from typing import Dict, Optional, Sequence
 
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import src.core.config  # noqa: F401 - ensures .env files are loaded
-from src.core.compliance.routes import build_compliance_router
 from src.core.config import get_allowed_origins
 from src.core.context import RequestCorrelationMiddleware
-from src.core.storage.routes import collections_router
 
 
 def create_app(
     title: str,
     service_name: str,
     *,
-    memory_inventory_fn: Optional[Callable[[str], List[str]]] = None,
-    on_user_purge: Optional[Callable[[str], int]] = None,
+    routers: Optional[Sequence[APIRouter]] = None,
 ) -> FastAPI:
-    """Creates a FastAPI service configured with CORS, correlation middleware, health probe, and shared routers.
+    """Creates a FastAPI service configured with CORS, correlation middleware, health probe, and domain routers.
 
     Args:
         title: OpenAPI specification title for the FastAPI application.
-        service_name: Logical microservice identifier (`'ingestion-api'` or `'agent-api'`).
-        memory_inventory_fn: Optional callback returning active conversation thread IDs for DSAR exports.
-        on_user_purge: Optional callback purging conversation memory threads on DSAR erasure.
+        service_name: Logical microservice identifier (`'ingest-api'` or `'agent-api'`).
+        routers: Optional sequence of FastAPI `APIRouter` instances to mount on this service.
 
     Returns:
         Configured `FastAPI` application instance.
@@ -54,14 +49,11 @@ def create_app(
         """Unauthenticated liveness and readiness probe endpoint for Cloud Run."""
         return {"status": "ok", "service": service_name}
 
-    app.include_router(collections_router)
-    app.include_router(
-        build_compliance_router(
-            memory_inventory_fn=memory_inventory_fn,
-            on_user_purge=on_user_purge,
-        )
-    )
+    if routers:
+        for router in routers:
+            app.include_router(router)
     return app
 
 
 __all__ = ["create_app"]
+

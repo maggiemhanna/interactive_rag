@@ -1,4 +1,4 @@
-"""PDF filename sanitization and document chunk splitting utilities.
+"""PDF filename sanitization and document chunk splitting utilities (`src.ingest.splitter`).
 
 Provides pure document-processing helpers independent of FastAPI HTTP request objects:
 - `sanitize_filename`: Strips path traversal components and enforces `.pdf` extensions.
@@ -17,7 +17,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from src.core.logger import setup_logging
 from src.core.observability.tracing import start_span
 
-logger = setup_logging(name="ingestion.splitter")
+logger = setup_logging(name="ingest.splitter")
 
 _SAFE_UPLOAD_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 
@@ -67,7 +67,7 @@ def split_pdfs(
     if isinstance(pdf_paths, str):
         pdf_paths = [pdf_paths]
 
-    with start_span("ingestion.split_pdfs", stage="chunking", file_count=len(pdf_paths)) as span:
+    with start_span("ingest.split_pdfs", stage="chunking", file_count=len(pdf_paths)) as span:
         all_chunks: List[Document] = []
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size, chunk_overlap=chunk_overlap

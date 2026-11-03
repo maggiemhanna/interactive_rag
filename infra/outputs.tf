@@ -30,9 +30,9 @@ output "frontend_service_uri" {
   value       = google_cloud_run_v2_service.frontend.uri
 }
 
-output "ingestion_api_url" {
-  description = "Internal Cloud Run URI for ingestion-api (direct internet access blocked via INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER)."
-  value       = google_cloud_run_v2_service.ingestion_api.uri
+output "ingest_api_url" {
+  description = "Internal Cloud Run URI for ingest-api (direct internet access blocked via INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER)."
+  value       = google_cloud_run_v2_service.ingest_api.uri
 }
 
 output "agent_api_url" {
@@ -136,3 +136,13 @@ output "observability_dashboard_id" {
   description = "Google Cloud Monitoring dashboard resource ID for InteractiveRAG Observability & AI Monitoring."
   value       = google_monitoring_dashboard.observability_dashboard.id
 }
+
+output "alert_policy_ids" {
+  description = "Cloud Monitoring alert policy IDs for latency SLO, Cloud Run memory saturation, and 5xx error spikes."
+  value = {
+    agent_high_latency          = google_monitoring_alert_policy.agent_high_latency_alert.id
+    cloud_run_memory_saturation = google_monitoring_alert_policy.cloud_run_memory_saturation_alert.id
+    cloud_run_5xx_error_rate    = google_monitoring_alert_policy.cloud_run_5xx_error_rate_alert.id
+  }
+}
+

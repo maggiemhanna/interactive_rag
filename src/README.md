@@ -2,20 +2,27 @@
 
 This directory contains the Python backend packages for **InteractiveRAG**, a multi-tenant, compliance-aware Agentic Retrieval-Augmented Generation platform powered by **LangGraph**, **Google Cloud Vertex AI** (`gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-2.5-flash-lite`, `gemini-embedding-001`, `text-embedding-005`), **Google Cloud Model Armor + Cloud DLP**, **ChromaDB**, **Google Cloud Storage**, and **FastAPI**.
 
+To prevent CPU- and memory-intensive PDF ingestion from blocking interactive queries or agent chat, the backend is organized into **4 modular domain packages** (`src/ingest`, `src/manage`, `src/query`, `src/agent`) plus shared platform infrastructure (`src/core`), deployed across **2 specialized backend Cloud Run services**:
+1. **`ingest-api` (`src.ingest.app:app`, Port 8000)**: Mounts **only** `src/ingest` (`POST /ingest` + `GET /health`) with low concurrency (`4`) and heavy vertical resources (`2 vCPU / 4Gi RAM`).
+2. **`agent-api` (`src.agent.app:app`, Port 8001)**: Mounts `src/query` (`POST /query`), `src/manage` (`GET /collections`, `DELETE /collections/{collection_name}`, `GET/DELETE /compliance/my-data`), and `src/agent` (`POST /agent`, `POST /agent/stream`, `GET /health`) with high concurrency (`32`), sharing a single warm `/tmp/chroma_db/{uid}` cache and unified per-UID rate limiter.
+
 ---
 
 ## Table of Contents
 
-- [1. `src/core/` - Shared Platform, Storage, AI Security & Compliance](#1-srccore---shared-platform-storage-ai-security--compliance)
+- [1. `src/core/` - Shared Platform, Storage, AI Security, Compliance & Observability](#1-srccore---shared-platform-storage-ai-security-compliance--observability)
   - [Core Infrastructure](#core-infrastructure)
-  - [`src/core/storage/` - Multi-Tenant Persistence & Distributed Locking](#srccorestorage---multi-tenant-persistence--distributed-locking)
+  - [`src/core/storage/` - Multi-Tenant Persistence, Incremental Delta Sync & Distributed Locking](#srccorestorage---multi-tenant-persistence-incremental-delta-sync--distributed-locking)
   - [`src/core/ai_security/` - Model Armor, Content Safety & Guardrails](#srccoreai_security---model-armor-content-safety--guardrails)
   - [`src/core/compliance/` - Data Residency, Audit Logging, Provenance & DSAR](#srccorecompliance---data-residency-audit-logging-provenance--dsar)
-- [2. `src/ingestion/` - Document Ingestion & Vector Search Service](#2-srcingestion---document-ingestion--vector-search-service)
+  - [`src/core/observability/` - Observability & AI Monitoring](#srccoreobservability---observability--ai-monitoring)
+- [2. `src/ingest/` - Dedicated Document Ingestion Service (`ingest-api`, Port 8000)](#2-srcingest---dedicated-document-ingestion-service-ingest-api-port-8000)
   - [Core Responsibilities](#core-responsibilities)
   - [API Endpoints Reference (`http://localhost:8000`)](#api-endpoints-reference-httplocalhost8000)
   - [Usage & Examples](#usage--examples)
-- [3. `src/agent/` - LangGraph Agentic RAG Service](#3-srcagent---langgraph-agentic-rag-service)
+- [3. `src/manage/` - Collection Management & GDPR Self-Service Package](#3-srcmanage---collection-management--gdpr-self-service-package)
+- [4. `src/query/` - Direct Vector Similarity Search Package](#4-srcquery---direct-vector-similarity-search-package)
+- [5. `src/agent/` - Unified Interactive Agent, Query & Management Service (`agent-api`, Port 8001)](#5-srcagent---unified-interactive-agent-query--management-service-agent-api-port-8001)
   - [Core Responsibilities](#core-responsibilities-1)
   - [LangGraph Agent Workflow](#langgraph-agent-workflow)
   - [API Endpoints Reference (`http://localhost:8001`)](#api-endpoints-reference-httplocalhost8001)
@@ -26,23 +33,22 @@ This directory contains the Python backend packages for **InteractiveRAG**, a mu
 
 ---
 
-## 1. `src/core/` - Shared Platform, Storage, AI Security & Compliance
+## 1. `src/core/` - Shared Platform, Storage, AI Security, Compliance & Observability
 
-`src/core/` centralizes cross-cutting platform infrastructure and domain packages shared by both Cloud Run services (`ingestion-api` and `agent-api`).
+`src/core/` centralizes cross-cutting platform infrastructure and domain packages shared by both Cloud Run backend services (`ingest-api` and `agent-api`).
 
 ### Core Infrastructure
-- **`config.py`**: Loads `.env` settings and exposes runtime environment helpers (`is_cloud_run`, `get_allowed_origins`, `get_google_cloud_location`, `get_model_armor_location`, `get_allowed_llm_models`, `get_allowed_embedding_models`) plus local service ports.
+- **`config.py`**: Loads `.env` settings and exposes runtime environment helpers (`is_cloud_run`, `get_allowed_origins`, `get_google_cloud_location`, `get_model_armor_location`, `get_allowed_llm_models`, `get_allowed_embedding_models`, `get_chroma_tmp_max_bytes`, `get_chroma_tmp_min_free_bytes`) plus local service ports.
 - **`context.py`**: Manages per-request `contextvars` correlation state (`RequestContext`, `RequestCorrelationMiddleware`) tracking sanitized `X-Request-Id`, Cloud Trace ID, active span ID, authenticated `uid`, and a thread-safe `data` store for domain modules.
 - **`auth.py`**: Verifies Google Identity Platform / Firebase Bearer JWTs (`verify_bearer_token`, `get_current_user`, `get_current_user_info`), enforces path-safe `uid` validation (`validate_uid`), and blocks `AUTH_DISABLED` bypasses when running on Cloud Run.
 - **`logger.py`**: Configures structured ANSI-colored console logging (`setup_logging`, `format_dict_for_logs`).
-- **`app_factory.py`**: Provides `create_app()` to wire CORS middleware, `RequestCorrelationMiddleware`, `/health` readiness probes, `/collections` routes, and `/compliance/my-data` self-service DSAR routes.
+- **`app_factory.py`**: Provides `create_app()` to wire CORS middleware, `RequestCorrelationMiddleware`, and `/health` readiness probes, with `include_manage_routes` so `ingest-api` mounts only `/ingest` + `/health` while `agent-api` mounts `query`, `manage`, and `agent` routes.
 
-### `src/core/storage/` - Multi-Tenant Persistence & Distributed Locking
+### `src/core/storage/` - Multi-Tenant Persistence, Incremental Delta Sync & Distributed Locking
 - **`paths.py`**: Isolates per-user local directories (`/tmp/chroma_db/{uid}`, `/tmp/uploads/{uid}`), constructs GCS object prefixes, checkpoints SQLite WAL files, and evicts cached Chroma `SharedSystemClient` registries (`release_client_cache`).
-- **`gcs_sync.py`**: Pulls and pushes per-user ChromaDB snapshots between `/tmp` and `gs://<bucket>/users/{uid}/chroma_db/` with `version.json` invalidation, and archives raw uploaded PDFs (`archive_upload`).
-- **`locks.py`**: Coordinates per-user `threading.RLock` instances, distributed `if_generation_match` GCS write locks with TTL stale-lock recovery (`user_write_lock`, `user_read_lock`), and LRU `/tmp` cache eviction (`evict_tmp_cache`).
+- **`gcs_sync.py`**: Pulls and pushes per-user ChromaDB snapshots between `/tmp` and `gs://<bucket>/users/{uid}/chroma_db/` with incremental MD5 delta sync (`_compute_file_md5_base64`, uploading only new or changed files and deleting stale remote blobs), `version.json` invalidation, and raw PDF upload archiving (`archive_upload`).
+- **`locks.py`**: Coordinates per-user `threading.RLock` instances, distributed `if_generation_match` GCS write locks with TTL stale-lock recovery (`user_write_lock`, `user_read_lock`), and bounded `/tmp` `tmpfs` LRU cache eviction (`evict_tmp_cache` enforcing `CHROMA_TMP_MAX_BYTES=512 MiB` and `CHROMA_TMP_MIN_FREE_BYTES=256 MiB`).
 - **`chroma.py`**: Instantiates regional Vertex AI `GoogleGenerativeAIEmbeddings` and manages per-user Chroma collections (`get_vectorstore`, `require_collection`, `list_collections`, `remove_collection`).
-- **`routes.py`**: Shared FastAPI `collections_router` (`GET /collections`, `DELETE /collections/{collection_name}`).
 
 ### `src/core/ai_security/` - Model Armor, Content Safety & Guardrails
 - **`armor.py`**: Regional Google Cloud Model Armor + Cloud Data Loss Prevention (SDP) screening for user prompts (`screen_user_prompt`), retrieved document chunks (`sanitize_chunk_text`, `sanitize_retrieved_documents`), and final LLM responses (`sanitize_model_output`) with fail-closed behavior in Cloud Run.
@@ -56,7 +62,6 @@ This directory contains the Python backend packages for **InteractiveRAG**, a mu
 - **`policy.py`**: Enforces per-user sliding-window rate limiters (`enforce_ingest_rate_limit`, `enforce_query_rate_limit`) and collection count quotas (`enforce_collection_quota`).
 - **`provenance.py`**: Builds EU AI Act Article 50 transparency, citation grounding, and Model Armor provenance metadata (`ComplianceMetadata`, `build_compliance_metadata`).
 - **`dsar.py`**: Executes GDPR Article 15 data inventory (`get_user_data_inventory`) and Article 17 hard erasure (`purge_all_user_data`) across live + noncurrent versioned GCS blobs, local `/tmp` caches, and LangGraph memory checkpoints.
-- **`routes.py`**: Builds the self-service `/compliance/my-data` FastAPI router (`build_compliance_router`).
 
 ### `src/core/observability/` - Observability & AI Monitoring
 - **`logging.py`**: Enriches `LogRecord` instances from `RequestContext`, scrubs raw queries into `query_sha256` / `query_chars` (`RequestContextLogFilter`), and formats single-line Cloud Logging JSON (`GCPJsonFormatter`).
@@ -66,34 +71,29 @@ This directory contains the Python backend packages for **InteractiveRAG**, a mu
 
 ---
 
-## 2. `src/ingestion/` - Document Ingestion & Vector Search Service
+## 2. `src/ingest/` - Dedicated Document Ingestion Service (`ingest-api`, Port 8000)
 
 ### Core Responsibilities
-`src/ingestion/` handles PDF validation, chunking, embedding indexing, and direct similarity search:
-1. **Upload Staging & Validation (`upload_parser.py`)**: Parses JSON or multipart `/ingest` payloads, enforces `%PDF-` magic-byte checks, `MAX_UPLOAD_MB` (413), `MAX_FILES_PER_REQUEST` (400), and `MAX_CHUNKS_PER_INGEST` (400), stages uploads inside `/tmp/uploads/{uid}/{request_id}`, and guarantees cleanup in `app.py`.
+`src/ingest/` isolates CPU- and memory-heavy PDF parsing, text splitting, batch embedding, and ChromaDB HNSW indexing into a dedicated Cloud Run service (`ingest-api`) so uploads never block interactive queries or agent chat:
+1. **Upload Staging & Validation (`upload_parser.py`)**: Parses JSON or multipart `/ingest` payloads, enforces `%PDF-` magic-byte checks, `MAX_UPLOAD_MB` (413), `MAX_FILES_PER_REQUEST` (400), and `MAX_CHUNKS_PER_INGEST` (400), stages uploads inside `/tmp/uploads/{uid}/{request_id}`, and guarantees cleanup.
 2. **PDF Loading & Chunking (`splitter.py`)**: Loads PDFs via `PyPDFLoader` and splits pages into overlapping chunks (`chunk_size=1000`, `chunk_overlap=200`) using `RecursiveCharacterTextSplitter`.
-3. **Vector Indexing & DLP-Sanitized Search (`service.py`)**: Indexes chunks in batches of `100` inside `user_write_lock(uid)` (`ingest_documents`) and runs top-$k$ similarity search inside `user_read_lock(uid)` with Cloud DLP `[INFO_TYPE]` chunk masking (`search_collection`).
-4. **FastAPI Service (`app.py`, `schemas.py`)**: Exposes `/ingest`, `/query`, `/collections`, `/compliance/my-data`, and `/health`.
+3. **Batched Vector Indexing (`service.py`)**: Indexes chunks in batches of `100` inside `user_write_lock(uid)` (`ingest_documents`) and pushes incremental MD5 deltas to GCS.
+4. **Dedicated FastAPI Service (`routes.py`, `app.py`, `schemas.py`)**: Exposes **only** `POST /ingest` and `GET /health`.
 
 ### API Endpoints Reference (`http://localhost:8000`)
 
 | Method | Path | Content-Type | Description |
 | :--- | :--- | :--- | :--- |
-| `GET` | `/health` | N/A | Unauthenticated readiness/liveness probe (`ingestion-api`). |
+| `GET` | `/health` | N/A | Unauthenticated readiness/liveness probe (`ingest-api`). |
 | `POST` | `/ingest` | `application/json` or `multipart/form-data` | Ingests PDF files from local paths (dev only) or multipart binary uploads. |
-| `POST` | `/query` | `application/json` | Performs top-$k$ similarity search with DLP chunk sanitization. |
-| `GET` | `/collections` | N/A | Lists the authenticated user's ChromaDB collections and passage counts. |
-| `DELETE` | `/collections/{collection_name}` | N/A | Deletes a ChromaDB collection from local cache and GCS. |
-| `GET` | `/compliance/my-data` | N/A | Returns GDPR Art. 15 personal data inventory for the caller. |
-| `DELETE` | `/compliance/my-data` | N/A | Executes GDPR Art. 17 complete versioned erasure for the caller. |
 
 ### Usage & Examples
 
 #### Starting the Service
 ```bash
-python -m src.ingestion
+python -m src.ingest
 # Or via uvicorn directly:
-uvicorn src.ingestion.app:app --host 0.0.0.0 --port 8000 --reload
+uvicorn src.ingest.app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 #### Multipart PDF Upload
@@ -103,28 +103,35 @@ curl -X POST "http://localhost:8000/ingest" \
   -F "collection_name=stock_market_vs"
 ```
 
-#### Vector Store Similarity Query
-```bash
-curl -X POST "http://localhost:8000/query" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "What are the key financial performance metrics?",
-    "collection_name": "stock_market_vs",
-    "k": 5
-  }'
-```
+---
+
+## 3. `src/manage/` - Collection Management & GDPR Self-Service Package
+
+`src/manage/` encapsulates tenant collection lifecycle management and GDPR Articles 15 & 17 self-service rights, mounted onto `agent-api`:
+- **`collections.py`**: Defines `collections_router` (`GET /collections` and `DELETE /collections/{collection_name}`).
+- **`compliance.py`**: Defines `compliance_router` (`GET /compliance/my-data` and `DELETE /compliance/my-data`).
+- **`routes.py`**: Defines `manage_router`, combining `collections_router` and `compliance_router` so `agent-api` can inspect and erase both ChromaDB collections and in-memory LangGraph sessions in a single atomic request.
 
 ---
 
-## 3. `src/agent/` - LangGraph Agentic RAG Service
+## 4. `src/query/` - Direct Vector Similarity Search Package
+
+`src/query/` encapsulates direct top-$k$ semantic similarity search against a user's ChromaDB collection, mounted onto `agent-api`:
+- **`schemas.py`**: Defines `QueryRequest` (validating collection name, query text, `k`, and embedding model allowlist).
+- **`service.py`**: Implements `search_collection(uid, query, collection_name, k, embedding_model)` inside `user_read_lock(uid)` with Cloud DLP `[INFO_TYPE]` chunk masking and retrieval similarity score telemetry.
+- **`routes.py`**: Exposes `POST /query` (`query_router`), sharing `agent-api`'s warm `/tmp/chroma_db/{uid}` cache and `_QUERY_RATE_LIMITER`.
+
+---
+
+## 5. `src/agent/` - Unified Interactive Agent, Query & Management Service (`agent-api`, Port 8001)
 
 ### Core Responsibilities
-`src/agent/` runs the stateful, safety-screened LangGraph RAG workflow:
+`src/agent/` runs the stateful, safety-screened LangGraph RAG workflow and mounts `src/query` + `src/manage` + `src/agent` onto `agent-api`:
 1. **XML-Spotlighted Retriever Tool (`tools.py`)**: Queries the user's Chroma collection, applies Cloud DLP `[INFO_TYPE]` chunk redaction, and wraps retrieved passages in `<retrieved_chunk source="..." page="...">` tags (`format_retrieved_chunks`, `get_retriever_tool`).
 2. **Tenant-Isolated Memory (`memory.py`)**: Namespaces `InMemorySaver` checkpoint threads under `{uid}:{thread_id}` and supports GDPR Art. 17 thread purging (`purge_user_memory_threads`).
 3. **Safety-Screened LangGraph StateGraph (`graph.py`)**: Compiles `input_guard` $\rightarrow$ `llm` $\rightarrow$ `tools` $\rightarrow$ `output_guard` with regional `ChatGoogleGenerativeAI`, Gemini safety thresholds, and `[source, p.X]` citation rules.
 4. **SSE & Interactive Streaming (`stream.py`, `display.py`)**: Streams sanitized message events, tool traces, and EU AI Act Art. 50 `compliance` frames over SSE (`format_sse_events`) or rich terminal panels (`run_interactive`).
-5. **FastAPI Service (`app.py`, `schemas.py`)**: Exposes `/agent`, `/agent/stream`, `/collections`, `/compliance/my-data`, and `/health`.
+5. **Unified Interactive FastAPI Service (`routes.py`, `app.py`, `schemas.py`)**: Defines `agent_router` (`POST /agent`, `POST /agent/stream`) in `routes.py` and mounts `agent_router`, `query_router` (`POST /query`), and `manage_router` (`GET /collections`, `DELETE /collections/{collection_name}`, `GET/DELETE /compliance/my-data`) plus `GET /health` in `app.py`.
 
 ### LangGraph Agent Workflow
 - **`input_guard` (`graph.py`)**: Screens the latest user turn via Model Armor (`screen_user_prompt`) before any LLM call.
@@ -137,12 +144,13 @@ curl -X POST "http://localhost:8000/query" \
 | Method | Path | Content-Type | Description |
 | :--- | :--- | :--- | :--- |
 | `GET` | `/health` | N/A | Unauthenticated readiness/liveness probe (`agent-api`). |
+| `POST` | `/query` | `application/json` | Performs top-$k$ similarity search with DLP chunk sanitization (`src/query`). |
+| `GET` | `/collections` | N/A | Lists the authenticated user's ChromaDB collections and passage counts (`src/manage`). |
+| `DELETE` | `/collections/{collection_name}` | N/A | Deletes a ChromaDB collection from local cache and GCS (`src/manage`). |
+| `GET` | `/compliance/my-data` | N/A | Returns GDPR Art. 15 personal data inventory across GCS, Chroma, and memory threads (`src/manage`). |
+| `DELETE` | `/compliance/my-data` | N/A | Executes GDPR Art. 17 hard erasure across GCS, `/tmp`, and memory threads (`src/manage`). |
 | `POST` | `/agent` | `application/json` | Runs agent query (`stream: false` JSON with `compliance`, or `stream: true` SSE). |
 | `POST` | `/agent/stream` | `application/json` | Dedicated Server-Sent Events (`text/event-stream`) endpoint. |
-| `GET` | `/collections` | N/A | Lists the authenticated user's ChromaDB collections and passage counts. |
-| `DELETE` | `/collections/{collection_name}` | N/A | Deletes a ChromaDB collection from local cache and GCS. |
-| `GET` | `/compliance/my-data` | N/A | Returns GDPR Art. 15 personal data inventory (including active memory threads). |
-| `DELETE` | `/compliance/my-data` | N/A | Executes GDPR Art. 17 hard erasure across GCS, `/tmp`, and memory threads. |
 
 ### Streaming & Provenance Events
 
@@ -168,7 +176,18 @@ python -m src.agent
 uvicorn src.agent.app:app --host 0.0.0.0 --port 8001 --reload
 ```
 
-#### Synchronous JSON Request
+#### Vector Store Similarity Query
+```bash
+curl -X POST "http://localhost:8001/query" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "What are the key financial performance metrics?",
+    "collection_name": "stock_market_vs",
+    "k": 5
+  }'
+```
+
+#### Synchronous JSON Agent Request
 ```bash
 curl -X POST "http://localhost:8001/agent" \
   -H "Content-Type: application/json" \
@@ -180,7 +199,7 @@ curl -X POST "http://localhost:8001/agent" \
   }'
 ```
 
-#### Streaming Request (SSE)
+#### Streaming Agent Request (SSE)
 ```bash
 curl -X POST "http://localhost:8001/agent/stream" \
   -H "Content-Type: application/json" \
@@ -222,7 +241,7 @@ src/
 ├── README.md
 ├── core/
 │   ├── __init__.py
-│   ├── config.py              # .env loading, runtime environment & allowlist getters
+│   ├── config.py              # .env loading, runtime environment, /tmp caps & allowlist getters
 │   ├── context.py             # Shared RequestContext & RequestCorrelationMiddleware
 │   ├── auth.py                # Firebase JWT verification & path-safe uid validation
 │   ├── logger.py              # ANSI-colored structured logging setup
@@ -230,10 +249,9 @@ src/
 │   ├── storage/
 │   │   ├── __init__.py
 │   │   ├── paths.py           # Per-user /tmp & GCS paths, SQLite WAL & Chroma cache helpers
-│   │   ├── gcs_sync.py        # GCS snapshot pull/push & PDF upload archiving
+│   │   ├── gcs_sync.py        # Incremental MD5 delta GCS snapshot pull/push & PDF archiving
 │   │   ├── locks.py           # Per-user thread RLocks, distributed GCS locks & /tmp LRU eviction
-│   │   ├── chroma.py          # Regional Vertex AI embeddings & ChromaDB collection helpers
-│   │   └── routes.py          # Shared /collections FastAPI router
+│   │   └── chroma.py          # Regional Vertex AI embeddings & ChromaDB collection helpers
 │   ├── ai_security/
 │   │   ├── __init__.py
 │   │   ├── armor.py           # Regional Model Armor + Cloud DLP prompt/chunk/output screening
@@ -246,23 +264,33 @@ src/
 │   │   ├── audit.py           # PII-free Cloud Logging publisher & SHA-256 query hashing
 │   │   ├── policy.py          # Per-user sliding-window rate limiters & collection quotas
 │   │   ├── provenance.py      # EU AI Act Art. 50 transparency & citation grounding metadata
-│   │   ├── dsar.py            # GDPR Art. 15 inventory & Art. 17 versioned hard erasure
-│   │   └── routes.py          # Self-service GET/DELETE /compliance/my-data router
+│   │   └── dsar.py            # GDPR Art. 15 inventory & Art. 17 versioned hard erasure
 │   └── observability/
 │       ├── __init__.py
 │       ├── logging.py         # Structured GCP JSON formatter & request correlation filter
 │       ├── state.py           # Per-request latency, TTFT, token, score & span state accumulators
 │       ├── telemetry.py       # AI-specific monitoring & interactiverag-telemetry publisher
 │       └── tracing.py         # Hierarchical per-stage span tracer & Cloud Trace exporter
-├── ingestion/
+├── ingest/                    # Package 1: Dedicated Document Ingestion Service (`ingest-api`)
 │   ├── __init__.py
-│   ├── __main__.py            # Entrypoint (`python -m src.ingestion`)
+│   ├── __main__.py            # Entrypoint (`python -m src.ingest`)
 │   ├── splitter.py            # PyPDFLoader + RecursiveCharacterTextSplitter chunking
 │   ├── upload_parser.py       # Multipart/JSON upload staging, %PDF- & ceiling validation
-│   ├── schemas.py             # IngestRequest & QueryRequest Pydantic models
-│   ├── service.py             # Batch Chroma indexing & DLP-sanitized similarity search
-│   └── app.py                 # Ingestion FastAPI service (/ingest, /query)
-└── agent/
+│   ├── schemas.py             # IngestRequest Pydantic model
+│   ├── service.py             # Batch Chroma indexing inside distributed GCS write lock
+│   ├── routes.py              # FastAPI router (`POST /ingest`)
+│   └── app.py                 # Ingestion FastAPI service (`POST /ingest`, `GET /health`)
+├── manage/                    # Package 2: Collection Management & GDPR Self-Service (`agent-api`)
+│   ├── __init__.py
+│   ├── collections.py         # `GET /collections` & `DELETE /collections/{collection_name}`
+│   ├── compliance.py          # `GET /compliance/my-data` & `DELETE /compliance/my-data`
+│   └── routes.py              # Combined management router builder
+├── query/                     # Package 3: Direct Vector Similarity Search (`agent-api`)
+│   ├── __init__.py
+│   ├── schemas.py             # Validated QueryRequest model
+│   ├── service.py             # DLP-sanitized top-k Chroma similarity search
+│   └── routes.py              # FastAPI router (`POST /query`)
+└── agent/                     # Package 4: Unified Interactive Agent, Query & Management Service (`agent-api`)
     ├── __init__.py
     ├── __main__.py            # Entrypoint (`python -m src.agent`)
     ├── schemas.py             # AgentRequest & AgentState models
@@ -271,5 +299,6 @@ src/
     ├── graph.py               # Safety-screened LangGraph StateGraph builder
     ├── stream.py              # Agent event runner, SSE formatter & CLI interactive runner
     ├── display.py             # Rich terminal message rendering
-    └── app.py                 # Agent FastAPI service (/agent, /agent/stream)
+    ├── routes.py              # FastAPI router (`POST /agent`, `POST /agent/stream`)
+    └── app.py                 # Agent FastAPI service (`agent_router`, `query_router`, `manage_router`)
 ```

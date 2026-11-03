@@ -18,15 +18,15 @@ resource "google_compute_network" "main" {
   ]
 }
 
-# Isolated Direct VPC Egress subnet for `ingestion-api` (processes untrusted user PDFs).
-resource "google_compute_subnetwork" "ingestion" {
-  name                     = "${var.app_name}-ingestion-subnet-${var.environment}"
+# Isolated Direct VPC Egress subnet for `ingest-api` (processes untrusted user PDFs).
+resource "google_compute_subnetwork" "ingest" {
+  name                     = "${var.app_name}-ingest-subnet-${var.environment}"
   project                  = var.project_id
   region                   = var.region
   network                  = google_compute_network.main.id
-  ip_cidr_range            = var.ingestion_subnet_cidr
+  ip_cidr_range            = var.ingest_subnet_cidr
   private_ip_google_access = true
-  description              = "Isolated Direct VPC Egress subnet for ingestion-api Cloud Run service."
+  description              = "Isolated Direct VPC Egress subnet for ingest-api Cloud Run service."
 }
 
 # Isolated Direct VPC Egress subnet for `agent-api` (runs LangGraph & Vertex AI calls).

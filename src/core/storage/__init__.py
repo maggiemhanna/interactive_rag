@@ -2,10 +2,9 @@
 
 Organizes per-user ChromaDB and Google Cloud Storage persistence into modular layers:
 - `paths`: Tenant directory isolation (`/tmp/chroma_db/{uid}`, `/tmp/uploads/{uid}`), Chroma cache eviction, and SQLite WAL helpers.
-- `gcs_sync`: GCS client/bucket lookup, atomic snapshot pull/push, and PDF upload archiving.
+- `gcs_sync`: GCS client/bucket lookup, atomic snapshot pull/push, incremental MD5 delta sync, and PDF upload archiving.
 - `locks`: Per-user thread RLocks, distributed `if_generation_match` GCS locks, and `/tmp` LRU cache eviction.
 - `chroma`: Regional Vertex AI embeddings and ChromaDB collection operations.
-- `routes`: Shared FastAPI `/collections` router.
 """
 
 import importlib

@@ -518,13 +518,13 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
             request_id="req-phase3-err",
             trace_id="205445aa7843bc8bf206b12000100000",
             root_span_id="0000000000000009",
-            service_name="ingestion-api",
+            service_name="ingest-api",
         )
         token = bind_request_context(ctx)
         secret_query = "Confidential acquisition target name?"
         try:
             with self.assertRaises(RuntimeError):
-                with start_span("ingestion.search_collection", stage="retrieval", query=secret_query):
+                with start_span("query.search_collection", stage="retrieval", query=secret_query):
                     raise RuntimeError("Simulated vector index error")
 
             # Active span ID restored even after exception
@@ -552,8 +552,9 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
         from src.agent.tools import get_retriever_tool
         from src.core.storage import chroma as chroma_module
         from src.core.storage import release_client_cache
-        from src.ingestion.service import index_documents, search_collection
-        from src.ingestion.splitter import split_pdfs
+        from src.ingest.service import ingest_documents
+        from src.ingest.splitter import split_pdfs
+        from src.query.service import search_collection
         from tests.ai_security import (
             DeterministicFakeEmbeddings,
             GroundedCitingChatModel,
@@ -594,20 +595,19 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
                 },
                 clear=False,
             ):
-                # 1. Split PDFs -> ingestion.split_pdfs (stage="chunking")
+                # 1. Split PDFs -> ingest.split_pdfs (stage="chunking")
                 docs = split_pdfs([pdf_path], chunk_size=300, chunk_overlap=30)
                 self.assertGreaterEqual(len(docs), 1)
 
-                # 2. Index documents -> ingestion.index_documents (stage="embedding")
-                indexed = index_documents(
-                    docs,
-                    persist_directory=user_chroma_dir,
+                # 2. Ingest documents -> ingest.ingest_documents (stage="embedding")
+                ingest_documents(
+                    uid="alice_e2e",
+                    documents=docs,
                     collection_name="obs_reports",
                     embedding_model="gemini-embedding-001",
                 )
-                self.assertIsNotNone(indexed)
 
-                # 3. Direct vector search -> ingestion.search_collection (stage="retrieval")
+                # 3. Direct vector search -> query.search_collection (stage="retrieval")
                 results = search_collection(
                     uid="alice_e2e",
                     query="Annual revenue growth",
@@ -641,9 +641,9 @@ class TestPhase3DistributedTracingAndStageSpans(unittest.TestCase):
 
             recorded_names = [s["name"] for s in get_recorded_spans()]
             for expected_span_name in (
-                "ingestion.split_pdfs",
-                "ingestion.index_documents",
-                "ingestion.search_collection",
+                "ingest.split_pdfs",
+                "ingest.ingest_documents",
+                "query.search_collection",
                 "agent.input_guard",
                 "agent.model_call",
                 "agent.retriever_tool",
@@ -757,7 +757,7 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
         from src.core.observability import telemetry as telemetry_module
         from src.core.storage import chroma as chroma_module
         from src.core.storage import release_client_cache
-        from src.ingestion import app as ingestion_app_module
+        from src.ingest import app as ingestion_app_module
         from tests.ai_security import (
             DeterministicFakeEmbeddings,
             GroundedCitingChatModel,
@@ -828,7 +828,7 @@ class TestPhase4AIMonitoringAndTelemetryStream(unittest.TestCase):
 
                 # 2. POST /query -> vectorstore.query
                 telemetry_events.clear()
-                res_query = ingest_client.post(
+                res_query = agent_client.post(
                     "/query",
                     headers={
                         "X-Request-Id": "req-obs-query-001",
@@ -979,7 +979,7 @@ class TestPhase5ObservabilityInfrastructureAndStaticPolicies(unittest.TestCase):
             "agent_total_tokens",
             "retrieval_mean_similarity_score",
             "agent_ungrounded_answers",
-            "ingestion_chunks_added",
+            "ingest_chunks_added",
         ):
             self.assertIn(f'resource "google_logging_metric" "{metric_name}"', obs_tf)
         self.assertIn('resource "google_monitoring_dashboard" "observability_dashboard"', obs_tf)

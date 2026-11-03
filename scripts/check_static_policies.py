@@ -6,7 +6,7 @@ Verifies offline compliance & security invariants before `make plan` and `make d
    defaults to or hardcodes `'global'` or multi-region (`'us'`, `'eu'`, `'asia'`) locations.
 2. Cloud Run Terraform (`infra/cloud_run.tf` & `infra/variables.tf`) enforces fail-closed
    Model Armor screening (`MODEL_ARMOR_FAIL_CLOSED` enabled by default, never disabled on backend services).
-3. All three Cloud Run services (`ingestion_api`, `agent_api`, `frontend`) guard `prod` with
+3. All three Cloud Run services (`ingest_api`, `agent_api`, `frontend`) guard `prod` with
    `deletion_protection = var.environment == "prod"`.
 """
 
@@ -129,11 +129,43 @@ def _check_terraform_variables(infra_dir: str) -> List[str]:
                 f'infra/variables.tf variable "model_armor_fail_closed" must default to true (found {raw_fail_closed!r}).'
             )
 
+    for required_var in (
+        "ingest_cpu",
+        "ingest_memory",
+        "ingest_concurrency",
+        "ingest_min_instances",
+        "ingest_max_instances",
+        "agent_cpu",
+        "agent_memory",
+        "agent_concurrency",
+        "agent_min_instances",
+        "agent_max_instances",
+        "frontend_cpu",
+        "frontend_memory",
+        "frontend_concurrency",
+        "frontend_min_instances",
+        "frontend_max_instances",
+        "chroma_tmp_max_bytes",
+        "chroma_tmp_min_free_bytes",
+    ):
+        if required_var not in var_blocks:
+            violations.append(f'infra/variables.tf is missing variable "{required_var}".')
+
+    for subnet_var in ("ingest_subnet_cidr", "agent_subnet_cidr"):
+        if subnet_var not in var_blocks:
+            violations.append(f'infra/variables.tf is missing variable "{subnet_var}".')
+        else:
+            raw_cidr = (_extract_tf_default(var_blocks[subnet_var]) or "").strip().strip('"')
+            if "/" not in raw_cidr or int(raw_cidr.split("/")[1]) > 26:
+                violations.append(
+                    f'infra/variables.tf variable "{subnet_var}" default ({raw_cidr!r}) must have prefix length <= 26 (e.g., /24).'
+                )
+
     return violations
 
 
 def _check_cloud_run_tf(infra_dir: str) -> List[str]:
-    """Checks `infra/cloud_run.tf` for prod deletion protection, regional pinning, and fail-closed Model Armor.
+    """Checks `infra/cloud_run.tf` for prod deletion protection, concurrency, regional pinning, and fail-closed Model Armor.
 
     Args:
         infra_dir: Path to the `infra/` Terraform directory.
@@ -150,7 +182,7 @@ def _check_cloud_run_tf(infra_dir: str) -> List[str]:
         content = fh.read()
 
     services = {m.group("name"): m.group("body") for m in _CLOUD_RUN_SERVICE_RE.finditer(content)}
-    expected_services = ("ingestion_api", "agent_api", "frontend")
+    expected_services = ("ingest_api", "agent_api", "frontend")
     for svc_name in expected_services:
         if svc_name not in services:
             violations.append(
@@ -172,13 +204,28 @@ def _check_cloud_run_tf(infra_dir: str) -> List[str]:
                     f'deletion_protection = var.environment == "prod" (found `{normalized_expr}`).'
                 )
 
-    for backend_svc in ("ingestion_api", "agent_api"):
+        if not re.search(r"^\s*max_instance_request_concurrency\s*=\s*.+$", body, re.MULTILINE):
+            violations.append(
+                f'infra/cloud_run.tf service "{svc_name}" must explicitly configure max_instance_request_concurrency.'
+            )
+
+    expected_app_modules = {
+        "ingest_api": "src.ingest.app:app",
+        "agent_api": "src.agent.app:app",
+    }
+    for backend_svc in ("ingest_api", "agent_api"):
         if backend_svc not in services:
             continue
         env_map = {
             m.group("name"): m.group("value").strip()
             for m in _ENV_BLOCK_RE.finditer(services[backend_svc])
         }
+        raw_app_mod = (env_map.get("APP_MODULE") or "").strip('"')
+        if raw_app_mod != expected_app_modules[backend_svc]:
+            violations.append(
+                f'infra/cloud_run.tf service "{backend_svc}" must set APP_MODULE="{expected_app_modules[backend_svc]}" (found {raw_app_mod!r}).'
+            )
+
         for loc_env in ("GOOGLE_CLOUD_LOCATION", "MODEL_ARMOR_LOCATION"):
             raw_loc = env_map.get(loc_env)
             if not raw_loc:
@@ -200,6 +247,12 @@ def _check_cloud_run_tf(infra_dir: str) -> List[str]:
                 f'infra/cloud_run.tf service "{backend_svc}" must not disable MODEL_ARMOR_FAIL_CLOSED ({fail_closed_val}).'
             )
 
+        for tmp_env in ("CHROMA_TMP_MAX_BYTES", "CHROMA_TMP_MIN_FREE_BYTES"):
+            if not env_map.get(tmp_env):
+                violations.append(
+                    f'infra/cloud_run.tf service "{backend_svc}" must set {tmp_env}.'
+                )
+
         for obs_env, expected_val in (
             ("TELEMETRY_LOG_NAME", "interactiverag-telemetry"),
             ("STRUCTURED_LOGGING", "true"),
@@ -219,7 +272,7 @@ def _check_cloud_run_tf(infra_dir: str) -> List[str]:
 
 
 def _check_observability_tf(infra_dir: str) -> List[str]:
-    """Checks `infra/observability.tf` for regional log bucket pinning, sink routing, log metrics, and dashboard.
+    """Checks `infra/observability.tf` for regional log bucket pinning, sink routing, log metrics, dashboard, and alert policies.
 
     Args:
         infra_dir: Path to the `infra/` Terraform directory.
@@ -282,7 +335,7 @@ def _check_observability_tf(infra_dir: str) -> List[str]:
         "agent_total_tokens",
         "retrieval_mean_similarity_score",
         "agent_ungrounded_answers",
-        "ingestion_chunks_added",
+        "ingest_chunks_added",
     ):
         if not re.search(
             rf'resource\s+"google_logging_metric"\s+"{metric_name}"\s*\{{',
@@ -299,6 +352,19 @@ def _check_observability_tf(infra_dir: str) -> List[str]:
         violations.append(
             'infra/observability.tf is missing google_monitoring_dashboard "observability_dashboard".'
         )
+
+    for alert_name in (
+        "agent_high_latency_alert",
+        "cloud_run_memory_saturation_alert",
+        "cloud_run_5xx_error_rate_alert",
+    ):
+        if not re.search(
+            rf'resource\s+"google_monitoring_alert_policy"\s+"{alert_name}"\s*\{{',
+            content,
+        ):
+            violations.append(
+                f'infra/observability.tf is missing google_monitoring_alert_policy "{alert_name}".'
+            )
 
     return violations
 
