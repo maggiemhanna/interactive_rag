@@ -27,8 +27,8 @@ from google.cloud import modelarmor_v1
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 
-from scripts.check_region_policy import evaluate_effective_location_policy
-from scripts.check_static_policies import evaluate_repo_static_policies
+from infra.scripts.check_region_policy import evaluate_effective_location_policy
+from infra.scripts.check_static_policies import evaluate_repo_static_policies
 from src.agent import app as agent_app_module
 from src.agent import graph as agent_graph_module
 from src.agent.memory import MEMORY_SAVER
@@ -331,7 +331,7 @@ class TestPhase1DataResidency(unittest.TestCase):
 
         expected_llms = "gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite"
         expected_embeddings = "gemini-embedding-001,text-embedding-004,text-embedding-005"
-        with open(os.path.join(REPO_ROOT, "infra", "variables.tf"), encoding="utf-8") as fh:
+        with open(os.path.join(REPO_ROOT, "infra", "terraform", "variables.tf"), encoding="utf-8") as fh:
             variables_tf = fh.read()
         self.assertIn(f'default     = "{expected_llms}"', variables_tf)
         self.assertIn(f'default     = "{expected_embeddings}"', variables_tf)
@@ -673,8 +673,8 @@ class TestPhase2AuditLogging(unittest.TestCase):
 
     def test_governance_terraform_audit_configs_bucket_sink_and_lb_logs(self) -> None:
         """Verifies `infra/compliance.tf` and `infra/load_balancer.tf` configure audit log buckets, sinks, and LB sampling."""
-        gov_path = os.path.join(REPO_ROOT, "infra", "compliance.tf")
-        lb_path = os.path.join(REPO_ROOT, "infra", "load_balancer.tf")
+        gov_path = os.path.join(REPO_ROOT, "infra", "terraform", "compliance.tf")
+        lb_path = os.path.join(REPO_ROOT, "infra", "terraform", "load_balancer.tf")
 
         with open(gov_path, encoding="utf-8") as fh:
             gov_tf = fh.read()
@@ -1649,7 +1649,7 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
         self.assertIn("deploy: policy-check", makefile_text)
 
         syn_root = create_synthetic_repo_copy(REPO_ROOT, prefix="comp_static_policy_")
-        syn_tfvars = os.path.join(syn_root, "infra", "terraform.tfvars")
+        syn_tfvars = os.path.join(syn_root, "infra", "terraform", "terraform.tfvars")
         try:
             cfg_path = os.path.join(syn_root, "src", "core", "config.py")
             with open(cfg_path, encoding="utf-8") as fh:
@@ -1662,7 +1662,7 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
             with open(cfg_path, "w", encoding="utf-8") as fh:
                 fh.write(orig_cfg)
 
-            cr_path = os.path.join(syn_root, "infra", "cloud_run.tf")
+            cr_path = os.path.join(syn_root, "infra", "terraform", "cloud_run.tf")
             with open(cr_path, encoding="utf-8") as fh:
                 orig_cr = fh.read()
             mutated_cr = orig_cr.replace(

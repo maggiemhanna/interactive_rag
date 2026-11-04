@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage
 
-from scripts.check_static_policies import evaluate_repo_static_policies
+from infra.scripts.check_static_policies import evaluate_repo_static_policies
 from src.agent import app as agent_app_module
 from src.agent import graph as agent_graph_module
 from src.agent.tools import get_retriever_tool
@@ -883,8 +883,8 @@ class TestPhase5ObservabilityInfrastructureAndStaticPolicies(unittest.TestCase):
     """Phase 5: Regional Observability Infrastructure in Terraform & Static Policy Checks."""
 
     def test_terraform_observability_infrastructure_definitions(self) -> None:
-        """Verifies `infra/` declares regional observability log buckets, sinks, log-based metrics, and dashboards."""
-        infra_dir = os.path.join(REPO_ROOT, "infra")
+        """Verifies `infra/terraform/` declares regional observability log buckets, sinks, log-based metrics, and dashboards."""
+        infra_dir = os.path.join(REPO_ROOT, "infra", "terraform")
 
         with open(os.path.join(infra_dir, "apis.tf"), encoding="utf-8") as fh:
             apis_tf = fh.read()
@@ -947,7 +947,7 @@ class TestPhase5ObservabilityInfrastructureAndStaticPolicies(unittest.TestCase):
 
         syn_root = create_synthetic_repo_copy(REPO_ROOT, prefix="obs_static_policy_")
         try:
-            obs_path = os.path.join(syn_root, "infra", "observability.tf")
+            obs_path = os.path.join(syn_root, "infra", "terraform", "observability.tf")
             with open(obs_path, encoding="utf-8") as fh:
                 orig_obs = fh.read()
             with open(obs_path, "w", encoding="utf-8") as fh:
@@ -958,7 +958,7 @@ class TestPhase5ObservabilityInfrastructureAndStaticPolicies(unittest.TestCase):
             with open(obs_path, "w", encoding="utf-8") as fh:
                 fh.write(orig_obs)
 
-            cr_path = os.path.join(syn_root, "infra", "cloud_run.tf")
+            cr_path = os.path.join(syn_root, "infra", "terraform", "cloud_run.tf")
             with open(cr_path, encoding="utf-8") as fh:
                 orig_cr = fh.read()
             with open(cr_path, "w", encoding="utf-8") as fh:

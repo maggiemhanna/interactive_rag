@@ -22,7 +22,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from scripts.check_static_policies import evaluate_repo_static_policies
+from infra.scripts.check_static_policies import evaluate_repo_static_policies
 import src.agent
 from src.agent import app as agent_app_module
 from src.agent import graph as agent_graph_module
@@ -331,7 +331,7 @@ class TestTerraformAndStaticScalingPolicies(unittest.TestCase):
         self.assertTrue(ok, f"Expected static policy check to pass, got: {violations}")
         self.assertEqual(violations, [])
 
-        infra_dir = os.path.join(REPO_ROOT, "infra")
+        infra_dir = os.path.join(REPO_ROOT, "infra", "terraform")
         with open(os.path.join(infra_dir, "variables.tf"), encoding="utf-8") as fh:
             vars_tf = fh.read()
         for var_name in (

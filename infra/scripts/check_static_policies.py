@@ -434,7 +434,8 @@ def evaluate_repo_static_policies(repo_root: str) -> Tuple[bool, List[str]]:
     Returns:
         Tuple `(ok, violations)` where `ok` is `True` iff `violations` is empty.
     """
-    infra_dir = os.path.join(repo_root, "infra")
+    tf_subdir = os.path.join(repo_root, "infra", "terraform")
+    infra_dir = tf_subdir if os.path.isdir(tf_subdir) else os.path.join(repo_root, "infra")
     violations: List[str] = []
     violations.extend(_check_python_config(repo_root))
     violations.extend(_check_terraform_variables(infra_dir))
@@ -450,7 +451,9 @@ def main() -> int:
     Returns:
         Exit status `0` when all static checks pass, or `1` when any violation is found.
     """
-    default_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    default_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
     parser = argparse.ArgumentParser(
         description="Verify static single-region residency, fail-closed Model Armor, and prod deletion protection policies."
     )

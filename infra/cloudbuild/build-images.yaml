@@ -6,7 +6,7 @@ steps:
     args:
       - build
       - -f
-      - docker/Dockerfile.backend
+      - infra/docker/Dockerfile.backend
       - -t
       - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/backend:${_IMAGE_TAG}
       - -t
@@ -20,7 +20,7 @@ steps:
     args:
       - build
       - -f
-      - docker/Dockerfile.frontend
+      - infra/docker/Dockerfile.frontend
       - -t
       - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/frontend:${_IMAGE_TAG}
       - -t

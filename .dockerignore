@@ -29,15 +29,15 @@ frontend/dist
 frontend/.vite
 
 # Terraform & IaC state
-infra/.terraform
-infra/*.tfstate
-infra/*.tfstate.*
-infra/*.tfvars
-infra/crash.log
+infra/terraform/.terraform
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/*.tfvars
+infra/terraform/crash.log
 
 # Docs, tests & OS metadata
 docs
-scripts
+infra/scripts
 tests
 .DS_Store
 .vscode

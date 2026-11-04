@@ -453,7 +453,7 @@ def create_synthetic_repo_copy(
         os.path.join(repo_root, "src", "core", "config.py"),
         os.path.join(syn_root, "src", "core", "config.py"),
     )
-    syn_tfvars = os.path.join(syn_root, "infra", "terraform.tfvars")
+    syn_tfvars = os.path.join(syn_root, "infra", "terraform", "terraform.tfvars")
     if os.path.exists(syn_tfvars):
         os.remove(syn_tfvars)
     return syn_root
