@@ -12,6 +12,51 @@ Instead of combining unrelated documents into a single shared database, Interact
 
 ---
 
+## 📑 Outline
+
+- [**Core Agentic RAG Architecture & Retrieval Pipeline**](#-core-agentic-rag-architecture--retrieval-pipeline)
+  - [1. PDF Document Parsing, Chunking & Indexing Strategy](#1-pdf-document-parsing-chunking--indexing-strategy)
+  - [2. Embedding Models, Hybrid Search & Domain-Scoped Vector Databases](#2-embedding-models-hybrid-search--domain-scoped-vector-databases)
+  - [3. Agentic RAG Architecture Pattern (Stateful LangGraph Pipeline)](#3-agentic-rag-architecture-pattern-stateful-langgraph-pipeline)
+  - [4. Document Grounding & Inline Page Citations](#4-document-grounding--inline-page-citations)
+- [**Cloud Architecture & Production Engineering Layers**](#-cloud-architecture--production-engineering-layers)
+  - [**I/ Cloud Architecture & Multi-Tenant Foundation**](#i-cloud-architecture--multi-tenant-foundation)
+    - [1. Cloud Deployment (Cloud Architecture & Google Cloud Services Used)](#1-cloud-deployment-cloud-architecture--google-cloud-services-used)
+    - [2. Multi-Tenant Persistence](#2-multi-tenant-persistence)
+  - [**II/ Operational Excellence**](#ii-operational-excellence)
+    - [1. Infrastructure as Code (IaC)](#1-infrastructure-as-code-iac)
+    - [2. CI/CD & Deployment](#2-cicd--deployment)
+    - [3. Testing & Quality Engineering](#3-testing--quality-engineering)
+  - [**III/ Designing for Change**](#iii-designing-for-change)
+    - [1. Configuration Management](#1-configuration-management)
+    - [2. Modularity & Abstraction](#2-modularity--abstraction)
+  - [**IV/ Performance & Cost Optimization**](#iv-performance--cost-optimization)
+    - [1. Scalability & Elasticity](#1-scalability--elasticity)
+    - [2. Resource Efficiency](#2-resource-efficiency)
+  - [**V/ Security, Privacy, and Compliance**](#v-security-privacy-and-compliance)
+    - [1. Authentication & Authorization](#1-authentication--authorization)
+    - [2. Infrastructure & Network Security](#2-infrastructure--network-security)
+    - [3. Data Protection & Privacy](#3-data-protection--privacy)
+    - [4. AI-Specific Security](#4-ai-specific-security)
+    - [5. Compliance & Governance](#5-compliance--governance)
+  - [**VI/ Reliability & Resilience**](#vi-reliability--resilience)
+    - [1. Observability](#1-observability)
+    - [2. Graceful Degradation](#2-graceful-degradation)
+- [**Repository Structure**](#-repository-structure)
+- [**Local Setup & Prerequisites**](#-local-setup--prerequisites)
+  - [1. Authenticate with Google Cloud & Configure `.env`](#1-authenticate-with-google-cloud--configure-env)
+  - [2. Install Python Dependencies](#2-install-python-dependencies)
+  - [3. Install Frontend Dependencies](#3-install-frontend-dependencies)
+- [**Running Locally**](#-running-locally)
+- [**Deploying to Google Cloud (Terraform + Cloud Build)**](#-deploying-to-google-cloud-terraform--cloud-build)
+- [**Testing & Verification**](#-testing--verification)
+  - [1. Offline Unit, Multi-Tenant, AI Security, Compliance, Observability & Scalability Test Suites](#1-offline-unit-multi-tenant-ai-security-compliance-observability--scalability-test-suites)
+  - [2. Live Local Smoke Scripts](#2-live-local-smoke-scripts)
+  - [3. Manual API Testing via `curl`](#3-manual-api-testing-via-curl)
+  - [4. Interactive Web Dashboard Workflow](#4-interactive-web-dashboard-workflow)
+
+---
+
 ## 🧠 Core Agentic RAG Architecture & Retrieval Pipeline
 
 ### 1. PDF Document Parsing, Chunking & Indexing Strategy
@@ -78,28 +123,28 @@ Instead of combining unrelated documents into a single shared database, Interact
 
 ---
 
-## 🏗️ Cloud Architecture & Production Engineering Layers
+## 🏗 Cloud Architecture & Production Engineering Layers
 
 InteractiveRAG is engineered for reproducible deployment on **Google Cloud Platform (GCP)** across **6 architectural domains (`I`–`VI`) and 16 defense-in-depth engineering layers**, verified by the automated test and policy suites in [`tests/`](tests/) and [`infra/scripts/`](infra/scripts/):
 
 | Domain | Layer | Pillars & Focus Areas |
 | :--- | :--- | :--- |
-| **I. Cloud Architecture & Multi-Tenant Foundation** | **1. Cloud Deployment** | End-to-end Google Cloud request routing topology and inventory of managed Google Cloud compute, AI, storage, identity, security, networking, CI/CD & observability services |
-| **I. Cloud Architecture & Multi-Tenant Foundation** | **2. Multi-Tenant Persistence** | Per-user vector database, PDF archive & conversation memory isolation, authoritative Cloud Storage snapshot synchronization, and distributed per-user Cloud Storage write locks |
-| **II. Operational Excellence** | **1. Infrastructure as Code (IaC)** | Declarative Terraform stack, remote versioned Cloud Storage state, remote Cloud Build Terraform runner, reproducible single-pass provisioning, and cross-environment parity |
-| **II. Operational Excellence** | **2. CI/CD & Deployment** | Four-stage automated bootstrap/build/policy-gate/deploy pipeline, health-gated zero-downtime Cloud Run revision rollouts, and Git-commit + versioned storage rollback support |
-| **II. Operational Excellence** | **3. Testing & Quality Engineering** | Offline unit test suites, multi-tenant API integration tests, live end-to-end smoke scripts, automated static & Terraform schema gates, mutation testing, and cross-layer coverage |
-| **III. Designing for Change** | **1. Configuration Management** | Externalized backend & Terraform configuration, startup frontend runtime config generation, automatic cloud vs. local environment separation, and runtime/infrastructure feature flags |
-| **III. Designing for Change** | **2. Modularity & Abstraction** | Loose coupling across 4 domain packages + shared core foundation, strict request/response interface schemas, dynamic chat & per-collection embedding model swappability, and dependency injection |
-| **IV. Performance & Cost Optimization** | **1. Scalability & Elasticity** | Workload-isolated microservice packaging (`ingest-api` vs. `agent-api`), horizontal autoscaling & per-container concurrency ceilings, `/24` private VPC subnet IP headroom, and parallel retrieval throughput |
-| **IV. Performance & Cost Optimization** | **2. Resource Efficiency** | Per-service CPU & memory right-sizing, scale-to-zero & request-scoped CPU billing, session affinity & version-checked warm cache reuse, bounded `/tmp` cache eviction, and MD5 delta & lifecycle storage efficiency |
-| **V. Security, Privacy, and Compliance** | **1. Authentication & Authorization** | Dedicated runtime & deployer service accounts, declarative IAM, Principle of Least Privilege, Google Sign-In & Email/Password authentication with token-derived tenant identity, and keyless service credentials |
-| **V. Security, Privacy, and Compliance** | **2. Infrastructure & Network Security** | Disabled CDN edge caching for private traffic, locked-down Cloud Run ingress, zero-internet private VPC with segmented subnets, Private Google Access, and Regional Private Service Connect |
-| **V. Security, Privacy, and Compliance** | **3. Data Protection & Privacy** | Encryption in transit (managed TLS & HTTP-to-HTTPS redirect) and at rest (AES-256 & ephemeral RAM-backed working directories), 4-tier data classification & storage segregation, and Secret Manager integration |
-| **V. Security, Privacy, and Compliance** | **4. AI-Specific Security** | Prompt injection mitigation (Model Armor & XML spotlighting), approved model allowlists, query & PDF upload guardrails, Cloud Sensitive Data Protection (Cloud DLP) two-stage redaction, and dual-layer content safety |
-| **V. Security, Privacy, and Compliance** | **5. Compliance & Governance** | Single-region data residency & live Org Policy verification, privacy-safe SHA-256 hashed audit & Data Access logging, GDPR self-service access & erasure, EU AI Act provenance badges, fail-closed screening, and rate/quota enforcement |
-| **VI. Reliability & Resilience** | **1. Observability** | Structured JSON operational logging & request correlation, Cloud Monitoring metrics, dashboards & automated alerts, distributed per-stage Cloud Trace waterfall spans, and AI latency, token & retrieval quality telemetry |
-| **VI. Reliability & Resilience** | **2. Graceful Degradation** | Hybrid-to-dense search & bounded-agent step-limit fallbacks, mid-stream SSE error recovery, exponential backoff with random jitter on storage locks, and bounded timeouts with stale-lock crash recovery |
+| [**I. Cloud Architecture & Multi-Tenant Foundation**](#i-cloud-architecture--multi-tenant-foundation) | [**1. Cloud Deployment**](#1-cloud-deployment-cloud-architecture--google-cloud-services-used) | End-to-end Google Cloud request routing topology and inventory of managed Google Cloud compute, AI, storage, identity, security, networking, CI/CD & observability services |
+| [**I. Cloud Architecture & Multi-Tenant Foundation**](#i-cloud-architecture--multi-tenant-foundation) | [**2. Multi-Tenant Persistence**](#2-multi-tenant-persistence) | Per-user vector database, PDF archive & conversation memory isolation, authoritative Cloud Storage snapshot synchronization, and distributed per-user Cloud Storage write locks |
+| [**II. Operational Excellence**](#ii-operational-excellence) | [**1. Infrastructure as Code (IaC)**](#1-infrastructure-as-code-iac) | Declarative Terraform stack, remote versioned Cloud Storage state, remote Cloud Build Terraform runner, reproducible single-pass provisioning, and cross-environment parity |
+| [**II. Operational Excellence**](#ii-operational-excellence) | [**2. CI/CD & Deployment**](#2-cicd--deployment) | Four-stage automated bootstrap/build/policy-gate/deploy pipeline, health-gated zero-downtime Cloud Run revision rollouts, and Git-commit + versioned storage rollback support |
+| [**II. Operational Excellence**](#ii-operational-excellence) | [**3. Testing & Quality Engineering**](#3-testing--quality-engineering) | Offline unit test suites, multi-tenant API integration tests, live end-to-end smoke scripts, automated static & Terraform schema gates, mutation testing, and cross-layer coverage |
+| [**III. Designing for Change**](#iii-designing-for-change) | [**1. Configuration Management**](#1-configuration-management) | Externalized backend & Terraform configuration, startup frontend runtime config generation, automatic cloud vs. local environment separation, and runtime/infrastructure feature flags |
+| [**III. Designing for Change**](#iii-designing-for-change) | [**2. Modularity & Abstraction**](#2-modularity--abstraction) | Loose coupling across 4 domain packages + shared core foundation, strict request/response interface schemas, dynamic chat & per-collection embedding model swappability, and dependency injection |
+| [**IV. Performance & Cost Optimization**](#iv-performance--cost-optimization) | [**1. Scalability & Elasticity**](#1-scalability--elasticity) | Workload-isolated microservice packaging (`ingest-api` vs. `agent-api`), horizontal autoscaling & per-container concurrency ceilings, `/24` private VPC subnet IP headroom, and parallel retrieval throughput |
+| [**IV. Performance & Cost Optimization**](#iv-performance--cost-optimization) | [**2. Resource Efficiency**](#2-resource-efficiency) | Per-service CPU & memory right-sizing, scale-to-zero & request-scoped CPU billing, session affinity & version-checked warm cache reuse, bounded `/tmp` cache eviction, and MD5 delta & lifecycle storage efficiency |
+| [**V. Security, Privacy, and Compliance**](#v-security-privacy-and-compliance) | [**1. Authentication & Authorization**](#1-authentication--authorization) | Dedicated runtime & deployer service accounts, declarative IAM, Principle of Least Privilege, Google Sign-In & Email/Password authentication with token-derived tenant identity, and keyless service credentials |
+| [**V. Security, Privacy, and Compliance**](#v-security-privacy-and-compliance) | [**2. Infrastructure & Network Security**](#2-infrastructure--network-security) | Disabled CDN edge caching for private traffic, locked-down Cloud Run ingress, zero-internet private VPC with segmented subnets, Private Google Access, and Regional Private Service Connect |
+| [**V. Security, Privacy, and Compliance**](#v-security-privacy-and-compliance) | [**3. Data Protection & Privacy**](#3-data-protection--privacy) | Encryption in transit (managed TLS & HTTP-to-HTTPS redirect) and at rest (AES-256 & ephemeral RAM-backed working directories), 4-tier data classification & storage segregation, and Secret Manager integration |
+| [**V. Security, Privacy, and Compliance**](#v-security-privacy-and-compliance) | [**4. AI-Specific Security**](#4-ai-specific-security) | Prompt injection mitigation (Model Armor & XML spotlighting), approved model allowlists, query & PDF upload guardrails, Cloud Sensitive Data Protection (Cloud DLP) two-stage redaction, and dual-layer content safety |
+| [**V. Security, Privacy, and Compliance**](#v-security-privacy-and-compliance) | [**5. Compliance & Governance**](#5-compliance--governance) | Single-region data residency & live Org Policy verification, privacy-safe SHA-256 hashed audit & Data Access logging, GDPR self-service access & erasure, EU AI Act provenance badges, fail-closed screening, and rate/quota enforcement |
+| [**VI. Reliability & Resilience**](#vi-reliability--resilience) | [**1. Observability**](#1-observability) | Structured JSON operational logging & request correlation, Cloud Monitoring metrics, dashboards & automated alerts, distributed per-stage Cloud Trace waterfall spans, and AI latency, token & retrieval quality telemetry |
+| [**VI. Reliability & Resilience**](#vi-reliability--resilience) | [**2. Graceful Degradation**](#2-graceful-degradation) | Hybrid-to-dense search & bounded-agent step-limit fallbacks, mid-stream SSE error recovery, exponential backoff with random jitter on storage locks, and bounded timeouts with stale-lock crash recovery |
 
 ---
 
@@ -1019,7 +1064,7 @@ Open **http://localhost:3000** in your browser.
 
 ---
 
-## ☁️ Deploying to Google Cloud (Terraform + Cloud Build)
+## ☁ Deploying to Google Cloud (Terraform + Cloud Build)
 
 The root [`Makefile`](Makefile) automates the complete deployment lifecycle. It automatically uses your local `terraform` binary if installed (`TF_MODE=local`) or falls back to running Terraform inside Google Cloud Build (`TF_MODE=cloudbuild`, via [`infra/cloudbuild/run-terraform.yaml`](infra/cloudbuild/run-terraform.yaml)) using a dedicated least-privilege deployer service account.
 
