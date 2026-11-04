@@ -4,10 +4,10 @@
 
 Instead of combining unrelated documents into a single shared database, InteractiveRAG gives every signed-in user an isolated workspace where they can organize PDFs into domain-specific vector collections (for example, separating annual financial reports from clinical research). Through the web dashboard or REST APIs, users can:
 
-- **Ingest PDF Documents (`POST /ingest`)**: Upload PDF documents that are parsed page-by-page, split into overlapping text chunks, converted into vector embeddings using Vertex AI (`gemini-embedding-001`, `text-embedding-004`, or `text-embedding-005`), and indexed into a named vector collection bound to that embedding model.
-- **Run Direct Hybrid Search (`POST /query`)**: Perform top-$k$ hybrid searches combining dense Vertex AI vector similarity with sparse BM25 lexical matching via Reciprocal Rank Fusion (RRF), scoped strictly to a selected collection (automatically using the collection's bound embedding model) to inspect relevant document chunks, normalized similarity scores, and page numbers directly.
-- **Chat with a Grounded AI Agent (`POST /agent`, `POST /agent/stream`)**: Ask questions in a multi-turn conversation with a stateful LangGraph agent that dynamically queries the user's chosen collection using its bound embedding model, grounds every factual statement in retrieved evidence with inline `[filename.pdf, p.X]` citations, and streams each workflow step in real time over Server-Sent Events (SSE).
-- **Manage Document Collections (`GET /collections`, `DELETE /collections/{collection_name}`)**: List all vector collections in the user's workspace along with their indexed chunk counts, bound `embedding_model`, and server-approved model catalogs (`allowed_llm_models`, `allowed_embedding_models`), or delete a collection when it is no longer needed.
+- **Ingest PDF Documents (`POST /ingest`)**: Upload PDF documents that are parsed page-by-page, split into overlapping text chunks, converted into semantic vector embeddings using Vertex AI, and indexed into a named vector collection bound to the chosen embedding model.
+- **Run Direct Hybrid Search (`POST /query`)**: Perform hybrid searches combining dense semantic vector similarity with keyword matching via Reciprocal Rank Fusion (RRF), scoped strictly to a selected collection to inspect relevant document chunks, similarity scores, and page numbers directly.
+- **Chat with a Grounded AI Agent (`POST /agent`, `POST /agent/stream`)**: Ask questions in a multi-turn conversation with a stateful LangGraph agent that dynamically searches the user's chosen collection, grounds every factual statement in retrieved evidence with inline `[filename.pdf, p.X]` citations, and streams each workflow step in real time over Server-Sent Events (SSE).
+- **Manage Document Collections (`GET /collections`, `DELETE /collections/{collection_name}`)**: List all vector collections in the user's workspace along with their indexed chunk counts, bound embedding model, and server-approved model catalogs, or delete a collection when it is no longer needed.
 - **Exercise Self-Service Privacy Controls (`GET /compliance/my-data`, `DELETE /compliance/my-data`)**: Export a complete inventory of stored collections, uploaded PDFs, storage bytes, and active conversation threads, or permanently erase all personal data—including live and archived Cloud Storage object versions, local vector caches, and conversation memory—in a single action.
 
 ---
@@ -15,556 +15,830 @@ Instead of combining unrelated documents into a single shared database, Interact
 ## 🧠 Core Agentic RAG Architecture & Retrieval Pipeline
 
 InteractiveRAG organizes its backend into **4 modular Python packages** (`src/ingest`, `src/manage`, `src/query`, `src/agent`) deployed across **2 backend services** so heavy document indexing never blocks interactive queries or chat:
-- **`ingest-api` (Document Ingestion Service)**: Calls **only** `src/ingest` (`POST /ingest`) to run PDF parsing, text chunking, and batch vector indexing on dedicated compute instances.
-- **`agent-api` (Interactive Agent, Search & Management Service)**: Calls **`src/manage`** (`GET /collections`, `DELETE /collections/{collection_name}`, `GET/DELETE /compliance/my-data`), **`src/query`** (`POST /query`), and **`src/agent`** (`POST /agent`, `POST /agent/stream`) to serve collection management, direct similarity search, and multi-turn LangGraph agent conversations.
+- **Document Ingestion Service (`ingest-api`)**: Runs only the ingestion package (`POST /ingest`) to perform PDF parsing, text chunking, and batch vector indexing on dedicated compute instances.
+- **Interactive Agent, Search & Management Service (`agent-api`)**: Runs the collection management (`GET /collections`, `DELETE /collections/{collection_name}`, `GET/DELETE /compliance/my-data`), direct search (`POST /query`), and conversational agent (`POST /agent`, `POST /agent/stream`) packages.
 
 ### 1. PDF Document Parsing, Chunking & Indexing Strategy
-- **Multipart PDF Upload Staging:** Uploaded PDF files are staged in a temporary workspace where original filenames are normalized before extraction begins, and temporary files are cleaned up automatically once indexing finishes.  
+- **Multipart PDF Upload Staging:** Uploaded PDF files are staged in an isolated temporary workspace where original filenames are cleaned and validated before text extraction begins, and temporary files are deleted automatically once indexing finishes.  
   — *Implemented in [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py)*  
   — *Called in [`src/ingest/routes.py`](src/ingest/routes.py)*
-- **Page-Aware PDF Extraction (`PyPDFLoader`):** Staged PDFs are loaded page-by-page using `PyPDFLoader`, preserving the source document filename (`source`) and page index (`page`) on every extracted page.  
+- **Page-Aware PDF Text Extraction:** Staged PDFs are read page-by-page, preserving the original document filename and page number on every extracted page so downstream answers can cite exact pages.  
   — *Implemented in [`src/ingest/splitter.py`](src/ingest/splitter.py)*  
   — *Called in [`src/ingest/service.py`](src/ingest/service.py)*
-- **Overlapping Recursive Text Chunking (`RecursiveCharacterTextSplitter`):** Extracted pages are split into `1,000`-character chunks with a `200`-character sliding overlap along paragraph and sentence boundaries so key facts or tables at chunk boundaries are never cut in half.  
+- **Overlapping Text Chunking:** Extracted pages are split into 1,000-character chunks with a 200-character sliding overlap along natural paragraph and sentence boundaries so key facts or tables near a split point are never cut in half.  
   — *Implemented in [`src/ingest/splitter.py`](src/ingest/splitter.py)*  
   — *Called in [`src/ingest/service.py`](src/ingest/service.py)*
-- **Sequential Batched Vector Indexing:** Extracted text chunks are embedded and written into the target ChromaDB collection sequentially in batches of `100` chunks per operation so multi-PDF uploads are indexed reliably.  
+- **Sequential Batched Vector Indexing:** Extracted text chunks are converted into embeddings and written into the target ChromaDB collection sequentially in batches of 100 chunks per operation so multi-PDF uploads are indexed reliably.  
   — *Implemented in [`src/ingest/service.py`](src/ingest/service.py)*  
   — *Called in [`src/ingest/routes.py`](src/ingest/routes.py)*
 
 ### 2. Embedding Models, Hybrid Search & Domain-Scoped Vector Databases
-- **Vertex AI Dense Vector Embeddings & Collection-Bound Embedding Consistency:** Document chunks (at ingestion time) and search queries (at retrieval time) are converted into dense semantic vectors using **Google Cloud Vertex AI** embedding models (`gemini-embedding-001` by default, `text-embedding-004`, or `text-embedding-005`). When a collection is first created, its chosen `embedding_model` is persisted in ChromaDB collection metadata (`resolve_collection_embedding_model`); all subsequent document appends (`POST /ingest`), direct similarity searches (`POST /query`), and agent retriever calls (`POST /agent`, `POST /agent/stream`) on that collection automatically resolve and use its bound embedding model so vectors always remain in a consistent embedding space.  
+- **Vertex AI Dense Vector Embeddings:** Document chunks (during upload) and user questions (during search) are converted into numerical semantic vectors using Google Cloud Vertex AI embedding models (`gemini-embedding-001` by default, `text-embedding-004`, or `text-embedding-005`).  
   — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
   — *Called in [`src/ingest/service.py`](src/ingest/service.py), [`src/query/service.py`](src/query/service.py) & [`src/agent/tools.py`](src/agent/tools.py)*
-- **Domain-Scoped Named Collections:** Instead of pooling all uploaded files into a single flat vector index (which degrades retrieval accuracy when documents cover different topics), documents are organized into separate named **ChromaDB** collections (for example, separating financial reports from clinical studies) that can be listed or deleted independently.  
+- **Collection-Bound Embedding Consistency:** When a collection is first created, its chosen embedding model is saved in the collection's metadata. All future document uploads, direct similarity searches, and agent searches on that collection automatically look up and use that same embedding model so vectors in a collection never mix incompatible formats.  
+  — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
+  — *Called in [`src/ingest/service.py`](src/ingest/service.py), [`src/query/service.py`](src/query/service.py), [`src/agent/tools.py`](src/agent/tools.py) & [`src/manage/collections.py`](src/manage/collections.py)*
+- **Domain-Scoped Named Collections:** Instead of pooling all uploaded files into a single flat index (which lowers accuracy when documents cover different topics), documents are organized into separate named ChromaDB collections that can be queried, listed, or deleted independently.  
   — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
   — *Called in [`src/ingest/service.py`](src/ingest/service.py), [`src/query/service.py`](src/query/service.py) & [`src/manage/collections.py`](src/manage/collections.py)*
-- **ChromaDB SQLite Metadata & HNSW Vector Index Storage:** Each collection persists its chunk text and page metadata in a SQLite catalog paired with a Hierarchical Navigable Small World (HNSW) approximate nearest-neighbor vector index for fast similarity lookups.  
+- **SQLite Metadata & HNSW Vector Index Storage:** Each collection stores its chunk text and page metadata in a local SQLite catalog paired with a Hierarchical Navigable Small World (HNSW) vector index for fast nearest-neighbor similarity lookups.  
   — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
   — *Called in [`src/ingest/service.py`](src/ingest/service.py) & [`src/query/service.py`](src/query/service.py)*
-- **Hybrid Search via Reciprocal Rank Fusion (Dense Vector + Sparse BM25):** Retrieval (`similarity_search_with_scores`) combines dense semantic vector search (`vectorstore.similarity_search_with_score`) with sparse lexical keyword matching (`BM25Retriever` backed by `rank-bm25` over the collection's stored documents) using **Reciprocal Rank Fusion (RRF)** (`rrf_k=60`, `dense_weight=0.5`, `bm25_weight=0.5`). Zero-score BM25 candidates are filtered out so non-matching chunks do not receive spurious lexical rank bonuses, fused RRF scores are normalized into `[0.0, 1.0]` for downstream observability telemetry, and retrieval gracefully degrades to dense-only similarity scores when no lexical token overlap exists.  
+- **Hybrid Search via Reciprocal Rank Fusion (Semantic + Keyword Matching):** Every search combines dense semantic vector similarity with BM25 keyword matching using Reciprocal Rank Fusion (RRF), filtering out zero-score keyword results and normalizing final scores between 0.0 and 1.0 so both conceptual meaning and exact terms (such as product codes or acronyms) are matched accurately.  
   — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
   — *Called in [`src/query/service.py`](src/query/service.py) & [`src/agent/tools.py`](src/agent/tools.py)*
-- **Collection-Targeted Search & Agent Retrieval:** Every similarity search (`POST /query`) and agent conversation (`POST /agent`, `POST /agent/stream`) targets one explicitly chosen collection at a time to keep retrieval focused and free of cross-topic noise.  
+- **Single-Collection Targeted Retrieval:** Every direct search and agent conversation targets one explicitly chosen collection at a time to keep retrieval focused and free of cross-topic noise.  
   — *Implemented in [`src/query/service.py`](src/query/service.py) & [`src/agent/tools.py`](src/agent/tools.py)*  
   — *Called in [`src/query/routes.py`](src/query/routes.py), [`src/agent/graph.py`](src/agent/graph.py) & [`src/agent/routes.py`](src/agent/routes.py)*
 
 ### 3. Agentic RAG Architecture Pattern (Stateful LangGraph Pipeline)
-- **Why Agentic RAG Instead of Fixed Single-Shot Retrieval:** Traditional RAG pipelines run a single similarity search using the user's raw prompt, which often struggles with conversational follow-up questions, multi-part questions, or queries that require rephrasing search terms. InteractiveRAG uses **LangGraph** to orchestrate a stateful, cyclic tool-calling workflow powered by **Vertex AI Gemini** (`gemini-2.5-flash`, `gemini-2.5-pro`, or `gemini-2.5-flash-lite` at `temperature=0` for deterministic, factual responses).  
+- **Stateful Agentic Workflow vs. Fixed Single-Shot Retrieval:** Traditional RAG pipelines run a single search using the user's raw prompt, which often fails on conversational follow-ups or multi-part questions. InteractiveRAG uses **LangGraph** and **Vertex AI Gemini** (configured with deterministic temperature zero) to orchestrate a multi-step reasoning and tool-calling workflow.  
   — *Implemented in [`src/agent/graph.py`](src/agent/graph.py)*  
   — *Called in [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
-- **Dynamic Collection-Scoped Retriever Tool:** On each request, the backend builds a structured retriever tool (retrieving the top-$k=5$ most relevant chunks per call) bound strictly to the user's selected collection.  
+- **Dynamic Collection-Scoped Search Tool:** On each request, the backend constructs a dedicated search tool bound strictly to the user's selected collection that fetches the top 5 most relevant document chunks per call.  
   — *Implemented in [`src/agent/tools.py`](src/agent/tools.py)*  
   — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
-- **Iterative Query Formulation & Multi-Step Search:** Gemini autonomously decides when to call the retriever tool, formulates targeted search queries based on the conversation history, inspects the returned chunks, and can perform additional search steps with refined queries if the initial chunks are insufficient before synthesizing its final answer.  
+- **Iterative Query Formulation & Multi-Step Search:** The Gemini agent autonomously decides when to search, writes targeted search queries based on the conversation history, evaluates the returned chunks, and can run additional searches with refined terms if the initial results are incomplete before writing its final answer.  
   — *Implemented in [`src/agent/graph.py`](src/agent/graph.py)*  
   — *Called in [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
-- **Multi-Turn Conversation Memory (`InMemorySaver`):** Conversation history is persisted across turns using an in-memory LangGraph checkpointer keyed by conversation thread so users can ask natural follow-up questions without repeating earlier context.  
+- **Multi-Turn Conversation Memory:** Conversation history is preserved across turns in an in-memory checkpointer keyed by conversation thread so users can ask natural follow-up questions without repeating earlier context.  
   — *Implemented in [`src/agent/memory.py`](src/agent/memory.py)*  
   — *Called in [`src/agent/graph.py`](src/agent/graph.py), [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
-- **Real-Time Step-by-Step SSE Event Streaming:** During execution, the streaming engine deduplicates graph state transitions and streams each completed workflow step—retriever tool invocations, retrieved evidence chunks, and the final AI answer—in real time over Server-Sent Events (SSE).  
+- **Real-Time Step-by-Step Event Streaming:** During execution, the streaming engine streams each completed workflow step—search tool calls, retrieved evidence chunks, and the final AI answer—to the browser in real time over Server-Sent Events (SSE).  
   — *Implemented in [`src/agent/service.py`](src/agent/service.py)*  
   — *Called in [`src/agent/routes.py`](src/agent/routes.py)*
 
 ### 4. Document Grounding & Inline Page Citations
-- **1-Indexed Page Number Normalization:** PDF parsers number pages starting at `0`, which causes off-by-one confusion when cited directly. Before returning chunks to the language model, the retrieval guardrail formatter converts `0`-based page metadata into human-readable `1`-indexed page numbers (`p.1`, `p.2`, ...) and attaches the exact `source` filename and `page` number to each chunk.  
+- **Human-Readable Page Number Normalization:** PDF readers internally number pages starting at 0, which causes off-by-one confusion when cited directly. Before chunks are shown to the AI model, page numbers are converted into human-readable 1-based page numbers (`p.1`, `p.2`, ...) paired with the source filename.  
   — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
   — *Called in [`src/agent/tools.py`](src/agent/tools.py)*
-- **Mandatory Document Grounding:** The system prompt enforces a strict grounding contract requiring the agent to call the retriever tool before answering factual questions and base every factual claim *exclusively* on the retrieved document chunks rather than pretraining memory or assumptions.  
+- **Mandatory Document Grounding:** The agent's system instructions require it to search the user's collection before answering factual questions and base every factual claim exclusively on the retrieved document chunks rather than outside knowledge or assumptions.  
   — *Implemented in [`src/agent/graph.py`](src/agent/graph.py)*  
   — *Called in [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
-- **Explicit Abstention When Evidence Is Missing:** Whenever the retriever returns no matching chunks or the retrieved chunks lack sufficient evidence to answer the question, the agent explicitly states that the answer cannot be found in the available documents rather than guessing.  
+- **Explicit Abstention When Evidence Is Missing:** Whenever a search returns no matching chunks or the retrieved text lacks enough information to answer the question, the agent clearly states that the answer cannot be found in the uploaded documents rather than guessing.  
   — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py) & [`src/agent/graph.py`](src/agent/graph.py)*  
   — *Called in [`src/agent/tools.py`](src/agent/tools.py), [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
-- **Inline `[source, p.X]` Page Citations:** Every factual statement in the assistant's answer must include an inline citation matching the exact `source` filename and `1`-indexed `page` number of the supporting chunk (for example, `[annual_report.pdf, p.4]`) so users can verify every claim against the source PDF.  
+- **Inline Source and Page Citations:** Every factual statement in the agent's response includes an inline citation showing the exact PDF filename and page number of the supporting chunk (for example, `[annual_report.pdf, p.4]`) so users can verify every claim against the original document.  
   — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py) & [`src/agent/graph.py`](src/agent/graph.py)*  
   — *Called in [`src/agent/tools.py`](src/agent/tools.py), [`src/core/compliance/provenance.py`](src/core/compliance/provenance.py) & [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*
 
 ---
 
-## 🏗️ Cloud Architecture & Defense-in-Depth Blueprints
+## 🏗️ Cloud Architecture & Production Engineering Layers
 
-InteractiveRAG is engineered for reproducible deployment on **Google Cloud Platform (GCP)** across **13 defense-in-depth architectural layers**, backed by six blueprint documents in [`docs/`](docs/) and the automated test and policy suites in [`tests/`](tests/) and [`infra/scripts/`](infra/scripts/):
+InteractiveRAG is engineered for reproducible deployment on **Google Cloud Platform (GCP)** across **6 architectural domains (`I`–`VI`) and 16 defense-in-depth engineering layers**, verified by the automated test and policy suites in [`tests/`](tests/) and [`infra/scripts/`](infra/scripts/):
 
-| Layer | Blueprint / Reference | Pillars & Focus Areas |
+| Domain | Layer | Pillars & Focus Areas |
 | :--- | :--- | :--- |
-| **1. Cloud Deployment & Multi-Tenant Persistence** | [`docs/GCP_DEPLOYMENT_PLAN.md`](docs/GCP_DEPLOYMENT_PLAN.md) | Serverless Cloud Run microservices (`ingest-api`, `agent-api`, `frontend`), strict multi-tenant data & conversation isolation, and durable Cloud Storage $\leftrightarrow$ `/tmp` vector synchronization |
-| **2. Infrastructure as Code (IaC)** | [`docs/GCP_DEPLOYMENT_PLAN.md`](docs/GCP_DEPLOYMENT_PLAN.md) | Declarative Terraform (`infra/terraform/*.tf`), remote versioned GCS state, Google Cloud Build image & Terraform pipelines (`infra/cloudbuild/*.yaml`), reproducible environments, and environment parity |
-| **3. CI/CD & Deployment** | [`docs/GCP_DEPLOYMENT_PLAN.md`](docs/GCP_DEPLOYMENT_PLAN.md) | Staged pre-flight/build/deploy pipeline design, immutable Cloud Run revision rollouts, readiness probes, and Git-SHA + versioned-state rollback support |
-| **4. Modularity & Abstraction** | [`docs/GCP_DEPLOYMENT_PLAN.md`](docs/GCP_DEPLOYMENT_PLAN.md), [`docs/SCALABILITY_ELASTICITY_PLAN.md`](docs/SCALABILITY_ELASTICITY_PLAN.md) | Loose coupling across 4 domain packages + shared `src/core`, Pydantic/LangChain interface contracts, dynamic LLM & embedding model swappability, and dependency injection |
-| **5. Configuration Management** | [`docs/GCP_DEPLOYMENT_PLAN.md`](docs/GCP_DEPLOYMENT_PLAN.md) | Externalized runtime & Terraform config, automatic Cloud Run vs. local environment separation, runtime/infrastructure feature flags, and build-once startup frontend config (`/env-config.js`) |
-| **6. Authentication & Authorization** | [`docs/GCP_DEPLOYMENT_PLAN.md`](docs/GCP_DEPLOYMENT_PLAN.md) | Dedicated runtime & deployer service accounts, bucket- and project-scoped IAM, Principle of Least Privilege, Identity Platform OAuth 2.0 / OIDC JWT verification, and API key scoping |
-| **7. Zero-Internet VPC & Network Security** | [`docs/NETWORK_SECURITY_PLAN.md`](docs/NETWORK_SECURITY_PLAN.md) | Global External HTTPS Load Balancer (`sslip.io` TLS), locked-down Cloud Run ingress, zero-internet custom VPC, Private Google Access, and Regional Private Service Connect |
-| **8. AI-Specific Security** | [`docs/AI_SECURITY_PLAN.md`](docs/AI_SECURITY_PLAN.md) | Prompt injection mitigation (Model Armor & XML spotlighting), model allowlists, grounding & upload guardrails, two-stage output filtering, and dual-layer content safety |
-| **9. Data Protection & Privacy** | [`docs/AI_SECURITY_PLAN.md`](docs/AI_SECURITY_PLAN.md), [`docs/COMPLIANCE_GOVERNANCE_PLAN.md`](docs/COMPLIANCE_GOVERNANCE_PLAN.md) | Encryption at rest & in transit, Sensitive Data Protection (Cloud DLP), PII handling & query hashing, architectural data classification, and Secret Manager integration |
-| **10. Compliance & Governance** | [`docs/COMPLIANCE_GOVERNANCE_PLAN.md`](docs/COMPLIANCE_GOVERNANCE_PLAN.md) | Single-region data residency, end-to-end audit & data-access logging, GDPR self-service rights, EU AI Act provenance transparency, fail-closed screening, and rate/quota enforcement |
-| **11. Observability & AI Monitoring** | [`docs/OBSERVABILITY_PLAN.md`](docs/OBSERVABILITY_PLAN.md) | Structured GCP JSON operational logging, Cloud Monitoring log-based metrics & dashboards, distributed per-stage tracing, and AI-specific latency, token & retrieval quality telemetry |
-| **12. Scalability, Elasticity & Resource Efficiency** | [`docs/SCALABILITY_ELASTICITY_PLAN.md`](docs/SCALABILITY_ELASTICITY_PLAN.md) | Workload-isolated microservice packaging, compute right-sizing (`cpu_idle`, `startup_cpu_boost`), scale-to-zero & concurrency autoscaling, session affinity, bounded `/tmp` LRU cache eviction, parallel DLP screening, and incremental MD5 delta sync |
-| **13. Testing & Quality Engineering** | [`tests/`](tests/), [`infra/scripts/`](infra/scripts/) | Offline unit test suites, multi-tenant FastAPI integration tests, live HTTP/SSE E2E smoke tests, automated pre-deploy static & Org-Policy gates, and cross-layer test coverage |
+| **I. Cloud Architecture & Multi-Tenant Foundation** | **1. Cloud Deployment** | End-to-end Google Cloud architecture, serverless Cloud Run microservices, Global External HTTPS Load Balancer, and inventory of managed Google Cloud AI, storage, identity, security, networking, CI/CD & observability services |
+| **I. Cloud Architecture & Multi-Tenant Foundation** | **2. Multi-Tenant Persistence** | Identity-bound tenant data & conversation isolation, private versioned Cloud Storage persistence, on-demand snapshot synchronization, distributed Cloud Storage write locks, and local memory cache eviction |
+| **II. Operational Excellence** | **1. Infrastructure as Code (IaC)** | Declarative Terraform stack, remote versioned Cloud Storage state, Cloud Build container & Terraform pipelines, reproducible one-command project bootstrap, and environment parity |
+| **II. Operational Excellence** | **2. CI/CD & Deployment** | Staged pre-flight/build/policy-gate/deploy pipeline design, zero-downtime Cloud Run revision rollouts, readiness checks, and Git commit + versioned storage rollback support |
+| **II. Operational Excellence** | **3. Testing & Quality Engineering** | Offline unit test suites, multi-tenant API integration tests, live end-to-end smoke scripts, automated pre-deploy static & Organization Policy gates, and cross-layer test coverage |
+| **III. Designing for Change** | **1. Configuration Management** | Externalized backend & infrastructure configuration, automatic cloud vs. local environment separation, runtime & infrastructure feature flags, and startup frontend configuration |
+| **III. Designing for Change** | **2. Modularity & Abstraction** | Loose coupling across 4 domain packages + shared core foundation, strict request/response interface schemas, dynamic chat & per-collection embedding model swappability, and dependency injection |
+| **IV. Performance & Cost Optimization** | **1. Scalability & Elasticity** | Workload-isolated microservice packaging, horizontal autoscaling & concurrency limits, private VPC subnet IP headroom, parallel retrieval-time privacy screening, and scaling alerts |
+| **IV. Performance & Cost Optimization** | **2. Resource Efficiency** | Per-service CPU & memory right-sizing, scale-to-zero & request-scoped CPU billing, session affinity for warm cache reuse, bounded in-memory cache quotas, and incremental file synchronization |
+| **V. Security, Privacy, and Compliance** | **1. Authentication & Authorization** | Dedicated runtime & deployer service accounts, declarative IAM, Principle of Least Privilege, Google Sign-In & Email/Password authentication, and keyless service credentials |
+| **V. Security, Privacy, and Compliance** | **2. Infrastructure & Network Security** | Global External HTTPS Load Balancer, locked-down Cloud Run ingress, zero-internet private VPC with segmented subnets, Private Google Access, and Regional Private Service Connect |
+| **V. Security, Privacy, and Compliance** | **3. Data Protection & Privacy** | Encryption at rest & in transit, Cloud Sensitive Data Protection (Cloud DLP), one-way query hashing, 4-tier data classification & storage segregation, and Secret Manager integration |
+| **V. Security, Privacy, and Compliance** | **4. AI-Specific Security** | Prompt injection mitigation (Model Armor & XML spotlighting), approved model allowlists, document grounding & PDF upload guardrails, two-stage output redaction, and dual-layer content safety |
+| **V. Security, Privacy, and Compliance** | **5. Compliance & Governance** | Single-region data residency, privacy-safe audit & Data Access logging, GDPR self-service data access & erasure, EU AI Act transparency badges, fail-closed screening, and rate/quota enforcement |
+| **VI. Reliability & Resilience** | **1. Observability** | Structured JSON operational logging, Cloud Monitoring metrics & dashboards, distributed per-stage Cloud Trace waterfall spans, and AI latency, token & retrieval quality telemetry |
+| **VI. Reliability & Resilience** | **2. Graceful Degradation** | Search & bounded-agent fallback strategies, pre-flight fail-closed security short-circuiting, exponential backoff with random jitter on storage locks, and bounded timeouts with crash recovery |
 
 ---
 
-### 1. Cloud Deployment & Multi-Tenant Persistence ([`docs/GCP_DEPLOYMENT_PLAN.md`](docs/GCP_DEPLOYMENT_PLAN.md))
+## I/ Cloud Architecture & Multi-Tenant Foundation
 
-Multiple users can sign in and use the cloud platform simultaneously—each person gets their own isolated document collections and chat history, while serverless containers automatically scale down to zero when idle to save cost.
+### 1. Cloud Deployment (Cloud Architecture & Google Cloud Services Used)
 
-- **1.1 Serverless Cloud Run Microservice Architecture**
-  - **Serverless Cloud Run Gen2 Services:** The application runs on **Google Cloud Run** across the React web frontend (`frontend`), the Document Ingestion service (`ingest-api`), and the interactive AI Agent, Search & Management service (`agent-api`), scaling on demand and scaling down to zero when idle. Each service is configured with `/health` liveness/readiness checks, explicit cross-origin security rules (`CORSMiddleware`), request correlation middleware, and HTTP Server-Sent Events (SSE) streaming support.  
+InteractiveRAG is deployed as a serverless, single-region, private-networked architecture on **Google Cloud Platform (GCP)**. External browser and API requests enter through a single global HTTPS front door and are routed privately to workload-isolated Cloud Run microservices that communicate with managed Google Cloud AI, storage, identity, security, and observability services exclusively over Google's private internal network.
+
+- **1.1 End-to-End Cloud Architecture & Request Flow**
+  - **Single HTTPS Entry Point:** All user traffic enters through a Global External Application Load Balancer over HTTPS on port 443 (with plain HTTP requests on port 80 automatically redirected to HTTPS).  
+    — *Provisioned in [`infra/terraform/load_balancer.tf`](infra/terraform/load_balancer.tf)*
+  - **Path-Based Routing to Serverless Microservices:** The Load Balancer routes requests by URL path across three serverless backend groups without exposing individual container URLs to the public internet:
+    - `/*` routes to the **Web Frontend Service (`frontend`)** serving the React web application.
+    - `/api/ingest/*` routes to the **Document Ingestion Service (`ingest-api`)** for PDF uploads and vector indexing.
+    - `/api/agent/*` routes to the **Interactive Agent, Search & Management Service (`agent-api`)** for collection management, direct search, and live AI chat.  
+    — *Provisioned in [`infra/terraform/load_balancer.tf`](infra/terraform/load_balancer.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
+  - **Workload-Isolated Serverless Containers:** Running document ingestion (`ingest-api`) on separate containers from interactive search and chat (`agent-api`) ensures heavy PDF parsing and vector index building never slow down active user conversations.  
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
-    — *Implemented in [`src/core/app_factory.py`](src/core/app_factory.py)*  
-    — *Called in [`src/ingest/app.py`](src/ingest/app.py) & [`src/agent/app.py`](src/agent/app.py)*
+    — *Implemented in [`src/core/app_factory.py`](src/core/app_factory.py), [`src/ingest/app.py`](src/ingest/app.py) & [`src/agent/app.py`](src/agent/app.py)*
 
-- **1.2 Multi-Tenant Data & Conversation Isolation**
-  - **Identity-Bound Tenant Context (`uid`):** A user's tenant scope is derived exclusively from the verified Firebase JWT `uid` (validated against a strict alphanumeric pattern to prevent path traversal)—never from client-supplied request parameters or headers.  
+- **1.2 Managed Google Cloud Services Used**
+  - **Google Cloud Run (Gen2 Serverless Compute):** Hosts the three containerized microservices (`frontend`, `ingest-api`, and `agent-api`), scaling container instances automatically with traffic and scaling down to zero when idle.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
+  - **Global External Application Load Balancer:** Provides a single static public IPv4 entry point, terminates HTTPS traffic, redirects plain HTTP to HTTPS, and forwards traffic privately to the Cloud Run services via Serverless Network Endpoint Groups (NEGs).  
+    — *Provisioned in [`infra/terraform/load_balancer.tf`](infra/terraform/load_balancer.tf)*
+  - **Google-Managed SSL Certificates:** Automatically provisions and renews a trusted public TLS certificate for the Load Balancer's `<IP-with-dashes>.sslip.io` domain at zero cost without requiring manual certificate uploads.  
+    — *Provisioned in [`infra/terraform/load_balancer.tf`](infra/terraform/load_balancer.tf)*
+  - **Google Cloud Vertex AI (Gemini Generative Models):** Provides regionally bound `gemini-2.5-flash`, `gemini-2.5-pro`, and `gemini-2.5-flash-lite` language models that power the agent's multi-step reasoning, search tool calls, and grounded answer generation.  
+    — *Provisioned in [`infra/terraform/apis.tf`](infra/terraform/apis.tf), [`infra/terraform/iam.tf`](infra/terraform/iam.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
+    — *Implemented in [`src/agent/graph.py`](src/agent/graph.py)*
+  - **Google Cloud Vertex AI (Text Embedding Models):** Provides regionally bound `gemini-embedding-001`, `text-embedding-004`, and `text-embedding-005` models that convert PDF document chunks and user search queries into dense semantic vectors.  
+    — *Provisioned in [`infra/terraform/apis.tf`](infra/terraform/apis.tf), [`infra/terraform/iam.tf`](infra/terraform/iam.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
+    — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*
+  - **Google Cloud Model Armor:** Screens incoming user prompts and outgoing AI responses against a regional security policy to block prompt injection attacks, jailbreak attempts, malicious web links, and harmful content categories.  
+    — *Provisioned in [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*  
+    — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*
+  - **Google Cloud Sensitive Data Protection (Cloud DLP):** Inspects retrieved document chunks and final AI answers using regional inspection and de-identification templates, automatically masking sensitive personal data and credentials (such as email addresses, phone numbers, credit card numbers, Social Security numbers, IBAN codes, API keys, and auth tokens).  
+    — *Provisioned in [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*  
+    — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*
+  - **Google Cloud Storage (Tenant Persistence Bucket):** Stores each user's authoritative ChromaDB vector database snapshots, archived original PDF uploads, and distributed per-user write-lock files in a private, versioned regional bucket.  
+    — *Provisioned in [`infra/terraform/storage.tf`](infra/terraform/storage.tf)*  
+    — *Implemented in [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py) & [`src/core/storage/locks.py`](src/core/storage/locks.py)*
+  - **Google Cloud Storage (Terraform State & Build Logs Bucket):** Stores remote versioned Terraform infrastructure state files and archived Cloud Build container build logs.  
+    — *Provisioned in [`infra/terraform/versions.tf`](infra/terraform/versions.tf)*  
+    — *Called in [`Makefile`](Makefile) & [`infra/cloudbuild/build-images.yaml`](infra/cloudbuild/build-images.yaml)*
+  - **Google Cloud Identity Platform (Firebase Authentication):** Provides managed user sign-in via Google Sign-In (OAuth 2.0 / OIDC) and Email/Password authentication, issuing cryptographically signed identity tokens verified by the backend on every request.  
+    — *Provisioned in [`infra/terraform/auth.tf`](infra/terraform/auth.tf)*  
+    — *Implemented in [`src/core/auth.py`](src/core/auth.py) & [`frontend/src/firebase.js`](frontend/src/firebase.js)*
+  - **Google Cloud IAM:** Governs machine-to-machine permissions across dedicated service accounts for the backend services, the frontend service, the deployment pipeline, and the Model Armor service agent.  
+    — *Provisioned in [`infra/terraform/iam.tf`](infra/terraform/iam.tf) & [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*
+  - **Google Cloud Secret Manager:** Securely stores sensitive OAuth 2.0 client credentials outside of source code and Terraform variable files, injecting them only when configuring Identity Platform.  
+    — *Provisioned in [`infra/terraform/auth.tf`](infra/terraform/auth.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*
+  - **Google Cloud Virtual Private Cloud (VPC):** Provides an isolated private network with its default route to the public internet removed and dedicated private `/24` subnets separating document ingestion traffic from interactive agent traffic.  
+    — *Provisioned in [`infra/terraform/network.tf`](infra/terraform/network.tf)*
+  - **Cloud Run Direct VPC Egress:** Routes 100% of outbound traffic from the backend Cloud Run containers directly into the private VPC subnets without requiring always-on NAT gateways or proxy virtual machines.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
+  - **Private Google Access & Cloud DNS:** Routes all backend requests to standard Google Cloud APIs (`googleapis.com`) over Google's private internal network (`199.36.153.8/30`) using a private Cloud DNS zone.  
+    — *Provisioned in [`infra/terraform/network.tf`](infra/terraform/network.tf)*
+  - **Regional Private Service Connect (PSC):** Provisions a private internal IP endpoint and private DNS zone inside the VPC for regional Model Armor calls (`modelarmor.<region>.rep.googleapis.com`) so AI safety screening never traverses the public internet.  
+    — *Provisioned in [`infra/terraform/network.tf`](infra/terraform/network.tf)*
+  - **Google Artifact Registry:** Hosts the project's private regional Docker container repository for immutable backend and frontend container images.  
+    — *Provisioned in [`infra/terraform/apis.tf`](infra/terraform/apis.tf)*
+  - **Google Cloud Build:** Compiles and pushes production Docker container images in parallel and executes remote Terraform infrastructure deployments inside a reproducible cloud runner.  
+    — *Provisioned in [`infra/terraform/apis.tf`](infra/terraform/apis.tf)*  
+    — *Implemented in [`infra/cloudbuild/build-images.yaml`](infra/cloudbuild/build-images.yaml) & [`infra/cloudbuild/run-terraform.yaml`](infra/cloudbuild/run-terraform.yaml)*
+  - **Google Cloud Logging:** Collects structured JSON logs from all services and routes them through dedicated sinks into separate regional storage buckets for 365-day compliance auditing and 30-day operational telemetry.  
+    — *Provisioned in [`infra/terraform/compliance.tf`](infra/terraform/compliance.tf) & [`infra/terraform/observability.tf`](infra/terraform/observability.tf)*  
+    — *Implemented in [`src/core/compliance/audit.py`](src/core/compliance/audit.py) & [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*
+  - **Google Cloud Audit Logs:** Records administrative actions, data reads, and data writes across Cloud Storage, Vertex AI, Cloud DLP, and Model Armor for security and compliance auditing.  
+    — *Provisioned in [`infra/terraform/compliance.tf`](infra/terraform/compliance.tf)*
+  - **Google Cloud Monitoring:** Extracts 10 custom performance and quality metrics from structured logs, powers an operations dashboard for AI latency, token usage, retrieval quality, and container scaling, and triggers automated health alerts.  
+    — *Provisioned in [`infra/terraform/observability.tf`](infra/terraform/observability.tf)*
+  - **Google Cloud Trace:** Captures distributed per-stage execution timelines across Cloud Storage synchronization, PDF chunking, Vertex AI calls, vector searches, and safety checks so operators can inspect end-to-end latency waterfalls.  
+    — *Provisioned in [`infra/terraform/iam.tf`](infra/terraform/iam.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
+    — *Implemented in [`src/core/observability/tracing.py`](src/core/observability/tracing.py)*
+  - **Google Cloud Organization Policy Service:** Enforces project-wide geographic resource location restrictions (`constraints/gcp.resourceLocations`), verified automatically before every deployment.  
+    — *Implemented in [`infra/scripts/check_region_policy.py`](infra/scripts/check_region_policy.py)*  
+    — *Called in [`Makefile`](Makefile)*
+
+---
+
+### 2. Multi-Tenant Persistence
+
+Multiple users can sign in and use the cloud platform simultaneously—each person gets their own strictly isolated document collections, vector database snapshots, and chat history, backed by durable Cloud Storage synchronization.
+
+- **2.1 Multi-Tenant Data & Conversation Isolation**
+  - **Identity-Derived Tenant Scope:** A user's workspace identity is taken exclusively from their cryptographically verified sign-in token and checked against a strict alphanumeric pattern to prevent directory traversal—never from client-supplied form fields or query parameters.  
     — *Implemented in [`src/core/auth.py`](src/core/auth.py)*  
     — *Called in [`src/core/storage/paths.py`](src/core/storage/paths.py), [`src/ingest/routes.py`](src/ingest/routes.py), [`src/query/routes.py`](src/query/routes.py), [`src/agent/routes.py`](src/agent/routes.py), [`src/manage/collections.py`](src/manage/collections.py) & [`src/manage/compliance.py`](src/manage/compliance.py)*
-  - **Per-User Vector Storage & Collection Isolation:** Each user's ChromaDB files are isolated under a dedicated Cloud Storage prefix (`gs://<bucket>/users/{uid}/chroma_db/`) and an isolated local container directory (`/tmp/chroma_db/{uid}`). Two users can create, query, or delete collections with the exact same name without ever seeing or overwriting each other's documents.  
+  - **Per-User Vector Database Isolation:** Each user's ChromaDB files are stored under a dedicated Cloud Storage folder (`users/{uid}/chroma_db/`) and an isolated local container folder (`/tmp/chroma_db/{uid}`). Two users can create, query, or delete collections with the exact same name without ever seeing or overwriting each other's documents.  
     — *Implemented in [`src/core/storage/paths.py`](src/core/storage/paths.py) & [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
     — *Called in [`src/ingest/service.py`](src/ingest/service.py), [`src/query/service.py`](src/query/service.py) & [`src/manage/collections.py`](src/manage/collections.py)*
-  - **Isolated Per-Request PDF Upload Staging:** In cloud deployments, the ingestion service accepts only multipart file uploads (blocking requests that reference local server file paths). Uploaded PDFs are staged in an isolated per-request folder (`/tmp/uploads/{uid}/{request_id}`), archived to the user's private Cloud Storage prefix (`gs://<bucket>/users/{uid}/uploads/`), and deleted from local disk as soon as indexing finishes.  
+  - **Per-Request PDF Upload Staging & Private Archiving:** Uploaded PDFs are staged in an isolated temporary directory unique to that user and request, archived to the user's private Cloud Storage uploads folder (`users/{uid}/uploads/`), and wiped from local container memory as soon as indexing finishes.  
     — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py), [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py) & [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py)*  
     — *Called in [`src/ingest/routes.py`](src/ingest/routes.py)*
-  - **Tenant-Namespaced Conversation Memory:** Every multi-turn chat thread is namespaced as `{uid}:{thread_id}` inside the in-memory LangGraph checkpointer so one user can never read, resume, or clear another user's conversation history.  
+  - **Tenant-Namespaced Conversation Memory:** Every multi-turn chat thread is prefixed with the user's unique ID (`{uid}:{thread_id}`) inside the conversation memory store so one user can never read, resume, or erase another user's conversation history.  
     — *Implemented in [`src/agent/memory.py`](src/agent/memory.py) & [`src/core/compliance/dsar.py`](src/core/compliance/dsar.py)*  
     — *Called in [`src/agent/routes.py`](src/agent/routes.py), [`src/agent/service.py`](src/agent/service.py) & [`src/manage/compliance.py`](src/manage/compliance.py)*
 
-- **1.3 Durable Cloud Storage $\leftrightarrow$ Container Memory Synchronization**
-  - **Why We Synchronize Instead of Mounting Cloud Storage Directly:** ChromaDB relies on SQLite and memory-mapped index files, whereas Google Cloud Storage does not support the low-level file locks SQLite requires. Sharing a direct storage mount across containers would risk database lock errors and corrupted indexes, while storing data only in container memory would lose all collections whenever serverless instances scale down.
-  - **Private Versioned Persistence Bucket:** Each user's authoritative vector database and uploaded PDFs are stored durably in a private, versioned **Google Cloud Storage** bucket with public access strictly blocked.  
+- **2.2 Durable Cloud Storage & Container Memory Synchronization**
+  - **Why Snapshots Are Synchronized Instead of Directly Mounted:** ChromaDB relies on SQLite and memory-mapped vector index files, whereas Cloud Storage object buckets do not support the byte-range file locking that SQLite requires. Synchronizing snapshots between Cloud Storage and fast local container memory avoids database corruption across concurrent containers while ensuring data survives when serverless instances scale down to zero.
+  - **Private Versioned Cloud Storage Persistence:** Each user's authoritative vector database and uploaded PDFs are stored in a private, versioned Google Cloud Storage bucket with public access blocked and uniform IAM permissions enforced.  
     — *Provisioned in [`infra/terraform/storage.tf`](infra/terraform/storage.tf)*  
     — *Called in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
-  - **On-Demand Snapshot Synchronization & Version Tracking:** A lightweight `version.json` marker in Cloud Storage tracks whenever a user's vector database changes. Read requests download updated files into fast local `/tmp/chroma_db/{uid}` storage only when a newer version exists in Cloud Storage, while write requests (`POST /ingest` and `DELETE /collections/{name}`) push updated database files back to Cloud Storage and advance `version.json`.  
+  - **On-Demand Version-Checked Downloads:** A lightweight version marker (`version.json`) in Cloud Storage tracks whenever a user's vector database changes. Read requests download updated files into a temporary local staging folder and swap them into place only when a newer version exists in Cloud Storage.  
     — *Implemented in [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py)*  
-    — *Called in [`src/core/storage/chroma.py`](src/core/storage/chroma.py), [`src/ingest/routes.py`](src/ingest/routes.py) & [`src/manage/collections.py`](src/manage/collections.py)*
-  - **Distributed Per-User Write Locks in Cloud Storage:** Before modifying a user's vector database, the backend acquires an atomic per-user lock object in Cloud Storage (`if_generation_match=0`, with automatic TTL recovery if a previous container crashed) to prevent concurrent write conflicts across instances.  
+    — *Called in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*
+  - **Incremental Write Synchronization:** Write operations (such as uploading new PDFs or deleting a collection) update the local vector database, upload only the changed or newly created files back to Cloud Storage, and increment the user's version marker.  
+    — *Implemented in [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py)*  
+    — *Called in [`src/ingest/routes.py`](src/ingest/routes.py) & [`src/manage/collections.py`](src/manage/collections.py)*
+  - **Distributed Per-User Write Locks:** Before modifying a user's vector database, the backend acquires an exclusive per-user lock file in Cloud Storage (`users/{uid}/locks/chroma.lock`) paired with an in-process thread lock so two simultaneous uploads or deletions for the same user cannot overwrite each other.  
     — *Implemented in [`src/core/storage/locks.py`](src/core/storage/locks.py)*  
-    — *Called in [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py)*
-  - **Automatic Local `/tmp` LRU Cache Eviction:** An automatic Least-Recently-Used (LRU) cache evictor removes the oldest inactive user caches when local `/tmp` storage fills up while never evicting a directory currently locked by an active request.  
+    — *Called in [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py), [`src/ingest/service.py`](src/ingest/service.py) & [`src/manage/collections.py`](src/manage/collections.py)*
+  - **Active-User-Protected Local Cache Eviction:** When local container memory fills up, an automatic Least-Recently-Used (LRU) cache cleaner removes the oldest inactive user folders while keeping active readers and writers pinned so an in-flight search or chat stream is never interrupted.  
     — *Implemented in [`src/core/storage/locks.py`](src/core/storage/locks.py)*  
     — *Called in [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py)*
 
 ---
 
-### 2. Infrastructure as Code (IaC) ([`docs/GCP_DEPLOYMENT_PLAN.md`](docs/GCP_DEPLOYMENT_PLAN.md))
+## II/ [OPERATIONAL EXCELLENCE]
+
+### 1. Infrastructure as Code (IaC)
 
 All cloud infrastructure, security policies, networking, and monitoring resources are managed declaratively as version-controlled code rather than through manual Google Cloud Console changes:
 
-- **2.1 Pillar 1 — Declarative Terraform Stack & Remote State (`Terraform`)**
-  - **Full-Stack Terraform Provisioning (`infra/terraform/*.tf`):** Terraform (`>= 1.5.0`, `hashicorp/google` and `hashicorp/google-beta` `~> 6.0`) declaratively provisions all 19 required Google Cloud APIs, Artifact Registry, dedicated runtime IAM service accounts, the versioned Cloud Storage persistence bucket, Identity Platform authentication, the zero-internet custom VPC and `/24` subnets, Private Google Access DNS, Regional Private Service Connect (PSC) for Model Armor, Cloud DLP inspect/de-identify templates, Model Armor templates, all three Cloud Run Gen2 services, the Global External HTTPS Load Balancer with managed `sslip.io` TLS certificate, Cloud Audit Logs, regional Cloud Logging buckets/sinks, log-based metrics, and Cloud Monitoring dashboards and alerts.  
+- **1.1 Pillar 1 — Declarative Terraform Stack & Remote State**
+  - **Full-Stack Declarative Terraform Modules:** Modular Terraform configuration files provision all 19 required Google Cloud APIs, Artifact Registry, dedicated IAM service accounts, the versioned Cloud Storage bucket, Identity Platform authentication, the zero-internet private VPC and subnets, Private Google Access DNS, Regional Private Service Connect for Model Armor, Cloud DLP templates, Model Armor templates, all three Cloud Run microservices, the Global External HTTPS Load Balancer, Cloud Audit Logs, regional Cloud Logging buckets and sinks, log-based metrics, and Cloud Monitoring dashboards and alerts.  
     — *Provisioned in [`infra/terraform/versions.tf`](infra/terraform/versions.tf), [`infra/terraform/apis.tf`](infra/terraform/apis.tf), [`infra/terraform/iam.tf`](infra/terraform/iam.tf), [`infra/terraform/storage.tf`](infra/terraform/storage.tf), [`infra/terraform/auth.tf`](infra/terraform/auth.tf), [`infra/terraform/network.tf`](infra/terraform/network.tf), [`infra/terraform/load_balancer.tf`](infra/terraform/load_balancer.tf), [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf), [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf), [`infra/terraform/compliance.tf`](infra/terraform/compliance.tf), [`infra/terraform/observability.tf`](infra/terraform/observability.tf) & [`infra/terraform/outputs.tf`](infra/terraform/outputs.tf)*
-  - **Remote Versioned GCS State Backend:** Terraform state is stored in a dedicated, versioned Google Cloud Storage bucket (`gs://<app>-tfstate-<project_number>/<app>/<env>/state`) with uniform bucket-level access and enforced public access prevention. Bucket and prefix parameters are injected dynamically during `make tf-init` (`-backend-config`) so `infra/terraform/versions.tf` remains portable across projects and environments without hardcoded bucket names.  
+  - **Remote Versioned Cloud Storage State Backend:** Terraform stores its infrastructure state in a dedicated, versioned Google Cloud Storage bucket with public access blocked. Bucket and folder parameters are passed dynamically at initialization time so the Terraform files remain portable across projects and environments without hardcoded bucket names.  
     — *Provisioned in [`infra/terraform/versions.tf`](infra/terraform/versions.tf)*  
     — *Called in [`Makefile`](Makefile) & [`infra/cloudbuild/run-terraform.yaml`](infra/cloudbuild/run-terraform.yaml)*
 
-- **2.2 Pillar 2 — Cloud-Native Image & Terraform Execution (`Cloud Build`)**
-  - **Parallel Multi-Image Cloud Build Pipeline (`infra/cloudbuild/build-images.yaml`):** **Google Cloud Build** builds both `linux/amd64` production container images (`backend` and `frontend`) concurrently (`waitFor: ['-']`), tags each image with both the Git commit SHA (`${_IMAGE_TAG}`) and `latest`, pushes them to the regional Artifact Registry repository, and archives build logs in the state bucket (`gs://${_LOGS_BUCKET}/cloudbuild-logs`).  
+- **1.2 Pillar 2 — Cloud-Native Image & Terraform Execution (`Cloud Build`)**
+  - **Parallel Container Image Build Pipeline:** Google Cloud Build compiles both production container images (`backend` and `frontend`) in parallel, tags each image with both the current Git commit hash and `latest`, pushes them to Artifact Registry, and archives build logs in the state bucket.  
     — *Implemented in [`infra/cloudbuild/build-images.yaml`](infra/cloudbuild/build-images.yaml), [`infra/docker/Dockerfile.backend`](infra/docker/Dockerfile.backend) & [`infra/docker/Dockerfile.frontend`](infra/docker/Dockerfile.frontend)*  
     — *Called in [`Makefile`](Makefile)*
-  - **Hybrid Local / Cloud Build Terraform Runner (`infra/cloudbuild/run-terraform.yaml`):** The root `Makefile` auto-detects whether a local `terraform` binary is installed (`TF_MODE=local`) and transparently falls back to executing `terraform init`, `validate`, `plan`, `apply`, `output`, and `destroy` remotely inside **Google Cloud Build** (`TF_MODE=cloudbuild`) using the pinned `hashicorp/terraform:1.9.8` image and a dedicated least-privilege deployer service account (`<app>-deployer`).  
+  - **Hybrid Local and Cloud Build Terraform Runner:** The project automation automatically detects whether Terraform is installed locally and, if not, executes Terraform initialization, validation, planning, deployment, output inspection, and teardown remotely inside Google Cloud Build using a pinned Terraform runner image and a dedicated deployer service account.  
     — *Implemented in [`infra/cloudbuild/run-terraform.yaml`](infra/cloudbuild/run-terraform.yaml)*  
     — *Called in [`Makefile`](Makefile)*
 
-- **2.3 Pillar 3 — Reproducible Environments**
-  - **Idempotent Zero-Touch Project Bootstrap (`make bootstrap`):** A single idempotent command enables seed GCP APIs, creates the versioned Terraform state bucket, provisions and binds the least-privilege deployer service account (`make ensure-deployer-sa`), and executes a targeted Terraform apply for Artifact Registry so a clean GCP project can be bootstrapped from scratch without manual setup.  
+- **1.3 Pillar 3 — Reproducible Environments**
+  - **One-Command Project Bootstrap:** A single idempotent bootstrap command (`make bootstrap`) enables seed Google Cloud APIs, creates the versioned Terraform state bucket, provisions the least-privilege deployer service account, and sets up Artifact Registry so a brand-new Google Cloud project can be initialized from scratch without manual clicks.  
     — *Provisioned in [`infra/terraform/apis.tf`](infra/terraform/apis.tf)*  
     — *Called in [`Makefile`](Makefile)*
-  - **Deterministic Hostname Resolution & Single-Apply Convergence:** Terraform computes deterministic Cloud Run regional hostnames (`<service>-<project_number>.<region>.run.app`) and the Load Balancer's `<IP-with-dashes>.sslip.io` domain upfront in `locals`, breaking circular dependencies between Cloud Run, Identity Platform `authorized_domains`, and backend `ALLOWED_ORIGINS` CORS lists so the entire stack converges in a single apply.  
+  - **Upfront Hostname Calculation for Single-Pass Deployment:** Terraform calculates the Cloud Run service URLs and the Load Balancer's `<IP-with-dashes>.sslip.io` domain upfront, avoiding circular dependencies between Cloud Run, Identity Platform authorized domains, and backend CORS origin lists so the entire stack deploys cleanly in a single pass.  
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf), [`infra/terraform/load_balancer.tf`](infra/terraform/load_balancer.tf) & [`infra/terraform/auth.tf`](infra/terraform/auth.tf)*
-  - **Pinned Base Images & Plan-Time Invariant Preconditions:** Dockerfiles pin explicit base image versions (`python:3.12-slim`, `node:22-slim`, `nginx:1.27-alpine`), `infra/cloudbuild/run-terraform.yaml` pins `hashicorp/terraform:1.9.8`, and Terraform `validation` / `lifecycle { precondition }` blocks reject invalid regions or out-of-range parameters at `terraform plan` time.  
-    — *Provisioned in [`infra/terraform/variables.tf`](infra/terraform/variables.tf), [`infra/terraform/storage.tf`](infra/terraform/storage.tf), [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf), [`infra/terraform/compliance.tf`](infra/terraform/compliance.tf) & [`infra/terraform/observability.tf`](infra/terraform/observability.tf)*  
+  - **Pinned Container & Terraform Versions:** All Dockerfiles pin exact base operating system and runtime versions (`python:3.12-slim`, `node:22-slim`, `nginx:1.27-alpine`), and the remote runner pins an exact Terraform version (`1.9.8`) so builds behave identically over time.  
     — *Implemented in [`infra/docker/Dockerfile.backend`](infra/docker/Dockerfile.backend), [`infra/docker/Dockerfile.frontend`](infra/docker/Dockerfile.frontend) & [`infra/cloudbuild/run-terraform.yaml`](infra/cloudbuild/run-terraform.yaml)*
+  - **Pre-Deployment Configuration Checks:** Built-in Terraform validation rules reject invalid cloud regions (such as multi-regional or global locations) or out-of-range scaling and retention settings during the planning phase before any cloud resources are modified.  
+    — *Provisioned in [`infra/terraform/variables.tf`](infra/terraform/variables.tf), [`infra/terraform/storage.tf`](infra/terraform/storage.tf), [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf), [`infra/terraform/compliance.tf`](infra/terraform/compliance.tf) & [`infra/terraform/observability.tf`](infra/terraform/observability.tf)*
 
-- **2.4 Pillar 4 — Environment Parity**
-  - **Single Parameterized Terraform Codebase Across `dev`, `staging` & `prod`:** All environments share the exact same `.tf` definitions in `infra/terraform/`, parameterized by `var.environment` (which namespaces resource identifiers as `-${var.environment}`, isolates remote state prefixes under `$(APP_NAME)/$(ENV)/state`, and toggles production-only safeguards such as `deletion_protection = var.environment == "prod"`), preventing configuration drift between staging and production.  
+- **1.4 Pillar 4 — Environment Parity**
+  - **Single Parameterized Terraform Codebase Across Environments:** Development, staging, and production environments share the exact same Terraform files, using an environment parameter to namespace resource names, isolate remote state folders, and enable production-only safeguards such as accidental deletion protection.  
     — *Provisioned in [`infra/terraform/variables.tf`](infra/terraform/variables.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
     — *Called in [`Makefile`](Makefile)*
-  - **Immutable Build-Once Container Artifacts Across Services & Environments:** A single `backend` image powers both `ingest-api` (`APP_MODULE=src.ingest.app:app`) and `agent-api` (`APP_MODULE=src.agent.app:app`), while the `frontend` image injects environment-specific endpoints and Firebase settings at container startup via `/env-config.js`—allowing the exact same container digest to run across environments without rebuilding.  
+  - **Shared Backend Container Image:** A single compiled backend container image runs both `ingest-api` and `agent-api` by selecting which service entrypoint to launch via an environment variable, guaranteeing identical Python libraries and security patches across both services.  
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
-    — *Implemented in [`infra/docker/Dockerfile.backend`](infra/docker/Dockerfile.backend), [`infra/docker/Dockerfile.frontend`](infra/docker/Dockerfile.frontend) & [`infra/docker/entrypoint-frontend.sh`](infra/docker/entrypoint-frontend.sh)*
+    — *Implemented in [`infra/docker/Dockerfile.backend`](infra/docker/Dockerfile.backend)*
+  - **Runtime-Configured Frontend Container Image:** The frontend container generates its browser configuration file (`/env-config.js`) at container startup from environment variables rather than baking URLs in at build time, allowing the exact same compiled image to run across environments without rebuilding.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
+    — *Implemented in [`infra/docker/Dockerfile.frontend`](infra/docker/Dockerfile.frontend) & [`infra/docker/entrypoint-frontend.sh`](infra/docker/entrypoint-frontend.sh)*
 
 > **Note on Unimplemented / Non-Relevant Pillars:**
-> - **Pulumi (*Not Implemented — Not Relevant*):** Pulumi is not used because 100% of our Google Cloud infrastructure is already declaratively defined and managed with **Terraform** ([`infra/terraform/*.tf`](infra/terraform/)), which provides first-party Google Cloud provider support and integrates directly with our remote GCS state backend and Cloud Build runner.
+> - **Pulumi (*Not Implemented — Not Relevant*):** Pulumi is not used because 100% of our Google Cloud infrastructure is already declaratively defined and managed with **Terraform** ([`infra/terraform/*.tf`](infra/terraform/)), which provides first-party Google Cloud support and integrates directly with our remote Cloud Storage state backend and Cloud Build runner.
 
 ---
 
-### 3. CI/CD & Deployment ([`docs/GCP_DEPLOYMENT_PLAN.md`](docs/GCP_DEPLOYMENT_PLAN.md))
+### 2. CI/CD & Deployment
 
 Container builds, compliance verification, and infrastructure rollouts are orchestrated through an automated, policy-gated deployment pipeline:
 
-- **3.1 Pillar 1 — Pipeline Design**
-  - **Staged Pre-Flight, Build, Policy-Gate & Deploy Pipeline:** The [`Makefile`](Makefile) and **Google Cloud Build** configs structure delivery into four deterministic stages:
-    1. **Bootstrap (`make bootstrap`):** Enables seed APIs, provisions the versioned remote state bucket and least-privilege `<app>-deployer` service account, and creates Artifact Registry.
-    2. **Parallel Container Build & Push (`make build-push` / `make build-push-local`):** Executes [`infra/cloudbuild/build-images.yaml`](infra/cloudbuild/build-images.yaml) on Cloud Build (or local Docker Buildx) to compile and push `linux/amd64` `backend` and `frontend` images tagged with `$(IMAGE_TAG)` (defaulting to `git rev-parse --short HEAD`) and `latest`.
-    3. **Mandatory Pre-Deploy Policy Gate (`make policy-check`):** Wired as an automatic prerequisite of both `make plan` and `make deploy`. Runs `check-project` (verifying active `gcloud` authentication), `check-region-policy` (querying the live GCP `constraints/gcp.resourceLocations` Organization Policy), `check-static-policy` (offline verification of single-region defaults, fail-closed Model Armor, Cloud Run concurrency/deletion-protection, and observability sinks/alerts), and `make validate` (`terraform validate`).
-    4. **Infrastructure Preview & Apply (`make plan` -> `make deploy` -> `make outputs`):** Applies the Terraform stack (locally or via [`infra/cloudbuild/run-terraform.yaml`](infra/cloudbuild/run-terraform.yaml)), including idempotent state auto-import for project-singleton Identity Platform resources.  
-    — *Implemented in [`Makefile`](Makefile), [`infra/cloudbuild/build-images.yaml`](infra/cloudbuild/build-images.yaml), [`infra/cloudbuild/run-terraform.yaml`](infra/cloudbuild/run-terraform.yaml), [`infra/scripts/check_region_policy.py`](infra/scripts/check_region_policy.py) & [`infra/scripts/check_static_policies.py`](infra/scripts/check_static_policies.py)*
+- **2.1 Pillar 1 — Pipeline Design**
+  - **Stage 1 — Project & State Bootstrap (`make bootstrap`):** Enables initial Google Cloud APIs, creates the versioned Terraform state bucket, provisions the least-privilege deployer service account, and initializes the Artifact Registry container repository.  
+    — *Implemented in [`Makefile`](Makefile) & [`infra/terraform/apis.tf`](infra/terraform/apis.tf)*
+  - **Stage 2 — Parallel Container Build & Push (`make build-push`):** Compiles the backend and frontend container images in parallel on Google Cloud Build (or locally via Docker Buildx) and pushes them to Artifact Registry tagged with the current Git commit hash and `latest`.  
+    — *Implemented in [`Makefile`](Makefile) & [`infra/cloudbuild/build-images.yaml`](infra/cloudbuild/build-images.yaml)*
+  - **Stage 3 — Mandatory Pre-Deployment Policy Gate (`make policy-check`):** Automatically runs before every infrastructure plan or deployment to verify active Google Cloud authentication, confirm the target region is allowed by the live Google Cloud Organization Policy, enforce offline security and scaling rules across Terraform and Python config files, and validate Terraform syntax.  
+    — *Implemented in [`Makefile`](Makefile), [`infra/scripts/check_region_policy.py`](infra/scripts/check_region_policy.py) & [`infra/scripts/check_static_policies.py`](infra/scripts/check_static_policies.py)*
+  - **Stage 4 — Infrastructure Plan & Rollout (`make plan` & `make deploy`):** Previews and applies the Terraform infrastructure stack locally or inside Google Cloud Build, automatically importing existing project-singleton authentication resources so repeated deployments never fail on state conflicts.  
+    — *Implemented in [`Makefile`](Makefile) & [`infra/cloudbuild/run-terraform.yaml`](infra/cloudbuild/run-terraform.yaml)*
 
-- **3.2 Pillar 2 — Deployment Strategies**
-  - **Zero-Downtime Immutable Cloud Run Revision Rollouts:** Deploying a new `var.image_tag` creates an immutable Cloud Run Gen2 revision for `ingest-api`, `agent-api`, and `frontend`. Cloud Run automatically starts the new revision, verifies container readiness (`GET /health`), and atomically shifts incoming traffic from the previous revision to the new healthy revision without dropping active connections.  
+- **2.2 Pillar 2 — Deployment Strategies**
+  - **Immutable Cloud Run Revision Rollouts:** Deploying a new container image tag creates a brand-new, immutable Cloud Run revision for `ingest-api`, `agent-api`, and `frontend` without modifying running containers in place.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
+  - **Health-Gated Zero-Downtime Traffic Shifting:** Cloud Run waits for the new container revision to pass its HTTP health checks (`/health` on the backend APIs and `/healthz` on the Nginx frontend) before atomically shifting live user traffic over from the previous revision.  
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
-    — *Implemented in [`src/core/app_factory.py`](src/core/app_factory.py)*
-  - **Zero-Downtime TLS Certificate Replacement (`create_before_destroy`):** The Google-managed SSL certificate on the Global HTTPS Load Balancer is configured with `lifecycle { create_before_destroy = true }` so replacement certificates are provisioned and bound to the HTTPS proxy before old certificates are removed.  
+    — *Implemented in [`src/core/app_factory.py`](src/core/app_factory.py) & [`infra/docker/nginx.conf.template`](infra/docker/nginx.conf.template)*
+  - **Zero-Downtime SSL Certificate Replacement:** The Load Balancer's Google-managed SSL certificate is configured to provision and attach any replacement certificate before removing the old one so HTTPS traffic is never interrupted during domain or certificate updates.  
     — *Provisioned in [`infra/terraform/load_balancer.tf`](infra/terraform/load_balancer.tf)*
 
-- **3.3 Pillar 3 — Rollback Support**
-  - **Git-SHA Immutable Image Tags & Versioned Storage for Fast Rollback:** Because every `make build-push` tags container images in Artifact Registry with the exact Git commit SHA (`IMAGE_TAG`) alongside `latest` and Object Versioning is enabled on both the Terraform state bucket (`gs://<app>-tfstate-<project_number>`) and the ChromaDB persistence bucket (`google_storage_bucket.chroma_persistence`), operators can deterministically roll back any deployment to a prior known-good revision via `make deploy IMAGE_TAG=<previous-git-sha>` or Cloud Run revision traffic shifting.  
-    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/storage.tf`](infra/terraform/storage.tf)*  
+- **2.3 Pillar 3 — Rollback Support**
+  - **Git-Commit Image Tag Rollbacks:** Because every container build tags images in Artifact Registry with the exact Git commit hash alongside `latest`, operators can roll back any service to a previously tested release in one command (`make deploy IMAGE_TAG=<previous-git-sha>`).  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
     — *Called in [`Makefile`](Makefile) & [`infra/cloudbuild/build-images.yaml`](infra/cloudbuild/build-images.yaml)*
+  - **Versioned Infrastructure State & Tenant Data Recovery:** Object versioning is enabled on both the Terraform state bucket and the tenant vector database bucket, retaining previous file versions so operators can recover from an unintended infrastructure change or data write.  
+    — *Provisioned in [`infra/terraform/storage.tf`](infra/terraform/storage.tf) & [`infra/terraform/versions.tf`](infra/terraform/versions.tf)*  
+    — *Called in [`Makefile`](Makefile)*
 
 > **Note on Unimplemented Pillars:**
-> - **Automated Git-Webhook CI Triggers, Progressive Traffic Splitting (Blue/Green & Canary) & Automated Rollback Triggers (*Not Implemented — Relevant*):** While Cloud Run performs zero-downtime revision swaps and supports manual Git-SHA rollbacks, automated Git-push CI triggers (e.g., GitHub Actions or Cloud Build Triggers running `unittest` on pull requests), declarative percentage-based blue/green or canary traffic-splitting blocks (`traffic {}`) in `infra/terraform/cloud_run.tf`, and automated rollback triggers tied to our Cloud Monitoring 5xx/latency alert policies ([`infra/terraform/observability.tf`](infra/terraform/observability.tf)) are not yet implemented and remain relevant future production enhancements.
+> - **Automated Git-Webhook CI Triggers, Progressive Traffic Splitting (Blue/Green & Canary) & Automated Rollback Triggers (*Not Implemented — Relevant*):** While Cloud Run performs zero-downtime revision swaps and supports manual Git-commit rollbacks, automated Git-push CI triggers (such as GitHub Actions or Cloud Build Triggers running unit tests on pull requests), percentage-based blue/green or canary traffic splitting across revisions, and automated rollback triggers tied to Cloud Monitoring error or latency alerts ([`infra/terraform/observability.tf`](infra/terraform/observability.tf)) are not yet implemented and remain relevant future production enhancements.
 
 ---
 
-### 4. Modularity & Abstraction ([`docs/GCP_DEPLOYMENT_PLAN.md`](docs/GCP_DEPLOYMENT_PLAN.md), [`docs/SCALABILITY_ELASTICITY_PLAN.md`](docs/SCALABILITY_ELASTICITY_PLAN.md))
+### 3. Testing & Quality Engineering
 
-The backend is architected around clean package boundaries, typed schema contracts, swappable AI models, and dependency injection so domain logic, security guardrails, and infrastructure adapters evolve independently:
+Quality, security, and multi-tenant isolation are verified across unit, integration, end-to-end, and infrastructure policy layers before code or Terraform changes are deployed:
 
-- **4.1 Pillar 1 — Loose Coupling**
-  - **4 Domain Packages + Shared Platform Core (`src/`):** Application logic is separated into a shared platform foundation ([`src/core/`](src/core/) for auth, config, storage, AI security, compliance, and observability) and **4 loosely coupled domain packages** that never import one another's route handlers:
-    1. [`src/ingest/`](src/ingest/) — Multipart upload staging, `PyPDFLoader` extraction, `RecursiveCharacterTextSplitter` chunking, and batched ChromaDB indexing (`ingest-api`).
-    2. [`src/manage/`](src/manage/) — Collection listing/deletion and GDPR Art. 15/17 self-service data inventory and erasure (`agent-api`).
-    3. [`src/query/`](src/query/) — Direct top-$k$ hybrid dense + BM25 RRF similarity search with parallel Cloud DLP redaction (`agent-api`).
-    4. [`src/agent/`](src/agent/) — Stateful LangGraph agentic workflow, dynamic retriever tool construction, tenant-namespaced memory, and SSE streaming (`agent-api`).  
-    — *Implemented in [`src/core/`](src/core/), [`src/ingest/`](src/ingest/), [`src/manage/`](src/manage/), [`src/query/`](src/query/) & [`src/agent/`](src/agent/)*
-  - **Composable Service Entrypoints (`create_app`):** [`src/core/app_factory.py`](src/core/app_factory.py) centralizes FastAPI creation, CORS, request correlation middleware, and `/health`, allowing [`src/ingest/app.py`](src/ingest/app.py) and [`src/agent/app.py`](src/agent/app.py) to compose independent microservices simply by passing their respective `APIRouter` lists.  
-    — *Implemented in [`src/core/app_factory.py`](src/core/app_factory.py), [`src/ingest/app.py`](src/ingest/app.py) & [`src/agent/app.py`](src/agent/app.py)*
-  - **Decoupled Cross-Cutting Context (`ContextVar`):** Request correlation IDs, distributed trace spans, compliance guardrail flags, and AI telemetry metrics propagate across modules via thread- and async-safe Python `ContextVar` state rather than tightly coupling domain functions to logging or audit internals.  
-    — *Implemented in [`src/core/context.py`](src/core/context.py), [`src/core/compliance/state.py`](src/core/compliance/state.py) & [`src/core/observability/state.py`](src/core/observability/state.py)*
+- **3.1 Pillar 1 — Unit, Integration & End-to-End (E2E) Testing**
+  - **Authentication & Tenant Identity Unit Tests:** Verifies cryptographic token validation, expired or forged token rejection, user ID format validation against directory traversal, local developer bypass behavior, and cloud production authentication enforcement.  
+    — *Implemented in [`tests/auth.py`](tests/auth.py) & [`tests/helpers.py`](tests/helpers.py)*
+  - **Storage Synchronization, Locking & Hybrid Search Unit Tests:** Verifies per-user Cloud Storage snapshot downloads, version tracking, incremental file uploads, distributed Cloud Storage write locks with expired-lock recovery, local memory cache eviction, and hybrid semantic + keyword search ranking.  
+    — *Implemented in [`tests/storage.py`](tests/storage.py) & [`tests/helpers.py`](tests/helpers.py)*
+  - **AI Security & Privacy Redaction Unit Tests:** Verifies prompt injection screening, XML quotation tags on retrieved chunks, approved model catalogs, collection-bound embedding consistency, PDF file-signature and upload size limits, two-stage personal data redaction, safe error messages, and content safety filters.  
+    — *Implemented in [`tests/ai_security.py`](tests/ai_security.py) & [`tests/helpers.py`](tests/helpers.py)*
+  - **Compliance, Residency & Quota Unit Tests:** Verifies single-region location checks, Organization Policy verification, privacy-safe audit logging, self-service GDPR data export and erasure, EU AI Act provenance badges, fail-closed security screening, per-user rate limiters, and collection count quotas.  
+    — *Implemented in [`tests/compliance.py`](tests/compliance.py) & [`tests/helpers.py`](tests/helpers.py)*
+  - **Observability & AI Telemetry Unit Tests:** Verifies structured JSON log formatting, automatic scrubbing of raw user questions from logs, request and trace correlation, per-stage execution timing spans, time-to-first-token tracking, multi-step AI token counting, and grounding quality scores.  
+    — *Implemented in [`tests/observability.py`](tests/observability.py) & [`tests/helpers.py`](tests/helpers.py)*
+  - **Scalability & Resource Efficiency Unit Tests:** Verifies route isolation between the ingestion and agent services, Cloud Run concurrency and resource settings, private subnet IP capacity, memory-pressure cache eviction, parallel privacy screening threads, and Cloud Monitoring scaling alerts.  
+    — *Implemented in [`tests/scalability_elasticity.py`](tests/scalability_elasticity.py) & [`tests/helpers.py`](tests/helpers.py)*
+  - **Multi-Tenant API Integration Test Suite:** Exercises the full ingestion and agent microservices end-to-end across multi-user PDF uploads, Cloud Storage archiving, similarity searches, collection management, GDPR data erasure, and live Server-Sent Events chat streaming—confirming that two concurrent users (Alice and Bob) remain completely isolated even when using identical collection and thread names.  
+    — *Implemented in [`tests/multi_tenant_api.py`](tests/multi_tenant_api.py) & [`tests/helpers.py`](tests/helpers.py)*
+  - **Live End-to-End Ingestion & Search Smoke Test:** Runs against a locally running ingestion service using real sample PDF documents, local ChromaDB storage, and live Google Cloud Vertex AI embedding generation to verify document upload and similarity search end-to-end.  
+    — *Implemented in [`tests/ingestion.py`](tests/ingestion.py)*
+  - **Live End-to-End Agent & Streaming Smoke Test:** Runs against a locally running agent service using live Vertex AI Gemini tool-calling to verify both standard JSON chat responses and real-time Server-Sent Events streaming.  
+    — *Implemented in [`tests/agent.py`](tests/agent.py)*
 
-- **4.2 Pillar 2 — Interface Contracts**
-  - **Strict Pydantic Request/Response & LangGraph State Schemas:** Every API and workflow boundary is governed by explicit typed contracts—including [`IngestRequest`](src/ingest/schemas.py), [`QueryRequest`](src/query/schemas.py), [`AgentRequest`](src/agent/schemas.py), [`AgentResponse`](src/agent/schemas.py), [`ProvenanceMetadata`](src/agent/schemas.py), [`AgentState`](src/agent/schemas.py) (`TypedDict`), [`AuthenticatedUser`](src/core/auth.py), and [`ArmorDecision`](src/core/ai_security/armor.py)—enforcing input validation (`HTTP 422`) before business logic executes.  
-    — *Implemented in [`src/ingest/schemas.py`](src/ingest/schemas.py), [`src/query/schemas.py`](src/query/schemas.py), [`src/agent/schemas.py`](src/agent/schemas.py), [`src/core/auth.py`](src/core/auth.py) & [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*
-  - **LangChain `Embeddings`, `BaseMessage` & `StructuredTool` Abstractions:** Storage, retrieval, and agent modules program against standard LangChain interfaces (`Embeddings`, `Document`, `BaseMessage`, `StructuredTool`), allowing [`similarity_search_with_scores()`](src/core/storage/chroma.py) to support both full Chroma hybrid RRF search and lightweight retriever-compatible implementations.  
-    — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py), [`src/agent/tools.py`](src/agent/tools.py) & [`src/agent/graph.py`](src/agent/graph.py)*
+- **3.2 Pillar 2 — Test & Policy Gate Automation**
+  - **Offline Static Security & Infrastructure Policy Gate:** Automatically inspects Terraform files and Python configuration defaults before deployment to verify single-region settings, fail-closed AI safety screening, Cloud Run concurrency and deletion protection, private subnet sizing, and observability sinks and alerts.  
+    — *Implemented in [`infra/scripts/check_static_policies.py`](infra/scripts/check_static_policies.py) & [`Makefile`](Makefile)*
+  - **Live Google Cloud Organization Policy Gate:** Queries the active Google Cloud Resource Location Restriction policy on the target project before any plan or deployment to confirm that an explicit regional allowlist exists and permits the configured deployment region.  
+    — *Implemented in [`infra/scripts/check_region_policy.py`](infra/scripts/check_region_policy.py) & [`Makefile`](Makefile)*
+  - **Automated Terraform Syntax & Schema Gate:** Runs Terraform configuration validation automatically as part of the pre-deployment policy check before any infrastructure changes are planned or applied.  
+    — *Implemented in [`Makefile`](Makefile) & [`infra/cloudbuild/run-terraform.yaml`](infra/cloudbuild/run-terraform.yaml)*
+  - **Synthetic Policy Violation Mutation Testing:** The test suite creates temporary copies of the repository and injects deliberate misconfigurations (such as global regions, disabled fail-closed screening, missing deletion protection, or undersized subnets) to prove that the automated policy gates reliably catch regressions.  
+    — *Implemented in [`tests/helpers.py`](tests/helpers.py), [`tests/compliance.py`](tests/compliance.py) & [`tests/scalability_elasticity.py`](tests/scalability_elasticity.py)*
 
-- **4.3 Pillar 3 — Model Swappability**
-  - **Dynamic Per-Request Generative LLM Swappability:** Users and API callers can switch between any approved Vertex AI generative model in `ALLOWED_LLM_MODELS` (`gemini-2.5-flash`, `gemini-2.5-pro`, or `gemini-2.5-flash-lite`) on a per-request basis (`model_name` in `POST /agent` and `POST /agent/stream`) or expand the catalog via environment configuration without changing code.  
-    — *Implemented in [`src/core/config.py`](src/core/config.py), [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py) & [`src/agent/graph.py`](src/agent/graph.py)*  
-    — *Called in [`src/agent/schemas.py`](src/agent/schemas.py), [`src/agent/routes.py`](src/agent/routes.py) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*
-  - **Per-Collection Embedding Model Swappability with Automatic Resolution:** Users can choose any approved Vertex AI embedding model in `ALLOWED_EMBEDDING_MODELS` (`gemini-embedding-001`, `text-embedding-004`, or `text-embedding-005`) when creating a collection (`POST /ingest`). The selected model is persisted in ChromaDB collection metadata and automatically resolved via [`resolve_collection_embedding_model()`](src/core/storage/chroma.py) across all subsequent uploads, `/query` searches, and `/agent` retriever calls.  
-    — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py) & [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
-    — *Called in [`src/ingest/service.py`](src/ingest/service.py), [`src/query/service.py`](src/query/service.py), [`src/agent/tools.py`](src/agent/tools.py) & [`src/manage/collections.py`](src/manage/collections.py)*
+- **3.3 Pillar 3 — Test Coverage Across Architectural Layers**
+  - **1-to-1 Architectural Layer & Pillar Verification:** Every backend package (`src/core`, `src/ingest`, `src/manage`, `src/query`, `src/agent`) and Terraform infrastructure module (`infra/terraform/*.tf`) is paired with dedicated positive and negative tests covering normal operation, invalid inputs, security blocks, and failure recovery.  
+    — *Implemented in [`tests/auth.py`](tests/auth.py), [`tests/storage.py`](tests/storage.py), [`tests/multi_tenant_api.py`](tests/multi_tenant_api.py), [`tests/ai_security.py`](tests/ai_security.py), [`tests/compliance.py`](tests/compliance.py), [`tests/observability.py`](tests/observability.py) & [`tests/scalability_elasticity.py`](tests/scalability_elasticity.py)*
 
-- **4.4 Pillar 4 — Dependency Injection**
-  - **FastAPI `Depends()` Request-Scoped Injection:** Authentication verification, tenant UID resolution, and multipart PDF upload validation are injected into route handlers via FastAPI `Depends(get_current_user)`, `Depends(get_current_user_info)`, and `Depends(parse_ingest_payload)`.  
-    — *Implemented in [`src/core/auth.py`](src/core/auth.py) & [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py)*  
-    — *Called in [`src/ingest/routes.py`](src/ingest/routes.py), [`src/query/routes.py`](src/query/routes.py), [`src/agent/routes.py`](src/agent/routes.py), [`src/manage/collections.py`](src/manage/collections.py) & [`src/manage/compliance.py`](src/manage/compliance.py)*
-  - **Factory & Collaborator Injection for Offline Test Doubles:** Core constructors—including `create_app(..., routers=...)`, `build_agent(retriever_tool, model_name=..., checkpointer=...)`, and modular client factories (`get_embeddings`, `get_storage_client`, `ChatGoogleGenerativeAI`)—accept injected collaborators or factory overrides so the offline test suite ([`tests/helpers.py`](tests/helpers.py)) can substitute `FakeGCSBucket`, `DeterministicFakeEmbeddings`, and `GroundedCitingChatModel` deterministically.  
-    — *Implemented in [`src/core/app_factory.py`](src/core/app_factory.py), [`src/agent/graph.py`](src/agent/graph.py), [`src/core/storage/chroma.py`](src/core/storage/chroma.py), [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py) & [`tests/helpers.py`](tests/helpers.py)*
-
-> **Note on Unimplemented / Non-Relevant Pillars:**
-> - **Multi-Cloud LLM / External Vector Database Adapter Plugins (*Not Implemented — Not Relevant*):** Swapping to non-GCP LLM providers or external vector database servers is not relevant to this project's architecture, which is specifically designed around single-region Google Cloud residency (**Vertex AI** accessed over Private Google Access) and serverless per-tenant **ChromaDB** snapshots synchronized with **Google Cloud Storage**.
+> **Note on Unimplemented Pillars:**
+> - **Automated Load & Performance Benchmarking, Browser UI E2E Tests & Code-Coverage Threshold Gates (*Not Implemented — Relevant*):** While our test suite verifies concurrency ceilings, parallel privacy screening worker pools, and memory eviction logic, a dedicated load-testing tool (such as Locust or k6 stress-testing concurrent PDF uploads and chat streams against live Cloud Run instances), automated browser UI tests (such as Playwright or Cypress for the React dashboard), and automated code-coverage percentage gates in CI are not yet implemented and remain relevant future enhancements.
 
 ---
 
-### 5. Configuration Management ([`docs/GCP_DEPLOYMENT_PLAN.md`](docs/GCP_DEPLOYMENT_PLAN.md))
+## III/ [DESIGNING FOR CHANGE]
+
+### 1. Configuration Management
 
 All runtime, security, scaling, and frontend settings are externalized from application code and automatically adapt across local development and cloud environments:
 
-- **5.1 Pillar 1 — Externalized Configuration**
-  - **Single-Source-of-Truth Backend Config (`src/core/config.py`):** All runtime parameters—GCP project and single-region location (`GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`), approved model catalogs (`ALLOWED_LLM_MODELS`, `ALLOWED_EMBEDDING_MODELS`), upload and retrieval guardrails (`MAX_UPLOAD_MB`, `MAX_FILES_PER_REQUEST`, `MAX_CHUNKS_PER_INGEST`, `MAX_QUERY_CHARS`, `AGENT_RECURSION_LIMIT`), security templates (`MODEL_ARMOR_TEMPLATE_ID`, `GEMINI_SAFETY_THRESHOLD`), per-user rate limits and collection quotas (`RATE_LIMIT_INGEST_PER_MINUTE`, `RATE_LIMIT_QUERY_PER_MINUTE`, `MAX_COLLECTIONS_PER_USER`), and `/tmp` cache eviction bounds (`CHROMA_TMP_MAX_BYTES`, `CHROMA_TMP_MIN_FREE_BYTES`, `CHROMA_LOCK_TTL_SECONDS`, `CHROMA_LOCK_TIMEOUT_SECONDS`)—are externalized into environment variables accessed via typed, validated getters in [`src/core/config.py`](src/core/config.py).  
+- **1.1 Pillar 1 — Externalized Configuration**
+  - **Centralized Backend Configuration Module:** All backend settings—including Google Cloud project and region, approved chat and embedding model lists, upload size and chunk limits, AI safety templates, per-user rate limits, collection quotas, and local memory cache caps—are loaded from environment variables through a single validated configuration module rather than hardcoded across files.  
     — *Implemented in [`src/core/config.py`](src/core/config.py)*
-  - **Parameterized Terraform Infrastructure Config (`infra/terraform/variables.tf`):** Over 40 validated Terraform input variables (with a documented template in [`infra/terraform/terraform.tfvars.example`](infra/terraform/terraform.tfvars.example)) externalize per-service CPU/memory limits, concurrency ceilings, min/max instance bounds, VPC subnet CIDRs, log retention windows, and alert thresholds, and wire them directly into the Cloud Run container definitions in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf).  
+  - **Parameterized Terraform Infrastructure Configuration:** Over 40 validated Terraform input variables (with a documented example template) control per-service CPU and memory limits, concurrency ceilings, minimum and maximum container counts, private subnet ranges, log retention windows, and alert thresholds without editing infrastructure code.  
     — *Provisioned in [`infra/terraform/variables.tf`](infra/terraform/variables.tf), [`infra/terraform/terraform.tfvars.example`](infra/terraform/terraform.tfvars.example) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
-  - **Build-Once Frontend with Startup Runtime Configuration (`/env-config.js`):** Single-page web apps normally bake API URLs and Firebase keys into static JavaScript files during `docker build`, which happens *before* Terraform has provisioned the Load Balancer or generated the project's Firebase Web API key. When the `frontend` container starts on Cloud Run, [`infra/docker/entrypoint-frontend.sh`](infra/docker/entrypoint-frontend.sh) reads the environment variables injected by Terraform (`INGESTION_API_URL`, `AGENT_API_URL`, Firebase auth settings, `ALLOWED_LLM_MODELS`, and `ALLOWED_EMBEDDING_MODELS`) and writes `/usr/share/nginx/html/env-config.js`, which the browser loads before starting React (falling back to the root `.env` via [`frontend/vite.config.js`](frontend/vite.config.js) during local development).  
+  - **Startup Runtime Configuration for the Web Frontend:** Single-page web apps normally bake backend URLs and authentication keys into static JavaScript files at image build time—before cloud resources even exist. Instead, when the frontend container starts on Cloud Run, a startup script reads the environment variables injected by Terraform and writes a runtime configuration file (`/env-config.js`) that the browser loads before starting React.  
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
     — *Implemented in [`infra/docker/entrypoint-frontend.sh`](infra/docker/entrypoint-frontend.sh) & [`frontend/vite.config.js`](frontend/vite.config.js)*  
     — *Called in [`frontend/index.html`](frontend/index.html) & [`frontend/src/firebase.js`](frontend/src/firebase.js)*
 
-- **5.2 Pillar 2 — Environment Separation**
-  - **Automatic Cloud Run vs. Local Runtime Separation (`is_cloud_run()`):** [`src/core/config.py`](src/core/config.py) detects Cloud Run execution via `K_SERVICE` / `K_REVISION` (`is_cloud_run()`) to enforce strict separation between local developer convenience and cloud production security:
-    - **Cloud Run Hardening (`K_SERVICE` set):** Hard-disables `AUTH_DISABLED=true` in [`is_auth_bypassed()`](src/core/auth.py), blocks local server-path PDF ingestion (`pdf_paths`) with `HTTP 403` in [`src/ingest/routes.py`](src/ingest/routes.py), fails closed (`[]`) on missing `ALLOWED_ORIGINS`, enables `/tmp/chroma_db/{uid}` $\leftrightarrow$ Cloud Storage synchronization, and defaults to structured GCP JSON logging and Cloud Trace export.
-    - **Local Development (`K_SERVICE` unset):** Loads `.env`, permits `AUTH_DISABLED=true` with `DEV_USER_ID` / `X-Dev-User-Id`, allows localhost CORS origins (`http://localhost:3000`, `http://localhost:5173`), persists ChromaDB directly to local disk when `GCS_BUCKET_NAME` is unset, and formats human-readable console logs.  
+- **1.2 Pillar 2 — Environment Separation**
+  - **Automatic Cloud Production Hardening:** When running on Google Cloud Run, the backend automatically disables local authentication bypasses, rejects requests that reference local server file paths, requires explicit CORS origin allowlists, synchronizes vector databases with Cloud Storage, and enables structured JSON logging and Cloud Trace export.  
     — *Implemented in [`src/core/config.py`](src/core/config.py), [`src/core/auth.py`](src/core/auth.py), [`src/ingest/routes.py`](src/ingest/routes.py), [`src/core/storage/paths.py`](src/core/storage/paths.py) & [`src/core/observability/logging.py`](src/core/observability/logging.py)*
-  - **Isolated Per-Environment Cloud State & Resource Naming (`var.environment`):** Terraform separates `dev`, `staging`, and `prod` stacks via `var.environment`—isolating GCS state prefixes (`$(APP_NAME)/$(ENV)/state`), suffixing all GCP resource names (`-${var.environment}`), and gating production deletion protection (`deletion_protection = var.environment == "prod"`).  
+  - **Developer-Friendly Local Execution Mode:** When running on a developer's laptop, the backend loads local `.env` settings, supports an optional local test-user bypass, permits localhost browser origins, stores vector collections directly on local disk when no Cloud Storage bucket is configured, and prints readable color-coded terminal logs.  
+    — *Implemented in [`src/core/config.py`](src/core/config.py), [`src/core/auth.py`](src/core/auth.py), [`src/core/storage/paths.py`](src/core/storage/paths.py) & [`src/core/observability/logging.py`](src/core/observability/logging.py)*
+  - **Isolated Per-Environment Cloud State & Resource Naming:** Terraform separates development, staging, and production environments using an environment identifier that isolates remote state folders, suffixes every cloud resource name, and enables production-only safeguards such as deletion protection.  
     — *Provisioned in [`infra/terraform/variables.tf`](infra/terraform/variables.tf), [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/storage.tf`](infra/terraform/storage.tf)*  
     — *Called in [`Makefile`](Makefile)*
 
-- **5.3 Pillar 3 — Feature Flags**
-  - **Runtime & Infrastructure Feature Toggles (`parse_bool_env` & Terraform Booleans):** Security, storage, observability, and developer capabilities are controlled via boolean feature flags parsed by [`parse_bool_env()`](src/core/config.py) and Terraform boolean variables:
-    - `MODEL_ARMOR_FAIL_CLOSED` / `var.model_armor_fail_closed` — Controls fail-closed (`HTTP 503`) vs. fail-open screening when Model Armor or Cloud DLP is unavailable (enforced as `true` in Cloud Run by [`infra/scripts/check_static_policies.py`](infra/scripts/check_static_policies.py)).
-    - `ARCHIVE_UPLOADS_TO_GCS` / `var.archive_uploads_to_gcs` — Toggles archiving original uploaded PDFs to `gs://<bucket>/users/{uid}/uploads/`.
-    - `AUDIT_CLOUD_LOGGING_ENABLED` & `TELEMETRY_CLOUD_LOGGING_ENABLED` — Toggle shipping structured audit and telemetry records to Google Cloud Logging (auto-disabled during `unittest`/`pytest` runs).
-    - `STRUCTURED_LOGGING` & `CLOUD_TRACE_ENABLED` — Toggle single-line GCP JSON log formatting and Cloud Trace waterfall export.
-    - `AUTH_DISABLED`, `AGENT_CONSOLE_TRACE` & `UVICORN_RELOAD` — Local development toggles for auth bypass, Rich terminal trace panels, and hot reload.
-    - `var.enable_google_oauth` & `var.audit_log_bucket_locked` — Terraform feature flags toggling Google OAuth 2.0 federated sign-in and WORM retention lock on the compliance audit log bucket.  
-    — *Provisioned in [`infra/terraform/variables.tf`](infra/terraform/variables.tf), [`infra/terraform/auth.tf`](infra/terraform/auth.tf), [`infra/terraform/compliance.tf`](infra/terraform/compliance.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
-    — *Implemented in [`src/core/config.py`](src/core/config.py)*
+- **1.3 Pillar 3 — Feature Flags**
+  - **Fail-Closed AI Safety Screening Toggle:** Controls whether the backend blocks requests (`HTTP 503`) or degrades open when Model Armor or Cloud DLP is unreachable (strictly enforced as fail-closed in cloud deployments, while toggleable for offline local development).  
+    — *Provisioned in [`infra/terraform/variables.tf`](infra/terraform/variables.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
+    — *Implemented in [`src/core/config.py`](src/core/config.py) & [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*
+  - **Uploaded PDF Cloud Storage Archiving Toggle:** Controls whether original uploaded PDF files are archived to the user's private Cloud Storage folder alongside their indexed vector database snapshot.  
+    — *Provisioned in [`infra/terraform/variables.tf`](infra/terraform/variables.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
+    — *Implemented in [`src/core/config.py`](src/core/config.py) & [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py)*
+  - **Cloud Audit & Telemetry Export Toggles:** Independently enable or disable shipping structured audit records and AI performance telemetry to Google Cloud Logging (and automatically disable remote log shipping during unit test runs).  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
+    — *Implemented in [`src/core/config.py`](src/core/config.py), [`src/core/compliance/audit.py`](src/core/compliance/audit.py) & [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*
+  - **Structured JSON Logging & Cloud Trace Toggles:** Independently control single-line JSON log formatting and distributed execution span export to Google Cloud Trace.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
+    — *Implemented in [`src/core/config.py`](src/core/config.py), [`src/core/observability/logging.py`](src/core/observability/logging.py) & [`src/core/observability/tracing.py`](src/core/observability/tracing.py)*
+  - **Local Developer Convenience Toggles:** Enable local authentication bypass, rich terminal agent trace panels, and automatic server hot-reload during local development.  
+    — *Implemented in [`src/core/config.py`](src/core/config.py), [`src/core/auth.py`](src/core/auth.py) & [`src/agent/routes.py`](src/agent/routes.py)*
+  - **Google OAuth & Immutable Audit Lock Infrastructure Toggles:** Terraform feature flags control whether federated Google Sign-In is enabled on Identity Platform and whether a permanent Write-Once-Read-Many (WORM) retention lock is placed on the 365-day compliance audit log bucket.  
+    — *Provisioned in [`infra/terraform/variables.tf`](infra/terraform/variables.tf), [`infra/terraform/auth.tf`](infra/terraform/auth.tf) & [`infra/terraform/compliance.tf`](infra/terraform/compliance.tf)*
 
 > **Note on Unimplemented Pillars:**
-> - **Dynamic Remote Feature-Flag Evaluation Service (*Not Implemented — Relevant*):** Feature flags are currently evaluated from environment variables injected into Cloud Run revisions (requiring a revision update to toggle in production). Integrating a dynamic remote feature-flag service (such as Firebase Remote Config or OpenFeature for live per-tenant or percentage-based feature rollouts without container redeployment) is not yet implemented and is a relevant future enhancement.
+> - **Dynamic Remote Feature-Flag Evaluation Service (*Not Implemented — Relevant*):** Feature flags are currently evaluated from environment variables injected into Cloud Run revisions (requiring a revision update to toggle in production). Integrating a dynamic remote feature-flag service (such as Firebase Remote Config or OpenFeature for live per-tenant or percentage-based rollouts without redeploying containers) is not yet implemented and is a relevant future enhancement.
 
 ---
 
-### 6. Authentication & Authorization ([`docs/GCP_DEPLOYMENT_PLAN.md`](docs/GCP_DEPLOYMENT_PLAN.md))
+### 2. Modularity & Abstraction
 
-Identity and access controls follow a zero-trust model across both cloud infrastructure (dedicated service accounts, scoped IAM, and least privilege) and application requests (Identity Platform OAuth/OIDC tokens and claims-derived tenant isolation):
+The backend is architected around clean package boundaries, typed schema contracts, swappable AI models, and dependency injection so domain logic, security guardrails, and infrastructure adapters evolve independently:
 
-- **6.1 Pillar 1 — Dedicated Service Accounts**
-  - **Separated Runtime, Frontend & CI/CD Identities:** Rather than relying on the default Compute Engine service account (which typically carries broad `roles/editor` access), the platform isolates machine identities across dedicated service accounts:
-    1. **Backend Runtime Service Account (`<app>-be-<env>`):** Attached to `ingest-api` and `agent-api` Cloud Run services.
-    2. **Frontend Runtime Service Account (`<app>-fe-<env>`):** Attached to the static `frontend` Nginx Cloud Run service.
-    3. **Cloud Build & Terraform Deployer Service Account (`<app>-deployer`):** Created by `make ensure-deployer-sa` in [`Makefile`](Makefile) for executing Cloud Build image builds and remote Terraform runs.
-    4. **Model Armor Managed Service Agent (`google_project_service_identity.modelarmor_sa`):** Provisioned to allow regional Model Armor templates to invoke Cloud DLP inspection and de-identification templates on the backend's behalf.  
-    — *Provisioned in [`infra/terraform/iam.tf`](infra/terraform/iam.tf), [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf), [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`Makefile`](Makefile)*
+- **2.1 Pillar 1 — Loose Coupling**
+  - **Shared Platform Core Package (`src/core`):** Centralizes cross-cutting platform capabilities—authentication, configuration, Cloud Storage synchronization, AI security guardrails, regulatory compliance, and observability—so domain packages never duplicate infrastructure logic.  
+    — *Implemented in [`src/core/`](src/core/)*
+  - **Dedicated Document Ingestion Package (`src/ingest`):** Encapsulates multipart PDF upload staging, page-by-page extraction, overlapping text chunking, and batched ChromaDB indexing without importing search or chat routes.  
+    — *Implemented in [`src/ingest/`](src/ingest/)*
+  - **Dedicated Collection & Privacy Management Package (`src/manage`):** Encapsulates vector collection listing, collection deletion, and self-service GDPR data inventory and erasure endpoints.  
+    — *Implemented in [`src/manage/`](src/manage/)*
+  - **Dedicated Direct Search Package (`src/query`):** Encapsulates hybrid semantic and keyword similarity search with parallel sensitive-data redaction.  
+    — *Implemented in [`src/query/`](src/query/)*
+  - **Dedicated Conversational Agent Package (`src/agent`):** Encapsulates the stateful LangGraph workflow, dynamic search tool construction, multi-turn conversation memory, and real-time Server-Sent Events streaming.  
+    — *Implemented in [`src/agent/`](src/agent/)*
+  - **Composable Microservice Application Factory:** A shared FastAPI application factory configures CORS headers, request correlation middleware, and health check endpoints in one place, allowing `ingest-api` and `agent-api` to assemble independent microservices simply by registering their respective routers.  
+    — *Implemented in [`src/core/app_factory.py`](src/core/app_factory.py), [`src/ingest/app.py`](src/ingest/app.py) & [`src/agent/app.py`](src/agent/app.py)*
+  - **Decoupled Request Context Propagation:** Request correlation IDs, trace spans, compliance guardrail flags, and AI telemetry metrics travel across modules through thread-safe context variables rather than passing logging or audit objects into every domain function.  
+    — *Implemented in [`src/core/context.py`](src/core/context.py), [`src/core/compliance/state.py`](src/core/compliance/state.py) & [`src/core/observability/state.py`](src/core/observability/state.py)*
 
-- **6.2 Pillar 2 — Identity & Access Management (IAM)**
-  - **Explicit Declarative IAM Bindings & Uniform Bucket Access:** All permissions are managed declaratively via `google_project_iam_member` and `google_storage_bucket_iam_member` resources in [`infra/terraform/iam.tf`](infra/terraform/iam.tf) and [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf). The Cloud Storage persistence bucket enforces `uniform_bucket_level_access = true` and `public_access_prevention = "enforced"` so legacy per-object ACLs are disabled and access is governed exclusively by IAM.  
-    — *Provisioned in [`infra/terraform/iam.tf`](infra/terraform/iam.tf), [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf) & [`infra/terraform/storage.tf`](infra/terraform/storage.tf)*
+- **2.2 Pillar 2 — Interface Contracts**
+  - **Strict Request & Response Validation Schemas:** Every API endpoint and agent state transition is governed by explicit Pydantic and typed data schemas—validating collection names, query lengths, model choices, and compliance metadata upfront and rejecting malformed payloads (`HTTP 422`) before business logic runs.  
+    — *Implemented in [`src/ingest/schemas.py`](src/ingest/schemas.py), [`src/query/schemas.py`](src/query/schemas.py), [`src/agent/schemas.py`](src/agent/schemas.py), [`src/core/auth.py`](src/core/auth.py) & [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*
+  - **Standardized AI, Embedding & Retriever Interfaces:** Storage, search, and agent modules program against standard LangChain document, embedding, message, and tool interfaces so the retrieval engine works seamlessly with both full ChromaDB hybrid search and lightweight test implementations.  
+    — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py), [`src/agent/tools.py`](src/agent/tools.py) & [`src/agent/graph.py`](src/agent/graph.py)*
 
-- **6.3 Pillar 3 — Principle of Least Privilege**
-  - **Zero-Privilege Frontend & Bucket-Scoped Backend IAM:**
-    - `frontend_sa` is intentionally granted **zero IAM roles** because the Nginx container only serves static assets and `/env-config.js` and never calls Google Cloud APIs.
-    - `backend_sa` is granted `roles/storage.objectUser` **strictly at the bucket level** on `google_storage_bucket.chroma_persistence` (never at the project level), preventing backend containers from accessing any other bucket in the project (such as the Terraform state bucket). Its project-level roles are limited to `roles/aiplatform.user`, `roles/modelarmor.user`, `roles/dlp.user`, `roles/logging.logWriter`, `roles/monitoring.metricWriter`, and `roles/cloudtrace.agent`.
-    - `TF_DEPLOYER_SA` is granted only the resource-admin roles required to deploy the stack and is intentionally denied `roles/orgpolicy.policyAdmin` (Separation of Duties: the deployer can read effective Organization Policies via [`infra/scripts/check_region_policy.py`](infra/scripts/check_region_policy.py) but can never weaken or modify them).
-    - Inside the container, [`infra/docker/Dockerfile.backend`](infra/docker/Dockerfile.backend) drops root privileges and executes Uvicorn as an unprivileged user (`appuser`, UID `10001`).  
-    — *Provisioned in [`infra/terraform/iam.tf`](infra/terraform/iam.tf) & [`Makefile`](Makefile)*  
+- **2.3 Pillar 3 — Model Swappability**
+  - **Dynamic Per-Request Chat Model Switching:** Users and API callers can switch between any approved Vertex AI generative model (`gemini-2.5-flash`, `gemini-2.5-pro`, or `gemini-2.5-flash-lite`) on individual chat requests or expand the approved model catalog via environment variables without changing application code.  
+    — *Implemented in [`src/core/config.py`](src/core/config.py), [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py) & [`src/agent/graph.py`](src/agent/graph.py)*  
+    — *Called in [`src/agent/schemas.py`](src/agent/schemas.py), [`src/agent/routes.py`](src/agent/routes.py) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*
+  - **Per-Collection Embedding Model Selection & Automatic Resolution:** Users can select any approved Vertex AI embedding model (`gemini-embedding-001`, `text-embedding-004`, or `text-embedding-005`) when creating a new collection. The chosen model is stored in the collection's metadata and resolved automatically on all future uploads, direct searches, and agent queries.  
+    — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py) & [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
+    — *Called in [`src/ingest/service.py`](src/ingest/service.py), [`src/query/service.py`](src/query/service.py), [`src/agent/tools.py`](src/agent/tools.py) & [`src/manage/collections.py`](src/manage/collections.py)*
+
+- **2.4 Pillar 4 — Dependency Injection**
+  - **Request-Scoped Authentication Injection:** Token verification and user identity extraction are injected into FastAPI route handlers as declarative request dependencies rather than called manually inside endpoint bodies.  
+    — *Implemented in [`src/core/auth.py`](src/core/auth.py)*  
+    — *Called in [`src/ingest/routes.py`](src/ingest/routes.py), [`src/query/routes.py`](src/query/routes.py), [`src/agent/routes.py`](src/agent/routes.py), [`src/manage/collections.py`](src/manage/collections.py) & [`src/manage/compliance.py`](src/manage/compliance.py)*
+  - **Pluggable Service Factories for Offline Testing:** Core builders—including the FastAPI app factory, the LangGraph agent builder, the sliding-window rate limiter, and cloud storage and AI client factories—accept injected dependencies so the test suite can substitute deterministic in-memory fakes for Cloud Storage, Vertex AI embeddings, Gemini chat models, and Model Armor completely offline.  
+    — *Implemented in [`src/core/app_factory.py`](src/core/app_factory.py), [`src/agent/graph.py`](src/agent/graph.py), [`src/core/compliance/policy.py`](src/core/compliance/policy.py), [`src/core/storage/chroma.py`](src/core/storage/chroma.py), [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py) & [`tests/helpers.py`](tests/helpers.py)*
+
+> **Note on Unimplemented / Non-Relevant Pillars:**
+> - **Multi-Cloud LLM / External Vector Database Adapter Plugins (*Not Implemented — Not Relevant*):** Swapping to non-GCP language model providers or external vector database servers is not relevant to this project's architecture, which is specifically designed around single-region Google Cloud data residency (**Vertex AI** accessed over Private Google Access) and serverless per-tenant **ChromaDB** snapshots synchronized with **Google Cloud Storage**.
+
+---
+
+## IV/ [PERFORMANCE & COST OPTIMIZATION]
+
+> *Splitting Performance & Cost Optimization into two dedicated layers—**1. Scalability & Elasticity** (how the platform isolates workloads, scales horizontally, parallelizes I/O, and monitors capacity) and **2. Resource Efficiency** (how the platform right-sizes compute, scales to zero, reuses warm caches, bounds RAM usage, and minimizes storage/token overhead)—separates capacity scaling concerns from cost and resource optimization.*
+
+### 1. Scalability & Elasticity
+
+InteractiveRAG isolates heavy document indexing from low-latency user queries and scales horizontally on demand across dedicated serverless instances and private `/24` subnets:
+
+- **1.1 Pillar 1 — Workload-Isolated Microservice Packaging (4 Packages Across 2 Backend Services)**
+  - **Dedicated Heavy-Write Ingestion Service (`ingest-api`):** Runs only the document ingestion package (`POST /ingest`) on dedicated instances so CPU-intensive PDF parsing, text chunking, and vector index building never compete with or slow down live user chats.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
+    — *Implemented in [`src/ingest/routes.py`](src/ingest/routes.py)*  
+    — *Called in [`src/ingest/app.py`](src/ingest/app.py)*
+  - **Unified Interactive Read, Management & Agent Service (`agent-api`):** Co-locates collection management (`src/manage`), direct similarity search (`src/query`), and multi-turn agent chat (`src/agent`) on a single interactive service so searches and follow-up chat turns share the same warm local vector cache, unified query rate limiter, and atomic GDPR data erasure workflow.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
+    — *Implemented in [`src/agent/routes.py`](src/agent/routes.py), [`src/query/routes.py`](src/query/routes.py) & [`src/manage/routes.py`](src/manage/routes.py)*  
+    — *Called in [`src/agent/app.py`](src/agent/app.py)*
+
+- **1.2 Pillar 2 — Horizontal Autoscaling, Concurrency Tuning & VPC Subnet Headroom**
+  - **Workload-Tuned Per-Container Concurrency Limits:** Each Cloud Run service enforces a per-container request concurrency ceiling matched to its workload—limiting `ingest-api` to 4 concurrent uploads per container to prevent CPU contention during PDF parsing, allowing 32 concurrent interactive requests per container on `agent-api` (where requests spend most of their time waiting on external AI and privacy API calls), and allowing 80 concurrent requests on the static `frontend`.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*
+  - **Service-Specific Horizontal Autoscaling Ceilings:** Cloud Run automatically adds or removes container instances based on incoming traffic up to service-specific caps—capping `ingest-api` at 5 instances (20 concurrent PDF uploads) to protect downstream Vertex AI embedding and Cloud DLP quotas, while scaling `agent-api` up to 10 instances (320 concurrent interactive requests) and `frontend` up to 5 instances (400 concurrent requests).  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*
+  - **Expanded `/24` Private VPC Subnets for Scale-Out Headroom:** Both private backend subnets (`ingest-subnet` and `agent-subnet`) are sized as `/24` CIDR blocks (251 usable IP addresses each), ensuring serverless Cloud Run Direct VPC Egress never runs out of private IP addresses during traffic spikes or revision rollouts.  
+    — *Provisioned in [`infra/terraform/network.tf`](infra/terraform/network.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*  
+    — *Called in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
+
+- **1.3 Pillar 3 — Parallel Retrieval-Time Throughput**
+  - **Multi-Threaded Retrieval Privacy Screening:** When a similarity search or agent tool call retrieves top-$k$ document chunks from ChromaDB, all retrieved chunks are screened for sensitive personal data concurrently across a bounded pool of up to 8 worker threads (1 chunk per thread) instead of scanning them one by one—keeping privacy screening latency near the duration of a single chunk scan even as $k$ increases.  
+    — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
+    — *Called in [`src/query/service.py`](src/query/service.py) & [`src/agent/tools.py`](src/agent/tools.py)*
+
+- **1.4 Pillar 4 — Infrastructure Scaling Observability & Automated Alerting**
+  - **Infrastructure Scaling & Utilization Dashboard Panels:** The Cloud Monitoring dashboard includes dedicated scaling panels charting active vs. idle container instance counts, 95th-percentile concurrent requests per instance, container CPU utilization, and container memory utilization across all services.  
+    — *Provisioned in [`infra/terraform/observability.tf`](infra/terraform/observability.tf)*
+  - **Automated Tail-Latency, Memory Saturation & Error Alerts:** Cloud Monitoring alert policies automatically notify operators whenever 95th-percentile agent response latency exceeds 15 seconds over 5 minutes, container memory utilization exceeds 85% over 3 minutes, or server 5xx error rates exceed 0.05 requests per second over 2 minutes.  
+    — *Provisioned in [`infra/terraform/observability.tf`](infra/terraform/observability.tf)*
+
+---
+
+### 2. Resource Efficiency
+
+Compute, memory, storage, network bandwidth, and AI token consumption are optimized so idle infrastructure costs $0 while active workloads minimize redundant data transfers and LLM calls:
+
+- **2.1 Pillar 1 — Compute Right-Sizing & Scale-to-Zero Billing**
+  - **Right-Sized CPU & Memory per Service:** Rather than over-provisioning every container for peak PDF parsing memory, compute resources are tailored to each service—allocating 2 vCPU and 4 GiB of RAM to `ingest-api` (for PDF extraction, batch embeddings, and vector index writes), 2 vCPU and 2 GiB of RAM to `agent-api` (for I/O-bound agent streaming and local vector cache reads), and 1 vCPU and 512 MiB of RAM to `frontend`.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*
+  - **Scale-to-Zero Idle Instance Elimination:** All three Cloud Run services are configured with a minimum instance count of zero so container instances spin down completely when no users are active, eliminating idle compute charges.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*
+  - **Request-Scoped CPU Billing:** Cloud Run CPU throttling is enabled on all services so CPU is allocated and billed only while a container is actively processing an HTTP request or open chat stream.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*
+  - **Temporary Cold-Start CPU Boost:** Cloud Run startup CPU boost is enabled on all services, temporarily allocating extra CPU power during container initialization to speed up Python and LangChain startup times without paying for permanently larger CPUs.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*
+
+- **2.2 Pillar 2 — Session Affinity & Warm In-Memory Cache Reuse**
+  - **Session Affinity for Multi-Turn Conversations:** Cloud Run session affinity is enabled on `agent-api` so consecutive requests from the same user are routed to the same warm container instance whenever possible, reusing the user's in-memory conversation history and cached local vector database.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
+  - **Version-Checked Snapshot Downloads:** Before downloading any vector database files from Cloud Storage, the backend checks the user's lightweight remote version marker (`version.json`) and skips the download completely whenever the container's local copy is already up to date.  
+    — *Implemented in [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py)*
+
+- **2.3 Pillar 3 — Bounded In-Memory Vector Cache Quotas & Eviction**
+  - **Maximum Local Vector Cache Size Cap (512 MiB):** Because Cloud Run stores local `/tmp` files directly inside container RAM, both backend services enforce a 512 MiB ceiling on cached user vector databases and automatically evict the oldest inactive user caches when the cap is reached.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*  
+    — *Implemented in [`src/core/storage/locks.py`](src/core/storage/locks.py) & [`src/core/storage/paths.py`](src/core/storage/paths.py)*  
+    — *Called in [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py)*
+  - **Minimum Free Container Memory Safety Floor (256 MiB):** Before syncing a user's vector database into local memory, the cache manager verifies that at least 256 MiB of free container memory remains—evicting inactive user caches and closing cached SQLite client connections first to prevent out-of-memory container crashes.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*  
+    — *Implemented in [`src/core/storage/locks.py`](src/core/storage/locks.py) & [`src/core/storage/paths.py`](src/core/storage/paths.py)*
+
+- **2.4 Pillar 4 — Storage, Network & AI Token Cost Efficiency**
+  - **Incremental MD5 Checksum File Uploads:** When saving updated vector database files back to Cloud Storage after an upload or collection deletion, the backend compares local file MD5 checksums against Cloud Storage metadata and uploads only new or modified files, avoiding redundant multi-megabyte transfers.  
+    — *Implemented in [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py)*  
+    — *Called in [`src/ingest/routes.py`](src/ingest/routes.py) & [`src/manage/collections.py`](src/manage/collections.py)*
+  - **Automated 7-Day Archived Object Version Cleanup:** Cloud Storage lifecycle rules automatically delete older archived file versions after 7 days or once 3 newer versions exist, preventing unbounded storage growth while preserving recent rollback history.  
+    — *Provisioned in [`infra/terraform/storage.tf`](infra/terraform/storage.tf)*
+  - **Front-Door Prompt Screening Token Savings:** Model Armor screens incoming user prompts *before* calling Vertex AI Gemini so blocked or malicious prompts consume zero generative AI tokens.  
+    — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py) & [`src/agent/graph.py`](src/agent/graph.py)*
+  - **Bounded Agent Steps & Per-User Rate Ceilings:** Capping the agent's search-and-reasoning loop at 6 steps per turn and enforcing per-user per-minute rate limits bounds maximum AI token consumption per user.  
+    — *Implemented in [`src/core/config.py`](src/core/config.py), [`src/agent/service.py`](src/agent/service.py) & [`src/core/compliance/policy.py`](src/core/compliance/policy.py)*
+  - **Zero-Cost Deterministic Grounding Quality Scoring:** Retrieval quality and citation grounding metrics are computed directly from normalized similarity scores and citation patterns in Python without making extra "LLM-as-a-judge" API calls.  
+    — *Implemented in [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*
+  - **Frontend Gzip Compression & Long-Lived Static Asset Caching:** The frontend Nginx server compresses JavaScript, CSS, and JSON payloads with Gzip and sets 1-year immutable browser caching headers on fingerprinted static bundles while keeping `/env-config.js` uncached.  
+    — *Implemented in [`infra/docker/nginx.conf.template`](infra/docker/nginx.conf.template)*
+
+> **Note on Unimplemented / Non-Relevant Pillars:**
+> - **GPU Right-Sizing & Spot / Preemptible Compute Usage (*Not Implemented — Not Relevant*):** Provisioning or right-sizing GPUs and Spot/Preemptible virtual machines is not relevant to InteractiveRAG's serverless architecture because all deep-learning inference (Gemini reasoning, dense vector embedding generation, and Model Armor safety screening) is offloaded to fully managed, pay-per-use **Google Cloud Vertex AI** and **Model Armor** regional APIs, while the application tier runs on serverless **Google Cloud Run** containers that scale to zero when idle.
+
+---
+
+## V/ [SECURITY, PRIVACY, AND COMPLIANCE]
+
+### 1. Authentication & Authorization
+
+Identity and access controls follow a zero-trust model across both cloud infrastructure (dedicated service accounts, scoped access policies, and least privilege) and application requests (authenticated user tokens and per-user data isolation):
+
+- **1.1 Dedicated Service Accounts**
+  - **Backend Runtime Service Account:** A dedicated service account is attached exclusively to the Ingestion and Agent Cloud Run microservices instead of using Google Cloud's overly broad default compute account.  
+    — *Provisioned in [`infra/terraform/iam.tf`](infra/terraform/iam.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
+  - **Frontend Runtime Service Account:** A separate dedicated service account is attached exclusively to the Frontend web container so the public web tier never shares credentials with the backend APIs.  
+    — *Provisioned in [`infra/terraform/iam.tf`](infra/terraform/iam.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
+  - **Deployment & Build Service Account:** A dedicated deployer service account is used exclusively for automated container image builds and infrastructure updates so human operators do not run deployments under personal credentials.  
+    — *Provisioned in [`Makefile`](Makefile)*
+  - **Model Armor Managed Service Agent:** A Google-managed service identity is provisioned for Google Cloud Model Armor so it can invoke regional Cloud DLP redaction templates on the backend's behalf.  
+    — *Provisioned in [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*
+
+- **1.2 Identity & Access Management (IAM)**
+  - **Declarative Role Bindings:** All cloud permissions are defined explicitly in version-controlled infrastructure code rather than granted manually in the cloud console.  
+    — *Provisioned in [`infra/terraform/iam.tf`](infra/terraform/iam.tf) & [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*
+  - **Uniform Bucket-Level Access & Public Access Prevention:** The Cloud Storage persistence bucket disables legacy per-file access lists and enforces strict public-access prevention so every storage operation is governed exclusively by Cloud IAM.  
+    — *Provisioned in [`infra/terraform/storage.tf`](infra/terraform/storage.tf)*
+
+- **1.3 Principle of Least Privilege**
+  - **Zero-Privilege Frontend Service Account:** The Frontend service account is granted zero Google Cloud permissions because the web server only delivers static browser files and runtime configuration and never calls backend cloud APIs.  
+    — *Provisioned in [`infra/terraform/iam.tf`](infra/terraform/iam.tf)*
+  - **Bucket-Scoped Backend Storage Permissions & Minimal Project Roles:** The Backend service account is granted storage read/write access strictly on the single application data bucket (never across the whole project, preventing access to the infrastructure state bucket), and its project-level permissions are limited to calling Vertex AI, Model Armor, Cloud DLP, Cloud Logging, Cloud Monitoring, and Cloud Trace.  
+    — *Provisioned in [`infra/terraform/iam.tf`](infra/terraform/iam.tf)*
+  - **Deployer Separation of Duties:** The deployment service account is granted only the permissions required to provision application resources and is intentionally denied permission to modify Google Cloud Organization Policies—meaning it can verify regional compliance rules before deploying, but can never weaken or override them.  
+    — *Provisioned in [`Makefile`](Makefile)*  
+    — *Called in [`infra/scripts/check_region_policy.py`](infra/scripts/check_region_policy.py)*
+  - **Non-Root Container Execution:** Inside the backend Docker image, root privileges are dropped before startup so the web server runs as an unprivileged operating-system user.  
     — *Implemented in [`infra/docker/Dockerfile.backend`](infra/docker/Dockerfile.backend)*
 
-- **6.4 Pillar 4 — OAuth 2.0 / OIDC & Zero-Trust User Authorization**
-  - **Managed Sign-In Providers (Google OAuth 2.0 / OIDC & Email/Password):** **Google Cloud Identity Platform (Firebase Authentication)** is provisioned to let users sign in with either federated **Google Sign-In (OAuth 2.0 / OIDC)** or **Email & Password**.  
+- **1.4 User Authentication & Zero-Trust Authorization**
+  - **Managed Google Sign-In & Email/Password Authentication:** Google Cloud Identity Platform (Firebase Authentication) is provisioned to let users sign in with either federated Google Sign-In or an Email and Password account.  
     — *Provisioned in [`infra/terraform/auth.tf`](infra/terraform/auth.tf)*  
     — *Implemented in [`frontend/src/firebase.js`](frontend/src/firebase.js)*  
     — *Called in [`frontend/src/AuthGate.jsx`](frontend/src/AuthGate.jsx)*
-  - **Automatic Bearer Token Attachment, Refresh & Session Cleanup:** The web application attaches the signed-in user's OIDC Firebase ID token (`Authorization: Bearer <ID_TOKEN>`) to every REST and SSE streaming request, refreshes expired tokens automatically, and clears all local collection lists, active conversation threads, and chat messages immediately on sign-out or account switch.  
+  - **Automatic Bearer Token Attachment, Refresh & Sign-Out Cleanup:** The web application attaches the signed-in user's identity token to every API and streaming request, refreshes expired tokens automatically, and clears all local collection lists, active conversation threads, and chat messages immediately upon sign-out or account switch.  
     — *Implemented in [`frontend/src/firebase.js`](frontend/src/firebase.js), [`frontend/src/api.js`](frontend/src/api.js) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*  
     — *Called in [`frontend/src/AuthGate.jsx`](frontend/src/AuthGate.jsx)*
-  - **Cryptographic RS256 Backend Verification & Tenant Authorization (`uid`):** Every protected backend endpoint verifies the incoming RS256 JWT signature, expiration (`exp`), and audience against Google's public signing certificates via the Firebase Admin SDK (`verify_bearer_token`), validates that the extracted `uid` matches `UID_PATTERN` (`^[a-zA-Z0-9_-]{1,128}$`), hard-disables the local development auth bypass whenever running in Cloud Run (`K_SERVICE` set), and scopes all tenant data access (`gs://<bucket>/users/{uid}/`, `/tmp/chroma_db/{uid}`, and `{uid}:{thread_id}`) strictly to the verified `uid`.  
+  - **Cryptographic Backend Token Verification:** Every protected backend endpoint verifies the incoming token's cryptographic signature, expiration time, and project audience against Google's public signing certificates, validates the user ID format, and hard-disables the local development authentication bypass whenever running in Cloud Run.  
     — *Implemented in [`src/core/auth.py`](src/core/auth.py)*  
     — *Called in [`src/ingest/routes.py`](src/ingest/routes.py), [`src/query/routes.py`](src/query/routes.py), [`src/agent/routes.py`](src/agent/routes.py), [`src/manage/collections.py`](src/manage/collections.py) & [`src/manage/compliance.py`](src/manage/compliance.py)*
+  - **Token-Derived Tenant Data Isolation:** User identity is derived exclusively from the verified authentication token (never from user-supplied form fields or URL parameters) and used to isolate all Cloud Storage folders, local vector database caches, and conversation memory threads.  
+    — *Implemented in [`src/core/auth.py`](src/core/auth.py) & [`src/core/storage/paths.py`](src/core/storage/paths.py)*  
+    — *Called in [`src/ingest/routes.py`](src/ingest/routes.py), [`src/query/routes.py`](src/query/routes.py), [`src/agent/routes.py`](src/agent/routes.py), [`src/manage/collections.py`](src/manage/collections.py) & [`src/manage/compliance.py`](src/manage/compliance.py)*
 
-- **6.5 Pillar 5 — API Key Scoping**
-  - **Keyless Backend Service-to-Service Auth (ADC):** Backend services never use static API keys or long-lived service-account JSON key files to call Vertex AI, Cloud Storage, Model Armor, Cloud DLP, or Cloud Logging; they authenticate exclusively via short-lived Google Cloud **Application Default Credentials (ADC)** bound to `backend_sa` (and short-lived `GOOGLE_OAUTH_ACCESS_TOKEN` tokens in `Makefile`).  
+- **1.5 API Key Scoping & Keyless Backend Credentials**
+  - **Keyless Backend Service-to-Service Authentication:** Backend containers never use static API keys or downloadable JSON key files to call Vertex AI, Cloud Storage, Model Armor, Cloud DLP, or Cloud Logging; instead, they authenticate automatically using short-lived credentials attached to their Cloud Run service account.  
     — *Provisioned in [`infra/terraform/iam.tf`](infra/terraform/iam.tf), [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`Makefile`](Makefile)*
-  - **Authorized-Domain & CORS Scoping for the Browser Identity Platform Key:** The public Identity Platform browser Web API key (`google_identity_platform_config.auth.client[0].api_key`) is restricted via Identity Platform's `authorized_domains` allowlist in [`infra/terraform/auth.tf`](infra/terraform/auth.tf) (permitting only `localhost`, `127.0.0.1`, the project's Firebase domains, the deterministic frontend Cloud Run domain, the Load Balancer's `<IP-with-dashes>.sslip.io` domain, and explicit `var.extra_allowed_origins`), paired with strict FastAPI CORS origin enforcement (`ALLOWED_ORIGINS`).  
+  - **Authorized-Domain & Cross-Origin Restrictions for Browser Sign-In:** The public browser authentication key used by the web interface is restricted to an explicit allowlist of authorized domains (the Load Balancer HTTPS domain, the Frontend service domain, and local development hosts) and paired with strict backend cross-origin request filtering.  
     — *Provisioned in [`infra/terraform/auth.tf`](infra/terraform/auth.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
     — *Implemented in [`src/core/config.py`](src/core/config.py) & [`src/core/app_factory.py`](src/core/app_factory.py)*
 
 > **Note on Unimplemented Pillars:**
-> - **Terraform-Managed `google_apikeys_key` Target/Referrer Restrictions & Sub-Tenant RBAC Roles (*Not Implemented — Relevant*):** While backend calls are 100% keyless via IAM/ADC and the browser Identity Platform key is constrained by `authorized_domains` and CORS (`ALLOWED_ORIGINS`), provisioning a dedicated `google_apikeys_key` resource in Terraform with explicit HTTP referrer and API target restrictions (limiting the browser key strictly to `identitytoolkit.googleapis.com` and `securetoken.googleapis.com`) and fine-grained sub-tenant RBAC roles (e.g., team admin vs. read-only viewer roles within a shared workspace) are not yet implemented and remain relevant future security enhancements.
+> - **Fine-Grained Sub-Tenant Role-Based Access Control (*Not Implemented — Relevant*):** Each authenticated user currently owns an isolated personal workspace with full read/write/delete rights over their own collections. Fine-grained sub-tenant roles (such as team administrator versus read-only viewer roles within a shared organization workspace) are not yet implemented and remain a relevant future enhancement.
 
 ---
 
-### 7. Zero-Internet VPC & Network Security ([`docs/NETWORK_SECURITY_PLAN.md`](docs/NETWORK_SECURITY_PLAN.md))
+### 2. Infrastructure & Network Security
 
-All external user traffic enters through a single HTTPS Load Balancer, while backend containers run inside a segmented private network with zero outbound access to the public internet.
+All external user traffic enters through a single HTTPS Load Balancer, while backend containers run inside a segmented private network with zero outbound access to the public internet:
 
-- **7.1 Single Public HTTPS Entry Point (`Global External Application Load Balancer`)**
-  - **Automatic Free HTTPS Certificate:** Terraform reserves a global static IP address and constructs a free `<IP-with-dashes>.sslip.io` domain name so Google Cloud can automatically provision and renew a trusted SSL/TLS certificate (and Identity Platform can authorize the domain) without requiring you to buy a custom domain. Plain HTTP requests on port `80` are automatically redirected to HTTPS on port `443`.  
+- **2.1 Single Public HTTPS Entry Point**
+  - **Automatic Free HTTPS Certificate & HTTP-to-HTTPS Redirect:** The platform reserves a global static IP address and constructs a free domain name so Google Cloud can automatically issue and renew a trusted HTTPS certificate without requiring a custom domain purchase, while automatically redirecting any plain HTTP requests on port 80 to encrypted HTTPS on port 443.  
     — *Provisioned in [`infra/terraform/load_balancer.tf`](infra/terraform/load_balancer.tf)*  
     — *Called in [`infra/terraform/auth.tf`](infra/terraform/auth.tf) & [`infra/terraform/outputs.tf`](infra/terraform/outputs.tf)*
-  - **Single-Origin URL Path Routing:** The Load Balancer exposes the web interface and both backend APIs under the same HTTPS domain—routing `/api/ingest/*` to `ingest-api`, `/api/agent/*` to `agent-api`, and all other paths (`/*`) to the Frontend service.  
+  - **Single-Origin URL Path Routing:** The Load Balancer exposes the web interface and both backend APIs under the same HTTPS domain—routing document upload paths to the Ingestion service, search and chat paths to the Agent service, and all other paths to the Frontend web service.  
     — *Provisioned in [`infra/terraform/load_balancer.tf`](infra/terraform/load_balancer.tf)*
-  - **Disabled Edge CDN Caching for Private Traffic:** Cloud CDN caching is explicitly disabled across all Load Balancer backends so private multi-tenant API responses and live chat streams are never cached at the network edge.  
+  - **Disabled Edge Caching for Private Traffic:** Content Delivery Network (CDN) caching is explicitly turned off across all Load Balancer backends so private multi-tenant API responses and live chat streams are never cached at public network edge locations.  
     — *Provisioned in [`infra/terraform/load_balancer.tf`](infra/terraform/load_balancer.tf)*
 
-- **7.2 Locked-Down Cloud Run Ingress**
-  - **Blocking Direct Container Access:** All three Cloud Run services are configured to accept traffic only from the internal Load Balancer (`INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER`). Anyone attempting to visit an underlying `*.run.app` service URL directly from the internet is automatically blocked at Google's network edge before the request ever reaches a container.  
+- **2.2 Locked-Down Container Ingress**
+  - **Blocking Direct Internet Access to Cloud Run URLs:** All three Cloud Run services are configured to accept incoming traffic exclusively from the internal Load Balancer. Anyone attempting to visit an underlying Cloud Run service URL directly from the public internet is blocked at Google's network edge before the request ever reaches a container.  
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
 
-- **7.3 Segmented Private VPC with Zero Outbound Internet**
-  - **Custom VPC Without an Internet Exit:** Backend services run inside a custom Virtual Private Cloud (VPC) that has its default route to the public internet removed. Even if a malicious file or prompt attempted to trick a container into sending data to an outside server, the network drops the connection immediately.  
+- **2.3 Segmented Private Network with Zero Outbound Internet**
+  - **Custom Private Network Without an Internet Exit:** Backend services run inside a custom Virtual Private Cloud (VPC) network whose default route to the public internet is deleted upon creation. Even if a malicious file or prompt attempted to trick a container into sending data to an outside server, the network drops the connection immediately.  
     — *Provisioned in [`infra/terraform/network.tf`](infra/terraform/network.tf)*
-  - **Workload-Segmented Private Subnets:** The Ingestion service (`ingest-subnet`) and the Agent service (`agent-subnet`) are placed in separate private subnets to isolate document parsing traffic from agent execution at the network layer.  
+  - **Workload-Segmented Private Subnets:** The Ingestion service and the Agent service are placed in separate private network subnets to isolate document parsing traffic from AI reasoning traffic at the network layer.  
     — *Provisioned in [`infra/terraform/network.tf`](infra/terraform/network.tf)*  
     — *Called in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
-  - **Serverless Direct VPC Egress:** Both backend services route 100% of their outbound traffic into the private VPC using serverless **Cloud Run Direct VPC Egress** (routing traffic strictly to private internal IP ranges without requiring always-on NAT or proxy VMs).  
+  - **Mandatory Private Network Routing for All Outbound Traffic:** Both backend services force 100% of their outbound traffic through the private VPC network using serverless Direct VPC Egress so no container can bypass the private network rules.  
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
 
-- **7.4 Private Internal Tunnels to Google Cloud APIs**
-  - **Private Google Access for Standard Google APIs:** A private Cloud DNS zone for `googleapis.com` and a restricted internal VPC route (`199.36.153.8/30`) direct all backend calls to Cloud Storage, Vertex AI, Identity Platform, Cloud Logging, Cloud Trace, and Cloud DLP over Google's private internal backbone rather than the public internet.  
+- **2.4 Private Internal Tunnels to Google Cloud APIs**
+  - **Private Google Access for Standard Google APIs:** A private DNS zone and restricted internal route direct all backend calls to Cloud Storage, Vertex AI, Identity Platform, Cloud Logging, Cloud Trace, and Cloud DLP over Google's private internal backbone rather than the public internet.  
     — *Provisioned in [`infra/terraform/network.tf`](infra/terraform/network.tf)*
-  - **Regional Private Service Connect (PSC) for Model Armor:** Because regional Model Armor endpoints use a dedicated regional domain (`modelarmor.<region>.rep.googleapis.com`), the VPC provisions a dedicated Private Service Connect endpoint and private DNS zone so AI safety screening traffic stays entirely on private internal IP addresses.  
+  - **Regional Private Service Connect for Model Armor:** A dedicated regional Private Service Connect endpoint and private DNS zone route all AI prompt and response safety screening calls to Google Cloud Model Armor entirely over private internal IP addresses.  
     — *Provisioned in [`infra/terraform/network.tf`](infra/terraform/network.tf)*
 
 ---
 
-### 8. AI-Specific Security — 5 Pillars ([`docs/AI_SECURITY_PLAN.md`](docs/AI_SECURITY_PLAN.md))
+### 3. Data Protection & Privacy
 
-Every user question, retrieved document chunk, and AI reply flows through a multi-stage security pipeline (prompt screening, iterative retrieval and reasoning, and output screening) organized around five pillars:
+Sensitive user documents, prompts, credentials, and logs are protected across their entire lifecycle through encryption, automated redaction, privacy-preserving hashing, storage tier classification, and managed secrets:
 
-- **8.1 Pillar 1 — Prompt Injection Mitigation**
-  - **Front-Door Prompt Screening:** Before calling Gemini, the agent's input screening stage sends the user's question to **Google Cloud Model Armor** to detect prompt-injection attempts, jailbreaks, and malicious links. Unsafe prompts are blocked immediately with a polite refusal without spending LLM tokens.  
-    — *Provisioned in [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*  
-    — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
-    — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
-  - **XML Spotlighting for Retrieved PDF Chunks:** Because malicious instructions hidden inside a PDF could try to impersonate system commands, every retrieved document chunk is wrapped inside `<retrieved_chunk source="..." page="...">` tags with any internal `<` or `>` characters escaped first so a document can never break out of its quotation box, and the system prompt instructs Gemini to treat all chunk content strictly as untrusted reference data.  
-    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
-    — *Called in [`src/agent/tools.py`](src/agent/tools.py) & [`src/agent/graph.py`](src/agent/graph.py)*
-  - **Safe Collection Naming:** Collection names are validated against a strict alphanumeric pattern across all endpoints and sanitized before binding to tool identifiers so attackers cannot smuggle prompt instructions into retriever tool descriptions via collection names.  
-    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
-    — *Called in [`src/ingest/schemas.py`](src/ingest/schemas.py), [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py), [`src/query/schemas.py`](src/query/schemas.py), [`src/agent/schemas.py`](src/agent/schemas.py), [`src/agent/tools.py`](src/agent/tools.py) & [`src/manage/collections.py`](src/manage/collections.py)*
-
-- **8.2 Pillar 2 — Model Access Controls**
-  - **Server-Approved Model Catalogs:** Instead of allowing callers to request arbitrary Vertex AI models, the backend maintains curated allowlists of approved chat models (`gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-2.5-flash-lite`) and embedding models (`gemini-embedding-001`, `text-embedding-004`, `text-embedding-005`).  
+- **3.1 Encryption at Rest & in Transit**
+  - **HTTPS/TLS Encryption & Automatic HTTP Redirect at the Edge:** All external browser and API traffic is encrypted in transit using a Google-managed SSL/TLS certificate at the global HTTPS Load Balancer, with automatic redirection from plain HTTP to HTTPS.  
+    — *Provisioned in [`infra/terraform/load_balancer.tf`](infra/terraform/load_balancer.tf)*
+  - **Encrypted Private Backbone Traffic to Google Cloud APIs:** All internal backend calls to Cloud Storage, Vertex AI, Cloud DLP, Model Armor, and Cloud Logging travel over encrypted TLS channels inside Google's private internal network.  
+    — *Provisioned in [`infra/terraform/network.tf`](infra/terraform/network.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
+  - **Default AES-256 Encryption at Rest Across All Cloud Storage & Logs:** All persistent cloud data—including per-user vector database snapshots, uploaded PDF archives, remote infrastructure state, compliance and operational log buckets, container images, and stored secrets—is encrypted at rest by default using Google-managed AES-256 encryption.  
+    — *Provisioned in [`infra/terraform/storage.tf`](infra/terraform/storage.tf), [`infra/terraform/compliance.tf`](infra/terraform/compliance.tf) & [`infra/terraform/observability.tf`](infra/terraform/observability.tf)*
+  - **Ephemeral In-Memory Container Working Directories:** On Cloud Run, local vector database caches and temporary PDF upload staging folders reside strictly in volatile memory (never written to unencrypted persistent local disks) and are wiped immediately after indexing, cache eviction, or user data erasure.  
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
-    — *Implemented in [`src/core/config.py`](src/core/config.py) & [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*
-  - **Automatic Endpoint Validation & Collection-Bound Embedding Enforcement:** Every ingestion, search, and chat request requires an explicit collection name, defaults to the primary approved model when omitted, immediately rejects unapproved model names with `HTTP 422`, and automatically enforces each existing collection's bound `embedding_model` across subsequent uploads, similarity searches, and agent retrieval calls.  
-    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py) & [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
-    — *Called in [`src/ingest/schemas.py`](src/ingest/schemas.py), [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py), [`src/ingest/service.py`](src/ingest/service.py), [`src/query/schemas.py`](src/query/schemas.py), [`src/query/service.py`](src/query/service.py), [`src/agent/schemas.py`](src/agent/schemas.py) & [`src/agent/tools.py`](src/agent/tools.py)*
-
-- **8.3 Pillar 3 — AI & Ingestion Guardrails**
-  - **Strict Document Grounding Guardrails:** The system prompt and retriever tool enforce anti-hallucination guardrails requiring the model to rely solely on `<retrieved_chunk>` evidence with 1-indexed `[filename.pdf, p.X]` citations and abstain whenever retrieved context is empty or insufficient.  
-    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py), [`src/agent/tools.py`](src/agent/tools.py) & [`src/agent/graph.py`](src/agent/graph.py)*  
-    — *Called in [`src/core/compliance/provenance.py`](src/core/compliance/provenance.py) & [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*
-  - **Query Length & Top-$k$ Search Bounds:** Request validators enforce maximum query text length (`4,000` characters) and similarity search result bounds (`k` between `1` and `50`).  
-    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
-    — *Called in [`src/query/schemas.py`](src/query/schemas.py) & [`src/agent/schemas.py`](src/agent/schemas.py)*
-  - **PDF File-Signature Verification & Upload Ceilings:** Ingestion validators enforce `%PDF-` magic-byte header verification, path-traversal filename sanitization, maximum file size (`20 MB` per PDF), maximum files per upload (`10`), and maximum extracted chunks per ingestion (`1,000`).  
-    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
-    — *Called in [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py) & [`src/ingest/splitter.py`](src/ingest/splitter.py)*
-  - **Bounded Agent Retrieval Loops:** The agent's tool-calling loop is capped (`6` steps by default) so ambiguous questions cannot trigger endless retrieval cycles, returning a clean fallback message if the step limit is reached.  
-    — *Implemented in [`src/core/config.py`](src/core/config.py) & [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*  
-    — *Called in [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
-
-- **8.4 Pillar 4 — Output Filtering & Sanitized Errors**
-  - **Automated PII & Secret Redaction Templates:** Terraform provisions **Google Cloud Sensitive Data Protection (Cloud DLP)** inspection and de-identification templates wired into **Model Armor** to automatically mask emails, phone numbers, credit card numbers, US Social Security numbers, IBAN codes, API keys, and auth tokens with `[INFO_TYPE]` placeholders (such as `[EMAIL_ADDRESS]`).  
-    — *Provisioned in [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*  
-    — *Called in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
-  - **Two-Stage Redaction Across Search, JSON & Live Streaming:** Sensitive data is masked both when document chunks are retrieved from ChromaDB (protecting direct `/query` searches and retriever tool traces) and again on the final AI answer in the output screening stage before responses are returned or streamed over SSE.  
-    — *Provisioned in [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*  
-    — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
-    — *Called in [`src/query/service.py`](src/query/service.py), [`src/agent/tools.py`](src/agent/tools.py), [`src/agent/graph.py`](src/agent/graph.py) & [`src/agent/service.py`](src/agent/service.py)*
-  - **Sanitized Server Error Messages:** Unexpected exceptions across all REST and streaming endpoints log full diagnostic stack traces privately on the server while returning a generic, safe error message to the client so internal details never leak.  
-    — *Implemented in [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*  
-    — *Called in [`src/ingest/routes.py`](src/ingest/routes.py), [`src/query/routes.py`](src/query/routes.py), [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
-
-- **8.5 Pillar 5 — Content Safety**
-  - **Dual-Layer Harm Filtering (Model Armor RAI + Vertex AI Gemini):**
-    1. **Google Cloud Model Armor Responsible AI (RAI) Filters** screen both incoming user prompts and outgoing model responses across Hate Speech, Harassment, Sexually Explicit, and Dangerous Content categories.  
-       — *Provisioned in [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*  
-       — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
-       — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
-    2. **Vertex AI Gemini Safety Thresholds** explicitly configure every Gemini model instance with pinned harm-blocking thresholds across all four safety categories.  
-       — *Implemented in [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*  
-       — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
-  - **Polite Refusal Fallbacks:** Whenever Model Armor or Gemini blocks a request or halts generation due to content safety rules, the backend replaces the blocked or empty output with a clear, polite refusal explanation so users never see a blank message bubble.  
-    — *Implemented in [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*  
-    — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
-
----
-
-### 9. Data Protection & Privacy ([`docs/AI_SECURITY_PLAN.md`](docs/AI_SECURITY_PLAN.md), [`docs/COMPLIANCE_GOVERNANCE_PLAN.md`](docs/COMPLIANCE_GOVERNANCE_PLAN.md))
-
-Sensitive user documents, prompts, credentials, and logs are protected across their entire lifecycle through encryption, automated Cloud DLP redaction, privacy-preserving hashing, storage tier classification, and managed secrets:
-
-- **9.1 Pillar 1 — Encryption at Rest & in Transit**
-  - **End-to-End Encryption in Transit (HTTPS/TLS + Edge Redirect + Private Backbone):**
-    - External browser and API traffic terminates TLS at the **Global External Application Load Balancer** using a Google-managed SSL/TLS certificate (`google_compute_managed_ssl_certificate.lb_cert` for `<IP-with-dashes>.sslip.io`), while plain HTTP requests on port `80` are automatically redirected to `https://` on port `443` with `301 Moved Permanently` (`google_compute_url_map.http_redirect`).
-    - Direct internet access to Cloud Run `*.run.app` endpoints is blocked (`INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER`), and all backend calls to Cloud Storage, Vertex AI, Cloud DLP, Model Armor, and Cloud Logging travel over encrypted TLS channels inside Google's private network via **Private Google Access** (`199.36.153.8/30`) and **Regional Private Service Connect (PSC)**.  
-    — *Provisioned in [`infra/terraform/load_balancer.tf`](infra/terraform/load_balancer.tf), [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/network.tf`](infra/terraform/network.tf)*
-  - **Encryption at Rest & Ephemeral In-Memory Container Caches:**
-    - All persistent cloud storage—including per-user ChromaDB snapshots and PDF archives in `google_storage_bucket.chroma_persistence`, remote Terraform state in `gs://<app>-tfstate-<project_number>`, regional Cloud Logging compliance and observability buckets, Artifact Registry images, and Secret Manager secrets—is encrypted at rest by default using Google-managed AES-256 encryption.
-    - On Cloud Run Gen2, local `/tmp/chroma_db/{uid}` and `/tmp/uploads/{uid}/{request_id}` directories live exclusively in ephemeral in-memory `tmpfs` (never written to unencrypted persistent local disks) and are purged immediately after upload indexing, LRU cache eviction, or GDPR erasure.  
-    — *Provisioned in [`infra/terraform/storage.tf`](infra/terraform/storage.tf), [`infra/terraform/compliance.tf`](infra/terraform/compliance.tf), [`infra/terraform/observability.tf`](infra/terraform/observability.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
     — *Implemented in [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py), [`src/core/storage/locks.py`](src/core/storage/locks.py) & [`src/core/compliance/dsar.py`](src/core/compliance/dsar.py)*
 
-- **9.2 Pillar 2 — Sensitive Data Protection (`Cloud DLP`)**
-  - **Regional Cloud DLP Inspection & De-Identification Templates:** Terraform provisions a regional **Google Cloud Sensitive Data Protection (Cloud DLP)** inspect template (`google_data_loss_prevention_inspect_template.ai_output_inspect`, configured with `min_likelihood = "POSSIBLE"` across `EMAIL_ADDRESS`, `PHONE_NUMBER`, `CREDIT_CARD_NUMBER`, `US_SOCIAL_SECURITY_NUMBER`, `IBAN_CODE`, `GCP_API_KEY`, and `AUTH_TOKEN`) paired with a de-identify template (`google_data_loss_prevention_deidentify_template.ai_output_deidentify`) that replaces detected values with `[INFO_TYPE]` labels and attaches both to the regional **Model Armor** template (`sdp_settings.advanced_config`).  
+- **3.2 Sensitive Data Protection (Cloud DLP)**
+  - **Regional Cloud DLP Inspection & De-Identification Templates:** Regional Google Cloud Sensitive Data Protection templates are provisioned to detect email addresses, phone numbers, credit card numbers, US Social Security numbers, IBAN bank codes, Google Cloud API keys, and authentication tokens and replace any match with a descriptive placeholder label (such as `[EMAIL_ADDRESS]`).  
     — *Provisioned in [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*
-  - **Two-Stage Parallel Redaction & Fail-Closed Enforcement:** [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py) runs Cloud DLP redaction both at retrieval time (`redact_chunks`, screening top-$k$ chunks concurrently across up to `8` worker threads before they reach `/query` callers or the LLM context) and at output time (`sanitize_model_output`, screening the final Gemini response before JSON return or SSE emission), failing closed with `HTTP 503` in production if DLP/Model Armor is unavailable.  
+  - **Retrieval-Stage Document Chunk Redaction:** Before retrieved PDF chunks are returned to direct search callers or passed into the AI model's prompt context, they are screened in parallel through the regional redaction pipeline so raw personal data inside uploaded PDFs is masked automatically.  
     — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
-    — *Called in [`src/query/service.py`](src/query/service.py), [`src/agent/tools.py`](src/agent/tools.py), [`src/agent/graph.py`](src/agent/graph.py) & [`src/agent/service.py`](src/agent/service.py)*
+    — *Called in [`src/query/service.py`](src/query/service.py) & [`src/agent/tools.py`](src/agent/tools.py)*
+  - **Output-Stage AI Response Redaction:** Before the final AI response is returned or streamed to the browser, it is screened a second time through the regional redaction pipeline to ensure no sensitive personal data or credentials appear in the answer.  
+    — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
+    — *Called in [`src/agent/graph.py`](src/agent/graph.py) & [`src/agent/service.py`](src/agent/service.py)*
 
-- **9.3 Pillar 3 — PII Handling & Privacy-by-Design**
-  - **One-Way SHA-256 Query Hashing & Automatic Log Scrubbing:** Neither compliance audit logs (`interactiverag-audit`) nor operational logs/telemetry (`interactiverag-telemetry`) ever record raw user prompts or document text. [`hash_query()`](src/core/compliance/audit.py) converts user questions into deterministic one-way SHA-256 hashes (`query_sha256`) and character counts (`query_length`), while [`QueryScrubbingFilter`](src/core/observability/logging.py) intercepts any accidental `query`, `prompt`, or `raw_query` fields on standard log records before they reach `stdout`.  
-    — *Implemented in [`src/core/compliance/audit.py`](src/core/compliance/audit.py) & [`src/core/observability/logging.py`](src/core/observability/logging.py)*
-  - **Disabled Third-Party Telemetry & Edge Caching:** ChromaDB anonymized telemetry is disabled (`ANONYMIZED_TELEMETRY="FALSE"`), and Cloud CDN caching is disabled (`enable_cdn = false`) across all Load Balancer backends so private tenant responses are never cached at edge locations.  
-    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/load_balancer.tf`](infra/terraform/load_balancer.tf)*
-  - **Self-Service GDPR Art. 15 Access, Art. 17 Erasure & 7-Day Version Hygiene:** Users can inspect their complete data footprint (`GET /compliance/my-data`) or permanently erase all live and archived Cloud Storage object versions (`versions=True`), local `/tmp` caches, and `{uid}:*` conversation threads (`DELETE /compliance/my-data`), complemented by GCS lifecycle rules that automatically delete archived object versions after 7 days or 3 newer snapshots.  
+- **3.3 PII Handling & Privacy-by-Design**
+  - **One-Way SHA-256 Query Hashing in Audit & Telemetry Logs:** Neither compliance audit logs nor operational telemetry logs ever record raw user questions or document text; instead, user prompts are converted into one-way cryptographic SHA-256 hashes and character counts before logging.  
+    — *Implemented in [`src/core/compliance/audit.py`](src/core/compliance/audit.py) & [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*
+  - **Automatic Log Scrubbing Filter:** A built-in log filter automatically inspects every operational log record before it is written to standard output and replaces any accidental raw query or prompt field with a one-way SHA-256 hash.  
+    — *Implemented in [`src/core/observability/logging.py`](src/core/observability/logging.py)*  
+    — *Called in [`src/core/logger.py`](src/core/logger.py)*
+  - **Disabled Third-Party Vector Database Telemetry:** Built-in usage telemetry inside the embedded ChromaDB engine is explicitly turned off across all environments so no usage beacons are sent to external servers.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
+  - **Self-Service Data Export, Erasure & 7-Day Version Cleanup:** Users can inspect or permanently delete all of their stored files, vector indexes, and chat threads at any time, while automated bucket lifecycle rules purge archived file versions after 7 days.  
     — *Provisioned in [`infra/terraform/storage.tf`](infra/terraform/storage.tf)*  
     — *Implemented in [`src/core/compliance/dsar.py`](src/core/compliance/dsar.py) & [`src/manage/compliance.py`](src/manage/compliance.py)*
 
-- **9.4 Pillar 4 — Data Classification & Storage Segregation**
-  - **Architectural Segregation Across Four Sensitivity & Retention Tiers:** Data is classified by sensitivity and lifecycle and routed into segregated storage boundaries:
-    1. **Tier 1 — Restricted Tenant Content (Uploaded PDFs, Vector Indexes & Chat Threads):** Isolated per verified `uid` (`gs://<bucket>/users/{uid}/`, `/tmp/chroma_db/{uid}`, `{uid}:{thread_id}`); treated as untrusted, potentially PII-bearing data subject to XML spotlighting, two-stage Cloud DLP redaction, 7-day noncurrent version pruning, and self-service GDPR Art. 17 erasure.
-    2. **Tier 2 — Confidential Credentials & Identity Material (OAuth Client Secrets & Bearer JWTs):** Stored in **Google Cloud Secret Manager** or verified in memory via RS256 public keys; never persisted in `.tf` files, container images, or logs, and actively scanned by Cloud DLP (`GCP_API_KEY`, `AUTH_TOKEN`).
-    3. **Tier 3 — Regulated Compliance Audit Records (`interactiverag-audit` & GCP Data Access Logs):** Scrubbed of raw PII (`query_sha256` only) and routed to a dedicated regional Cloud Logging bucket (`compliance_audit`) with **365-day retention** and optional WORM retention lock (`var.audit_log_bucket_locked`).
-    4. **Tier 4 — Operational & AI Telemetry Diagnostics (`interactiverag-telemetry` & Cloud Trace Spans):** Scrubbed of raw prompts and routed to a separate regional Cloud Logging bucket (`observability_telemetry`) with **30-day retention**.  
-    — *Provisioned in [`infra/terraform/storage.tf`](infra/terraform/storage.tf), [`infra/terraform/auth.tf`](infra/terraform/auth.tf), [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf), [`infra/terraform/compliance.tf`](infra/terraform/compliance.tf) & [`infra/terraform/observability.tf`](infra/terraform/observability.tf)*  
-    — *Implemented in [`src/core/storage/paths.py`](src/core/storage/paths.py), [`src/core/compliance/audit.py`](src/core/compliance/audit.py) & [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*
+- **3.4 Data Classification & Storage Segregation**
+  - **Tier 1 — Restricted Tenant Content:** Uploaded PDFs, vector indexes, and conversation threads are isolated per verified user ID, treated as untrusted content subject to XML boundary tagging and two-stage Cloud DLP redaction, pruned after 7 days when superseded, and erasable on demand.  
+    — *Provisioned in [`infra/terraform/storage.tf`](infra/terraform/storage.tf)*  
+    — *Implemented in [`src/core/storage/paths.py`](src/core/storage/paths.py) & [`src/core/compliance/dsar.py`](src/core/compliance/dsar.py)*
+  - **Tier 2 — Confidential Credentials & Identity Material:** OAuth client secrets are stored in Google Cloud Secret Manager and user authentication tokens are verified in memory using public signing keys—never written to infrastructure files, container images, or logs.  
+    — *Provisioned in [`infra/terraform/auth.tf`](infra/terraform/auth.tf) & [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*  
+    — *Implemented in [`src/core/auth.py`](src/core/auth.py)*
+  - **Tier 3 — Regulated Compliance Audit Records (365-Day Retention):** Application audit events and Google Cloud Data Access Audit Logs are scrubbed of raw personal data and routed into a dedicated regional Cloud Logging bucket with a 365-day retention policy and optional retention lock.  
+    — *Provisioned in [`infra/terraform/compliance.tf`](infra/terraform/compliance.tf)*  
+    — *Implemented in [`src/core/compliance/audit.py`](src/core/compliance/audit.py)*
+  - **Tier 4 — Operational & AI Telemetry Diagnostics (30-Day Retention):** High-volume operational logs, latency breakdowns, and token metrics are scrubbed of raw prompts and routed into a separate regional Cloud Logging bucket with a 30-day retention policy.  
+    — *Provisioned in [`infra/terraform/observability.tf`](infra/terraform/observability.tf)*  
+    — *Implemented in [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*
 
-- **9.5 Pillar 5 — Secrets Management**
-  - **Google Cloud Secret Manager Integration for OAuth Credentials:** Sensitive OAuth 2.0 credentials are never stored in Terraform files or `terraform.tfvars`; [`infra/terraform/variables.tf`](infra/terraform/variables.tf) holds only the Secret Manager secret names (`var.google_oauth_client_id_secret_name` and `var.google_oauth_client_secret_name`), and [`infra/terraform/auth.tf`](infra/terraform/auth.tf) fetches the secret versions from **Google Cloud Secret Manager** (`data "google_secret_manager_secret_version"`) at apply time.  
+- **3.5 Secrets Management**
+  - **Google Cloud Secret Manager for OAuth Credentials:** Sensitive OAuth 2.0 client credentials are never stored in configuration files; Terraform stores only the secret names and retrieves the secret values directly from Google Cloud Secret Manager during deployment.  
     — *Provisioned in [`infra/terraform/auth.tf`](infra/terraform/auth.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*
-  - **Keyless Runtime Auth, Build-Context Exclusions & Output Secret Scanning:** Backend containers authenticate to GCP services via IAM/ADC without static secret keys; [`.gitignore`](.gitignore) and [`.dockerignore`](.dockerignore) exclude `.env` and `infra/terraform/terraform.tfvars` from Git history and Docker image layers; [`sanitize_error_message()`](src/core/ai_security/safety.py) prevents internal stack traces or config values from leaking in error responses; and Cloud DLP automatically masks `GCP_API_KEY` and `AUTH_TOKEN` patterns in retrieved chunks and LLM outputs.  
-    — *Provisioned in [`infra/terraform/iam.tf`](infra/terraform/iam.tf) & [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*  
-    — *Implemented in [`.gitignore`](.gitignore), [`.dockerignore`](.dockerignore) & [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*
+  - **Keyless Runtime Service Authentication:** Backend containers authenticate to Google Cloud services using their attached IAM service account identity rather than static secret keys.  
+    — *Provisioned in [`infra/terraform/iam.tf`](infra/terraform/iam.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
+  - **Git & Docker Build Secret Exclusions:** Local environment files and Terraform variable files are excluded from both Git version control and Docker build contexts so local developer secrets can never be committed or baked into container images.  
+    — *Implemented in [`.gitignore`](.gitignore) & [`.dockerignore`](.dockerignore)*
+  - **Sanitized Error Responses:** Standardized user-facing error messages ensure internal stack traces, file paths, and environment variables are never leaked to callers when an unexpected error occurs.  
+    — *Implemented in [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*
+  - **Automated API Key & Auth Token Redaction in AI Outputs:** Cloud DLP automatically scans retrieved chunks and AI responses for Google Cloud API keys and authentication tokens and masks them before delivery.  
+    — *Provisioned in [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*
 
 > **Note on Unimplemented Pillars:**
-> - **Customer-Managed Encryption Keys (Cloud KMS CMEK) & Automated Per-Document Sensitivity Labeling (*Not Implemented — Relevant*):** While all buckets and logs are encrypted at rest with Google-managed encryption keys (GMEK) and data is segregated by architectural tier and scanned by Cloud DLP across 7 PII/credential `info_types`, Customer-Managed Encryption Keys (Cloud KMS CMEK) and automated document-level sensitivity tagging (e.g., classifying individual uploaded PDFs as `PUBLIC` / `INTERNAL` / `CONFIDENTIAL` in metadata at ingestion time) are not yet implemented and remain relevant future enhancements for regulated enterprises.
+> - **Customer-Managed Encryption Keys (Cloud KMS CMEK) & Automated Per-Document Sensitivity Labeling (*Not Implemented — Relevant*):** While all buckets and logs are encrypted at rest with Google-managed encryption keys and data is segregated across four architectural sensitivity tiers, Customer-Managed Encryption Keys (Cloud KMS) and automated per-document sensitivity tagging at upload time remain relevant future enhancements for regulated enterprises.
 
 ---
 
-### 10. Compliance & Governance ([`docs/COMPLIANCE_GOVERNANCE_PLAN.md`](docs/COMPLIANCE_GOVERNANCE_PLAN.md))
+### 4. AI-Specific Security
+
+Every user question, retrieved document chunk, and AI reply flows through a multi-stage security pipeline organized around five pillars:
+
+- **4.1 Prompt Injection Mitigation**
+  - **Front-Door Prompt Screening:** Before calling the Gemini language model, the agent sends the user's question to Google Cloud Model Armor to detect prompt-injection attacks, jailbreak attempts, and malicious web links. Unsafe questions are blocked immediately with a polite refusal without spending language model tokens.  
+    — *Provisioned in [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*  
+    — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
+    — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
+  - **XML Boundary Tagging for Retrieved PDF Chunks:** Because malicious instructions hidden inside an uploaded PDF could attempt to impersonate system commands, every retrieved passage is wrapped inside explicit XML tags with internal angle brackets escaped first, and the system instructions direct the model to treat everything inside those tags strictly as untrusted reference text.  
+    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
+    — *Called in [`src/agent/tools.py`](src/agent/tools.py) & [`src/agent/graph.py`](src/agent/graph.py)*
+  - **Safe Collection Naming:** Collection names are validated against a strict alphanumeric pattern across all endpoints and sanitized before binding to internal search tools so attackers cannot smuggle prompt instructions through collection names.  
+    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
+    — *Called in [`src/ingest/schemas.py`](src/ingest/schemas.py), [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py), [`src/query/schemas.py`](src/query/schemas.py), [`src/agent/schemas.py`](src/agent/schemas.py), [`src/agent/tools.py`](src/agent/tools.py) & [`src/manage/collections.py`](src/manage/collections.py)*
+
+- **4.2 Model Access Controls**
+  - **Curated Chat & Embedding Model Allowlists:** Instead of allowing callers to request arbitrary Vertex AI models, the backend maintains explicit allowlists of approved Gemini chat models and Vertex AI embedding models.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
+    — *Implemented in [`src/core/config.py`](src/core/config.py) & [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*
+  - **Strict Model Validation on Every Request:** Every upload, search, and chat request validates the requested model against the approved catalog, defaults to the primary approved model when omitted, and immediately rejects unapproved model names.  
+    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
+    — *Called in [`src/ingest/schemas.py`](src/ingest/schemas.py), [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py), [`src/query/schemas.py`](src/query/schemas.py) & [`src/agent/schemas.py`](src/agent/schemas.py)*
+  - **Automatic Collection-Bound Embedding Enforcement:** Once a collection is created with a specific embedding model, the backend records that model in the collection's metadata and automatically enforces the exact same embedding model on all future document uploads, similarity searches, and agent lookups.  
+    — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
+    — *Called in [`src/ingest/service.py`](src/ingest/service.py), [`src/query/service.py`](src/query/service.py) & [`src/agent/tools.py`](src/agent/tools.py)*
+
+- **4.3 AI & Ingestion Guardrails**
+  - **Strict Document Grounding & Citation Rules:** The agent's system instructions require every factual claim to be supported by retrieved document passages with 1-indexed `[filename.pdf, p.X]` citations and require the model to abstain whenever the uploaded documents do not contain the answer.  
+    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py), [`src/agent/tools.py`](src/agent/tools.py) & [`src/agent/graph.py`](src/agent/graph.py)*  
+    — *Called in [`src/core/compliance/provenance.py`](src/core/compliance/provenance.py) & [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*
+  - **Query Length & Search Result Bounds:** Request validators cap user question length at 4,000 characters and constrain similarity search result counts between 1 and 50 passages.  
+    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
+    — *Called in [`src/query/schemas.py`](src/query/schemas.py) & [`src/agent/schemas.py`](src/agent/schemas.py)*
+  - **PDF File-Signature Verification & Upload Ceilings:** Upload validators verify that every file starts with an authentic `%PDF-` binary header, sanitize filenames to prevent directory traversal, and cap uploads at 20 MB per file, 10 files per request, and 1,000 extracted chunks per batch.  
+    — *Implemented in [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py)*  
+    — *Called in [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py) & [`src/ingest/splitter.py`](src/ingest/splitter.py)*
+  - **Bounded Agent Retrieval Loops:** The agent's reasoning loop is capped at 6 steps by default so ambiguous questions cannot trigger endless search cycles, returning a polite fallback message if the step limit is reached.  
+    — *Implemented in [`src/core/config.py`](src/core/config.py) & [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*  
+    — *Called in [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
+
+- **4.4 Output Filtering & Sanitized Errors**
+  - **Automated PII & Secret Redaction Templates:** Google Cloud Sensitive Data Protection templates wired into Model Armor automatically mask emails, phone numbers, credit card numbers, US Social Security numbers, IBAN codes, API keys, and authentication tokens with `[INFO_TYPE]` placeholders.  
+    — *Provisioned in [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*  
+    — *Called in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
+  - **Two-Stage Redaction Across Search, JSON & Live Streaming:** Sensitive data is masked both when document passages are retrieved from the vector database and again on the final AI answer before responses are returned or streamed to the user.  
+    — *Provisioned in [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*  
+    — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
+    — *Called in [`src/query/service.py`](src/query/service.py), [`src/agent/tools.py`](src/agent/tools.py), [`src/agent/graph.py`](src/agent/graph.py) & [`src/agent/service.py`](src/agent/service.py)*
+  - **Sanitized Server Error Messages:** Unexpected exceptions across all REST and streaming endpoints log full diagnostic details privately on the server while returning a generic, safe error message to the client.  
+    — *Implemented in [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*  
+    — *Called in [`src/ingest/routes.py`](src/ingest/routes.py), [`src/query/routes.py`](src/query/routes.py), [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
+
+- **4.5 Content Safety**
+  - **Google Cloud Model Armor Responsible AI Filters:** Model Armor screens both incoming user prompts and outgoing AI responses across Hate Speech, Harassment, Sexually Explicit, and Dangerous Content categories.  
+    — *Provisioned in [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*  
+    — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
+    — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
+  - **Vertex AI Gemini Harm-Blocking Thresholds:** Every Gemini model call is configured with explicit harm-blocking thresholds across all four safety categories and post-generation safety block detection.  
+    — *Implemented in [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*  
+    — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
+  - **Polite Refusal Fallback Messages:** Whenever Model Armor or Gemini blocks a prompt or halts generation due to content safety rules, the backend replaces the blocked output with a clear, polite refusal explanation so users never see a blank message bubble.  
+    — *Implemented in [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*  
+    — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
+
+---
+
+### 5. Compliance & Governance
 
 Enterprise governance controls ensure that all data and AI calls stay within approved single-region boundaries, every layer of a request is auditable without exposing personal data, users have self-service privacy controls and AI transparency badges, and operational policies are enforced automatically:
 
-- **10.1 Pillar 1 — Data Residency & Single-Region Pinning**
-  - **Live Organization Policy Verification:** Allowed geographic regions are governed by the project's **Google Cloud Resource Location Restriction** Organization Policy. Before any deployment runs, an automated check queries the live Organization Policy on the project and aborts if no location allowlist is active or if the target region is not permitted.  
+- **5.1 Data Residency & Single-Region Pinning**
+  - **Live Organization Policy Verification:** Allowed geographic regions are governed by the project's Google Cloud Resource Location Restriction Organization Policy. Before any deployment runs, an automated check queries the live Organization Policy on the project and aborts if no location allowlist is active or if the target region is not permitted.  
     — *Implemented in [`infra/scripts/check_region_policy.py`](infra/scripts/check_region_policy.py)*  
     — *Called in [`Makefile`](Makefile)*
-  - **Infrastructure Single-Region Validation:** Terraform validates that the configured deployment location is a concrete single region (such as `us-central1` or `europe-west1`)—rejecting `"global"` and multi-regions (`"us"`, `"eu"`, `"asia"`)—and enforces regional preconditions on storage buckets, security templates, and private endpoints.  
+  - **Infrastructure Single-Region Validation:** Terraform validates that the configured deployment location is a concrete single region (such as `us-central1` or `europe-west1`)—rejecting multi-region or global locations—and enforces regional preconditions on storage buckets, security templates, and private endpoints.  
     — *Provisioned in [`infra/terraform/storage.tf`](infra/terraform/storage.tf), [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf), [`infra/terraform/network.tf`](infra/terraform/network.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
   - **Backend Regional Endpoint Binding:** At runtime, the Python backend validates that the configured location is a single region and explicitly binds all Vertex AI chat models, Vertex AI embedding models, and Model Armor clients to that regional endpoint.  
     — *Implemented in [`src/core/compliance/residency.py`](src/core/compliance/residency.py)*  
     — *Called in [`src/core/storage/chroma.py`](src/core/storage/chroma.py), [`src/agent/graph.py`](src/agent/graph.py) & [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*
 
-- **10.2 Pillar 2 — Privacy-Safe Audit Logging, GCP Data Access Logs & Trace Correlation**
-  - **End-to-End Request & Trace Correlation:** A correlation middleware assigns or forwards a unique request ID (`X-Request-Id`) on every call and links it with Google Cloud's trace context so administrators can filter by a single ID in **Logs Explorer** to trace a request across the Load Balancer, backend microservices, AI safety checks, and cloud storage operations.  
+- **5.2 Privacy-Safe Audit Logging, GCP Data Access Logs & Trace Correlation**
+  - **End-to-End Request & Trace Correlation:** A correlation middleware assigns or forwards a unique request ID on every call and links it with Google Cloud's trace context so administrators can filter by a single ID in Logs Explorer to trace a request across the Load Balancer, backend microservices, AI safety checks, and cloud storage operations.  
     — *Implemented in [`src/core/context.py`](src/core/context.py) & [`src/core/compliance/audit.py`](src/core/compliance/audit.py)*  
     — *Called in [`src/core/app_factory.py`](src/core/app_factory.py)*
-  - **PII-Free Application Audit Stream:** Backend services publish structured JSON audit records to a dedicated audit stream in **Google Cloud Logging** for authentication failures, document uploads, searches, agent chats, collection changes, privacy requests, rate-limit blocks, and safety filter actions—replacing raw user questions with one-way SHA-256 hashes and character counts so personal data never leaks into logs.  
+  - **PII-Free Application Audit Stream:** Backend services publish structured JSON audit records to a dedicated audit stream in Google Cloud Logging for authentication failures, document uploads, searches, agent chats, collection changes, privacy requests, rate-limit blocks, and safety filter actions—replacing raw user questions with one-way SHA-256 hashes and character counts so personal data never leaks into logs.  
     — *Implemented in [`src/core/compliance/audit.py`](src/core/compliance/audit.py)*  
     — *Called in [`src/core/auth.py`](src/core/auth.py), [`src/ingest/routes.py`](src/ingest/routes.py), [`src/query/routes.py`](src/query/routes.py), [`src/agent/routes.py`](src/agent/routes.py), [`src/agent/service.py`](src/agent/service.py), [`src/manage/collections.py`](src/manage/collections.py) & [`src/manage/compliance.py`](src/manage/compliance.py)*
-  - **GCP Data Access Audit Logs & Load Balancer Access Logs:** Terraform enables Google Cloud Data Access Audit Logs (covering administrative reads, data reads, and data writes) for Cloud Storage, Vertex AI, Cloud DLP, and Model Armor alongside HTTP access logging on the HTTPS Load Balancer backends.  
+  - **Google Cloud Data Access Audit Logs & Load Balancer Access Logs:** Terraform enables Google Cloud Data Access Audit Logs (covering administrative reads, data reads, and data writes) for Cloud Storage, Vertex AI, Cloud DLP, and Model Armor alongside HTTP access logging on the HTTPS Load Balancer backends.  
     — *Provisioned in [`infra/terraform/compliance.tf`](infra/terraform/compliance.tf) & [`infra/terraform/load_balancer.tf`](infra/terraform/load_balancer.tf)*
-  - **365-Day Regional Audit Log Archive:** A dedicated Cloud Logging sink routes application audit events, GCP Data Access Audit Logs, and Load Balancer HTTP access logs into a regional Cloud Logging bucket configured with 365-day retention.  
+  - **365-Day Regional Audit Log Archive:** A dedicated Cloud Logging sink routes application audit events, Google Cloud Data Access Audit Logs, and Load Balancer HTTP access logs into a regional Cloud Logging bucket configured with 365-day retention.  
     — *Provisioned in [`infra/terraform/compliance.tf`](infra/terraform/compliance.tf)*
 
-- **10.3 Pillar 3 — Regulatory Compliance (GDPR Self-Service Rights & EU AI Act Art. 50 Provenance)**
-  - **GDPR Art. 15 Right of Access (`GET /compliance/my-data`):** Authenticated users can view a complete inventory of their stored collections, chunk counts, uploaded PDF filenames, live and archived Cloud Storage object counts, total storage bytes, and active chat threads via the API or the **"My Data & Privacy"** modal in the web interface.  
+- **5.3 Regulatory Compliance (GDPR Self-Service Rights & EU AI Act Art. 50 Provenance)**
+  - **GDPR Right of Access (Self-Service Data Inventory):** Authenticated users can view a complete inventory of their stored collections, chunk counts, uploaded PDF filenames, live and archived Cloud Storage object counts, total storage bytes, and active chat threads via the API or the "My Data & Privacy" modal in the web interface.  
     — *Implemented in [`src/core/compliance/dsar.py`](src/core/compliance/dsar.py)*  
     — *Called in [`src/manage/compliance.py`](src/manage/compliance.py) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*
-  - **GDPR Art. 17 Right to Erasure (`DELETE /compliance/my-data`) & Storage Hygiene:** Users can permanently erase all of their data in one action—deleting every live and archived object version in Cloud Storage, wiping local vector and upload caches, and clearing all conversation history from agent memory—complemented by Cloud Storage lifecycle rules that automatically prune archived object versions after 7 days.  
+  - **GDPR Right to Erasure (One-Click Full Account Wipe):** Users can permanently erase all of their data in one action—deleting every live and archived object version in Cloud Storage, wiping local vector and upload caches, and clearing all conversation history from agent memory—complemented by Cloud Storage lifecycle rules that automatically prune archived object versions after 7 days.  
     — *Provisioned in [`infra/terraform/storage.tf`](infra/terraform/storage.tf)*  
     — *Implemented in [`src/core/compliance/dsar.py`](src/core/compliance/dsar.py)*  
     — *Called in [`src/manage/compliance.py`](src/manage/compliance.py) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*
-  - **EU AI Act Art. 50 AI Provenance & Transparency Badges:** Every `/agent` JSON response and `/agent/stream` SSE completion event includes structured provenance metadata and renders visual verification badges in the chat UI allowing the user to see:
-    - **AI Generation, Model & Region:** Whether the reply was AI-generated or stopped by a guardrail, which exact **Gemini model** and **cloud region** produced it, and the correlating request ID.
-    - **Citation Grounding:** Whether document grounding was enforced, whether the answer is backed by inline `[filename.pdf, p.X]` citations, and how many chunks were retrieved.
-    - **PII Redaction & Content Safety Activation:** Whether sensitive personal data (PII) was detected and redacted, whether Model Armor screening was active, which security filters ran, and whether any content safety or prompt-protection guardrails were triggered.  
+  - **EU AI Act Art. 50 AI Generation, Model & Region Transparency Badge:** Every agent response includes structured provenance metadata and renders a visual badge in the chat interface showing whether the reply was AI-generated or stopped by a guardrail, which exact Gemini model and Google Cloud region produced it, and the correlating request ID.  
+    — *Implemented in [`src/core/compliance/provenance.py`](src/core/compliance/provenance.py) & [`src/core/compliance/state.py`](src/core/compliance/state.py)*  
+    — *Called in [`src/agent/schemas.py`](src/agent/schemas.py), [`src/agent/routes.py`](src/agent/routes.py), [`src/agent/service.py`](src/agent/service.py) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*
+  - **EU AI Act Art. 50 Citation Grounding Badge:** Every agent response reports whether document grounding was enforced, whether the answer is backed by inline `[filename.pdf, p.X]` citations, and how many document passages were retrieved.  
+    — *Implemented in [`src/core/compliance/provenance.py`](src/core/compliance/provenance.py) & [`src/core/compliance/state.py`](src/core/compliance/state.py)*  
+    — *Called in [`src/agent/schemas.py`](src/agent/schemas.py), [`src/agent/routes.py`](src/agent/routes.py), [`src/agent/service.py`](src/agent/service.py) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*
+  - **EU AI Act Art. 50 PII Redaction & Safety Filter Badge:** Every agent response reports whether sensitive personal data was detected and redacted by Cloud DLP, whether Model Armor screening was active, which security filters ran, and whether any safety guardrails were triggered.  
     — *Implemented in [`src/core/compliance/provenance.py`](src/core/compliance/provenance.py) & [`src/core/compliance/state.py`](src/core/compliance/state.py)*  
     — *Called in [`src/agent/schemas.py`](src/agent/schemas.py), [`src/agent/routes.py`](src/agent/routes.py), [`src/agent/service.py`](src/agent/service.py) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*
 
-- **10.4 Pillar 4 — Policy Enforcement (Fail-Closed Screening, Rate Limits, Quotas & Pre-Deploy Gates)**
-  - **Fail-Closed Security Screening in Production:** In production deployments, if Google Cloud Model Armor or Cloud DLP is unreachable, misconfigured, or times out during prompt screening, chunk redaction, or output filtering, the backend immediately halts processing, logs a high-severity audit event, and returns `HTTP 503 Service Unavailable` so unscreened content is never exposed.  
+- **5.4 Policy Enforcement (Fail-Closed Screening, Rate Limits, Quotas & Pre-Deploy Gates)**
+  - **Fail-Closed Security Screening in Production:** In production deployments, if Google Cloud Model Armor or Cloud DLP is unreachable, misconfigured, or times out during prompt screening, chunk redaction, or output filtering, the backend immediately halts processing, logs a high-severity audit event, and returns a service-unavailable error so unscreened content is never exposed.  
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
     — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
     — *Called in [`src/ingest/routes.py`](src/ingest/routes.py), [`src/query/routes.py`](src/query/routes.py), [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
-  - **Per-User Sliding-Window Rate Limiters:** Sliding-window rate limiters protect each user account on document uploads (`10/minute` default) and queries (`30/minute` default), returning `HTTP 429 Too Many Requests` with a `Retry-After` header when exceeded.  
+  - **Per-User Sliding-Window Rate Limiters:** Sliding-window rate limiters protect each user account on document uploads (10 per minute by default) and queries (30 per minute by default), returning a rate-limit error with retry timing guidance when exceeded.  
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
     — *Implemented in [`src/core/compliance/policy.py`](src/core/compliance/policy.py)*  
     — *Called in [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py), [`src/query/routes.py`](src/query/routes.py) & [`src/agent/routes.py`](src/agent/routes.py)*
-  - **Per-User Collection Count Quotas:** Each user is capped at a maximum number of collections (`20` default), returning `HTTP 403 Forbidden` when attempting to create a new collection past the limit while still allowing uploads into existing collections.  
+  - **Per-User Collection Count Quotas:** Each user is capped at a maximum number of collections (20 by default), blocking creation of new collections past the limit while still allowing document uploads into existing collections.  
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
     — *Implemented in [`src/core/compliance/policy.py`](src/core/compliance/policy.py)*  
     — *Called in [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py)*
   - **Cloud Run Production Deletion Protection:** Terraform enables accidental deletion protection on Cloud Run services in production deployments.  
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
-  - **Automated Pre-Deploy Policy Gate (`make policy-check`):** Automated policy checks verify live Organization Policy compliance, single-region settings, fail-closed screening, and Terraform validity before any `make plan` or `make deploy` runs.  
+  - **Automated Pre-Deploy Policy Gate:** Automated policy checks verify live Organization Policy compliance, single-region settings, fail-closed screening, and infrastructure configuration validity before any deployment plan or rollout runs.  
     — *Implemented in [`infra/scripts/check_static_policies.py`](infra/scripts/check_static_policies.py) & [`infra/scripts/check_region_policy.py`](infra/scripts/check_region_policy.py)*  
     — *Called in [`Makefile`](Makefile)*
 
 ---
 
-### 11. Observability & AI Monitoring ([`docs/OBSERVABILITY_PLAN.md`](docs/OBSERVABILITY_PLAN.md))
+## VI/ [RELIABILITY & RESILIENCE]
+
+### 1. Observability
 
 While compliance audit logging records *who* performed *what* action and *when* for regulatory accountability, the observability layer gives operators real-time visibility into *how fast*, *at what token cost*, and *with what retrieval and grounding quality* every request executed:
 
-- **11.1 Pillar 1 — Structured Logging & Privacy-Safe Correlation**
-  - **Dual-Mode Application Logging:** When running in the cloud, backend services emit single-line JSON log records containing severity levels, timestamps, source file locations, and trace identifiers so **Google Cloud Logging** can index and filter them automatically—while preserving readable color-coded terminal output during local development.  
+- **1.1 Structured Logging & Privacy-Safe Correlation**
+  - **Dual-Mode Application Logging:** When running in the cloud, backend services emit single-line JSON log records containing severity levels, timestamps, source file locations, and trace identifiers so Google Cloud Logging can index and filter them automatically—while preserving readable color-coded terminal output during local development.  
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
     — *Implemented in [`src/core/observability/logging.py`](src/core/observability/logging.py)*  
     — *Called in [`src/core/logger.py`](src/core/logger.py)*
@@ -574,117 +848,97 @@ While compliance audit logging records *who* performed *what* action and *when* 
   - **Automatic Query Scrubbing Filter:** A built-in log filter automatically intercepts any accidental raw query text before it is written to standard output and replaces it with a one-way SHA-256 hash and character count so user questions never leak into operational logs.  
     — *Implemented in [`src/core/observability/logging.py`](src/core/observability/logging.py)*  
     — *Called in [`src/core/logger.py`](src/core/logger.py)*
-  - **Dedicated Regional Observability Log Bucket:** Operational container logs and AI performance telemetry are routed into a dedicated regional **Google Cloud Logging** bucket with a 30-day retention policy, keeping high-volume operational diagnostics separate from the 365-day compliance audit archive.  
+  - **Dedicated Regional Observability Log Bucket:** Operational container logs and AI performance telemetry are routed into a dedicated regional Google Cloud Logging bucket with a 30-day retention policy, keeping high-volume operational diagnostics separate from the 365-day compliance audit archive.  
     — *Provisioned in [`infra/terraform/observability.tf`](infra/terraform/observability.tf)*
 
-- **11.2 Pillar 2 — Cloud Monitoring Metrics & AI Observability Dashboard**
-  - **Zero-Overhead Log-Based Metrics:** Instead of making extra network calls to a monitoring API during user requests, **Google Cloud's Log Router** automatically extracts 10 custom performance and quality metrics directly from structured telemetry logs—tracking end-to-end turn latency, time-to-first-token, LLM vs. retrieval stage latency, input/output/total token consumption, retrieval similarity scores, ungrounded answer counts, and ingested chunk throughput with zero request-path overhead.  
+- **1.2 Cloud Monitoring Metrics & AI Observability Dashboard**
+  - **Zero-Overhead Log-Based Metrics:** Instead of making extra network calls to a monitoring API during user requests, Google Cloud's Log Router automatically extracts 10 custom performance and quality metrics directly from structured telemetry logs—tracking end-to-end turn latency, time-to-first-token, language model versus retrieval stage latency, input/output/total token consumption, retrieval similarity scores, ungrounded answer counts, and ingested chunk throughput with zero request-path overhead.  
     — *Provisioned in [`infra/terraform/observability.tf`](infra/terraform/observability.tf)*  
     — *Called in [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*
-  - **AI Quality, Latency & Token Dashboard:** Terraform provisions a **Google Cloud Monitoring** dashboard that gives operators a single view of median and tail (95th-percentile) response latency, time-to-first-token, Gemini reasoning vs. vector search stage durations, token consumption by model, retrieval similarity score distributions, ungrounded or blocked response rates, document ingestion throughput, and HTTP traffic volume.  
+  - **AI Quality, Latency & Token Dashboard:** Terraform provisions a Google Cloud Monitoring dashboard that gives operators a single view of median and 95th-percentile response latency, time-to-first-token, Gemini reasoning versus vector search stage durations, token consumption by model, retrieval similarity score distributions, ungrounded or blocked response rates, document ingestion throughput, and HTTP traffic volume.  
     — *Provisioned in [`infra/terraform/observability.tf`](infra/terraform/observability.tf)*
 
-- **11.3 Pillar 3 — Distributed Tracing & Stage-Level Latency Breakdown**
+- **1.3 Distributed Tracing & Stage-Level Latency Breakdown**
   - **Hierarchical Per-Stage Execution Spans:** Every major step of a request—including Cloud Storage synchronization, PDF page splitting, Vertex AI embedding generation, Model Armor input screening, each Gemini reasoning step, ChromaDB similarity search, and output safety screening—is timed as an individual child span linked to the parent request trace so operators can pinpoint exactly which stage dominates latency.  
     — *Implemented in [`src/core/observability/tracing.py`](src/core/observability/tracing.py)*  
     — *Called in [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py), [`src/ingest/splitter.py`](src/ingest/splitter.py), [`src/ingest/service.py`](src/ingest/service.py), [`src/query/service.py`](src/query/service.py), [`src/agent/graph.py`](src/agent/graph.py) & [`src/agent/tools.py`](src/agent/tools.py)*
-  - **Cloud Trace Waterfall Export:** In cloud deployments, completed execution spans are exported to **Google Cloud Trace** so operators can inspect end-to-end request waterfall timelines alongside correlated application logs.  
+  - **Cloud Trace Waterfall Export:** In cloud deployments, completed execution spans are exported to Google Cloud Trace so operators can inspect end-to-end request waterfall timelines alongside correlated application logs.  
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/iam.tf`](infra/terraform/iam.tf)*  
     — *Implemented in [`src/core/observability/tracing.py`](src/core/observability/tracing.py)*  
     — *Called in [`src/core/app_factory.py`](src/core/app_factory.py)*
 
-- **11.4 Pillar 4 — AI-Specific Monitoring (Latency, Token Usage & Retrieval Quality)**
+- **1.4 AI-Specific Monitoring (Latency, Token Usage & Retrieval Quality)**
   - **Turn Latency, Stage Breakdown & Time-to-First-Token:** Every completed ingestion, similarity search, and agent conversation turn emits a structured telemetry summary recording total wall-clock duration, a millisecond breakdown across internal pipeline stages, and—for live streaming chats—the Time-to-First-Token (how quickly the user sees the first streamed event).  
     — *Implemented in [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py) & [`src/core/observability/state.py`](src/core/observability/state.py)*  
     — *Called in [`src/ingest/routes.py`](src/ingest/routes.py), [`src/query/routes.py`](src/query/routes.py), [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
-  - **Multi-Step Gemini Token Accounting:** Because an agent turn may invoke Gemini multiple times across iterative tool-calling steps, the backend extracts prompt, completion, and total token counts from each model call and aggregates total token usage and LLM call counts across the entire conversation turn for accurate cost tracking.  
+  - **Multi-Step Gemini Token Accounting:** Because an agent turn may invoke Gemini multiple times across iterative tool-calling steps, the backend extracts prompt, completion, and total token counts from each model call and aggregates total token usage and model call counts across the entire conversation turn for accurate cost tracking.  
     — *Implemented in [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*  
     — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
-  - **Deterministic Retrieval & Grounding Quality Signals:** Every search and agent turn records normalized vector similarity scores (top and average match quality), the number of retriever tool calls and chunks fetched, the number of inline `[filename.pdf, p.X]` citations produced, and whether the final answer was properly grounded—providing continuous retrieval quality signals without paying for extra LLM-as-a-judge calls.  
+  - **Deterministic Retrieval & Grounding Quality Signals:** Every search and agent turn records normalized vector similarity scores (top and average match quality), the number of retriever tool calls and chunks fetched, the number of inline `[filename.pdf, p.X]` citations produced, and whether the final answer was properly grounded—providing continuous retrieval quality signals without paying for extra evaluation model calls.  
     — *Implemented in [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*  
     — *Called in [`src/agent/tools.py`](src/agent/tools.py), [`src/query/service.py`](src/query/service.py), [`src/agent/routes.py`](src/agent/routes.py) & [`src/agent/service.py`](src/agent/service.py)*
 
 ---
 
-### 12. Scalability, Elasticity & Resource Efficiency ([`docs/SCALABILITY_ELASTICITY_PLAN.md`](docs/SCALABILITY_ELASTICITY_PLAN.md))
+### 2. Graceful Degradation
 
-InteractiveRAG combines workload-isolated microservice packaging with compute right-sizing, scale-to-zero autoscaling, bounded in-memory `/tmp` cache management, and incremental Cloud Storage delta sync so heavy PDF uploads never degrade interactive user latency while minimizing compute and storage cost:
+The platform is engineered to handle partial component failures, search edge cases, lock contention, and runaway agent loops predictably across four resilience pillars:
 
-- **12.1 Workload-Isolated Microservice Packaging (4 Packages Across 2 Backend Services)**
-  - **Dedicated Heavy-Write Ingestion Service (`ingest-api`):** Runs only the document ingestion package (`POST /ingest`) on dedicated instances so CPU-intensive PDF parsing and vector index construction never compete with or slow down live user chats.  
+- **2.1 Fallback Strategies**
+  - **Hybrid Search to Dense Semantic Search Fallback:** During document retrieval, if the keyword search index encounters an unexpected error or a user's question shares zero exact keywords with the collection, search transparently falls back to normalized dense semantic vector similarity scores rather than failing the request.  
+    — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
+    — *Called in [`src/query/service.py`](src/query/service.py) & [`src/agent/tools.py`](src/agent/tools.py)*
+  - **Bounded Agent Step-Limit Fallback:** When an ambiguous question causes the agent's search loop to reach its maximum allowed step count (6 steps by default) without converging, the backend catches the step-limit condition, records an audit event, and returns a polite message asking the user to narrow or rephrase their question instead of crashing with a server error.  
+    — *Implemented in [`src/agent/service.py`](src/agent/service.py) & [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*  
+    — *Called in [`src/agent/routes.py`](src/agent/routes.py)*
+  - **Mid-Stream Server-Sent Events Error Recovery:** If a security block or unexpected error occurs while an answer is actively streaming to the browser, the stream generator catches the failure, logs an audit record, sends a structured error event carrying a safe user-facing message, and closes the stream cleanly so the chat interface never freezes on a broken connection.  
+    — *Implemented in [`src/agent/service.py`](src/agent/service.py) & [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*  
+    — *Called in [`src/agent/routes.py`](src/agent/routes.py)*
+  - **Polite Safety Refusal Fallbacks:** Whenever a prompt or response is blocked by Model Armor or Gemini safety thresholds, the backend replaces the blocked content with a clear, polite refusal message so users never receive a blank response.  
+    — *Implemented in [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py) & [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
+    — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
+  - **Cloud Logging Standard-Output Fallback:** When the audit or telemetry publisher cannot reach the Google Cloud Logging API directly, it catches the network error and falls back to writing a single-line structured JSON record to standard output so Cloud Run's built-in log collector still captures the event.  
+    — *Implemented in [`src/core/compliance/audit.py`](src/core/compliance/audit.py) & [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*
+  - **Cloud Trace Outage Isolation:** Optional Cloud Trace export errors are caught and isolated in the background so a tracing service outage can never interrupt live user traffic.  
+    — *Implemented in [`src/core/observability/tracing.py`](src/core/observability/tracing.py)*
+  - **Collection Embedding Model & Safety Threshold Configuration Fallbacks:** If an older collection lacks explicit embedding model metadata, the backend automatically infers the embedding model from the stored vector dimensions or falls back to the primary approved embedding model; similarly, unrecognized safety threshold strings automatically fall back to the strictest harm-blocking level.  
+    — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py) & [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*
+
+- **2.2 Fail-Closed Security Short-Circuiting & Load Shedding**
+  - **Pre-Flight Fail-Closed Security Short-Circuiting in Production:** Before opening a live stream or calling Vertex AI or ChromaDB, the backend verifies that Model Armor and Cloud DLP screening are reachable and properly configured. In production, if the security screening service is unavailable, execution stops immediately with a service-unavailable response rather than sending unscreened requests to downstream AI models.  
+    — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
+    — *Called in [`src/agent/routes.py`](src/agent/routes.py), [`src/agent/service.py`](src/agent/service.py), [`src/query/service.py`](src/query/service.py) & [`src/ingest/routes.py`](src/ingest/routes.py)*
+  - **Fail-Open Mode for Offline Local Development:** When running locally without cloud security templates configured, developers can explicitly enable fail-open mode so local testing can proceed without calling regional Model Armor endpoints.  
+    — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py) & [`src/core/config.py`](src/core/config.py)*
+  - **Per-User Sliding-Window Rate Limiting:** Per-user sliding-window rate limiters reject sudden upload or query traffic bursts at the entry gate before they can exhaust container memory or downstream Vertex AI quotas.  
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
-    — *Implemented in [`src/ingest/routes.py`](src/ingest/routes.py)*  
-    — *Called in [`src/ingest/app.py`](src/ingest/app.py)*
-  - **Unified Interactive Read, Management & Agent Service (`agent-api`):** Co-locates collection management, direct similarity search, and multi-turn LangGraph agent execution on a single interactive service so searches and follow-up chat turns share the same warm local vector cache, unified query rate limiter, and atomic GDPR data inventory and erasure workflow.  
-    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
-    — *Implemented in [`src/agent/routes.py`](src/agent/routes.py), [`src/query/routes.py`](src/query/routes.py) & [`src/manage/routes.py`](src/manage/routes.py)*  
-    — *Called in [`src/agent/app.py`](src/agent/app.py)*
+    — *Implemented in [`src/core/compliance/policy.py`](src/core/compliance/policy.py)*  
+    — *Called in [`src/ingest/upload_parser.py`](src/ingest/upload_parser.py), [`src/query/routes.py`](src/query/routes.py) & [`src/agent/routes.py`](src/agent/routes.py)*
+  - **Per-Container Concurrency Load Shedding:** Cloud Run per-instance concurrency ceilings cap how many simultaneous requests a single container will accept before excess traffic is routed to a new instance or shed cleanly.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
 
-- **12.2 Compute Right-Sizing & Autoscaling Strategies (Horizontal, Vertical & Network Profiles)**
-  - **Right-Sized Vertical CPU & Memory Allocations (`Compute Right-Sizing`):** Rather than over-provisioning every container for peak PDF parsing memory, compute resources are right-sized per workload—provisioning `ingest-api` with `2 vCPU` and `4 GiB` of RAM (for concurrent `PyPDFLoader` parsing, batch embedding generation, and `/tmp` HNSW index writes), `agent-api` with `2 vCPU` and `2 GiB` of RAM (for I/O-bound LangGraph streaming and warm `/tmp` vector cache reads), and `frontend` with `1 vCPU` and `512 MiB` of RAM.  
-    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*
-  - **Request-Scoped CPU Billing (`cpu_idle = true`) & Cold-Start Boost (`startup_cpu_boost = true`):** All three Cloud Run services enable `cpu_idle = true` (throttling CPU and billing only while a container is actively handling a request) and `startup_cpu_boost = true` (temporarily boosting CPU during container initialization to reduce Python/LangChain cold-start latency without paying for permanently oversized CPU).  
-    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
-  - **Workload-Tuned Request Concurrency Ceilings:** Each Cloud Run service enforces a per-instance request concurrency limit tailored to its workload—limiting `ingest-api` to `4` concurrent uploads per container to prevent CPU contention, allowing `32` concurrent interactive requests per container on `agent-api` (since chat and search spend most of their time waiting on external Vertex AI / DLP network I/O), and `80` concurrent requests on the static `frontend`.  
-    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*
-  - **Scale-to-Zero Elasticity & Service-Specific Horizontal Scale-Out Caps (`Autoscaling Strategies`):** Cloud Run automatically scales each service from `min_instance_count = 0` (zero idle compute cost when no requests are active, configurable via `var.*_min_instances`) up to service-specific maximums—capping `ingest-api` at `5` instances (`20` concurrent PDF uploads) to protect downstream Vertex AI and Cloud DLP quotas, while scaling `agent-api` up to `10` instances (`320` concurrent interactive requests) and `frontend` up to `5` instances (`400` concurrent requests).  
-    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*
-  - **Session Affinity for Multi-Turn Conversations:** Cloud Run `session_affinity = true` is enabled on `agent-api` so consecutive turns from the same user prefer the same warm container instance, maximizing hits on the user's in-memory `MEMORY_SAVER` checkpointer and local `/tmp/chroma_db/{uid}` vector cache.  
-    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
-  - **Expanded `/24` Private VPC Subnets for Scale-Out Headroom:** Both private backend subnets are sized as `/24` CIDR blocks (`251` usable IP addresses each), ensuring serverless Direct VPC Egress never runs out of private IP addresses during traffic spikes or revision rollouts.  
-    — *Provisioned in [`infra/terraform/network.tf`](infra/terraform/network.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*  
-    — *Called in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
-  - **Bounded In-Memory `/tmp` Vector Cache Quotas:** Because Cloud Run mounts `/tmp` directly inside container RAM, both backend services enforce a `512 MiB` cap (`CHROMA_TMP_MAX_BYTES`) on cached user vector databases and maintain at least `256 MiB` of free container memory (`CHROMA_TMP_MIN_FREE_BYTES`)—automatically evicting the oldest inactive user caches via LRU before memory pressure can trigger an out-of-memory crash.  
-    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*  
+- **2.3 Retry Policies**
+  - **Exponential Backoff with Random Jitter on Distributed Storage Locks:** When two concurrent write requests for the same user contend for the user's distributed vector database lock in Cloud Storage, the waiting container retries lock acquisition using exponential backoff (starting at 0.25 seconds and scaling up to 2 seconds) plus random jitter to prevent synchronized retry collisions across containers.  
     — *Implemented in [`src/core/storage/locks.py`](src/core/storage/locks.py)*  
     — *Called in [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py)*
+  - **Non-Penalizing Rate-Limit Retry Guidance:** When a request exceeds a user's rate limit, the rate limiter calculates the exact number of seconds until the oldest request leaves the 60-second window, returns that wait time in the HTTP `Retry-After` response header, and intentionally does not count the rejected attempt against the user's window so well-behaved clients can retry cleanly.  
+    — *Implemented in [`src/core/compliance/policy.py`](src/core/compliance/policy.py)*
+  - **Automatic Browser Authentication Token Refresh:** On the client side, the web application automatically refreshes expired user authentication tokens through the Firebase Authentication SDK before sending API or streaming requests.  
+    — *Implemented in [`frontend/src/api.js`](frontend/src/api.js)*
 
-- **12.3 API Throughput, Incremental Storage Sync & Scaling Observability**
-  - **Parallel Retrieval-Time Privacy Screening:** When a similarity search or agent tool call retrieves top-$k$ chunks from ChromaDB, the backend screens all retrieved chunks for sensitive personal data concurrently across a bounded pool of up to `8` worker threads (`1` chunk per thread) instead of scanning them one after another—cutting retrieval-stage screening latency to the duration of a single chunk scan.  
-    — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
-    — *Called in [`src/query/service.py`](src/query/service.py) & [`src/agent/tools.py`](src/agent/tools.py)*
-  - **Incremental MD5 Cloud Storage Delta Synchronization:** When pushing updated ChromaDB files back to Cloud Storage after an upload or collection deletion, the backend compares local file MD5 checksums against remote Cloud Storage object metadata and uploads only new or modified files, avoiding redundant multi-megabyte uploads as user vector databases grow.  
-    — *Implemented in [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py)*  
-    — *Called in [`src/ingest/routes.py`](src/ingest/routes.py) & [`src/manage/collections.py`](src/manage/collections.py)*
-  - **Infrastructure Scaling & Utilization Dashboard Panels:** The Cloud Monitoring dashboard includes dedicated scaling panels charting active vs. idle container instance counts, 95th-percentile concurrent requests per instance, CPU utilization, and container memory utilization across all services.  
-    — *Provisioned in [`infra/terraform/observability.tf`](infra/terraform/observability.tf)*
-  - **Automated Latency, Memory Saturation & Error Alert Policies:** Cloud Monitoring alert policies automatically notify operators whenever 95th-percentile agent turn latency exceeds `15 seconds` over a sustained `5-minute` window, container memory utilization exceeds `85%` over `3 minutes`, or server `5xx` error rates exceed `0.05 requests/second` over `2 minutes`.  
-    — *Provisioned in [`infra/terraform/observability.tf`](infra/terraform/observability.tf)*
-
-> **Note on Unimplemented / Non-Relevant Pillars:**
-> - **GPU Right-Sizing & Spot / Preemptible Compute Usage (*Not Implemented — Not Relevant*):** Provisioning or right-sizing GPUs and Spot/Preemptible VMs (Compute Engine or GKE node pools) is not relevant to InteractiveRAG's serverless architecture because all deep-learning inference (Gemini 2.5 reasoning, dense vector embedding generation, and Model Armor safety screening) is offloaded to fully managed, pay-per-token **Google Cloud Vertex AI** and **Model Armor** regional APIs, while the application tier runs on serverless **Google Cloud Run** containers with scale-to-zero (`min_instance_count = 0`) and request-scoped CPU billing (`cpu_idle = true`), eliminating idle VM and GPU hardware costs entirely.
-
----
-
-### 13. Testing & Quality Engineering ([`tests/`](tests/), [`infra/scripts/`](infra/scripts/))
-
-Quality, security, and multi-tenant isolation are verified across unit, integration, end-to-end, and infrastructure policy layers before code or Terraform changes are deployed:
-
-- **13.1 Pillar 1 — Unit, Integration & End-to-End (E2E) Testing**
-  - **Deterministic Offline Unit Test Suites (`tests/`):** Six domain-specific `unittest` suites verify every backend and infrastructure layer completely offline using deterministic in-memory test doubles in [`tests/helpers.py`](tests/helpers.py) (`FakeGCSBucket` & `FakeGCSBlob` supporting atomic `if_generation_match` preconditions, MD5 digests, and object versioning; `DeterministicFakeEmbeddings`; `GroundedCitingChatModel`; `make_test_pdf`; and Model Armor/Cloud DLP response builders):
-    - [`tests/auth.py`](tests/auth.py) — RS256 Bearer JWT verification, expired/revoked/forged token rejection (`HTTP 401`), UID path-traversal validation, local dev bypass, and Cloud Run fail-closed enforcement.
-    - [`tests/storage.py`](tests/storage.py) — Per-user GCS $\leftrightarrow$ `/tmp` snapshot synchronization, `version.json` tracking, incremental MD5 delta uploads, atomic GCS distributed write locks with stale-lock TTL recovery, bounded `/tmp` LRU cache eviction, and hybrid dense + BM25 RRF search.
-    - [`tests/ai_security.py`](tests/ai_security.py) — All 5 AI security pillars (Model Armor prompt injection screening, XML spotlighting, model allowlists & collection-bound embedding consistency, PDF `%PDF-` magic-byte/size/chunk guardrails, two-stage Cloud DLP redaction, sanitized errors, and dual-layer RAI content safety).
-    - [`tests/compliance.py`](tests/compliance.py) — Single-region residency validation, live Org Policy parser checks, PII-free SHA-256 audit logging, GDPR Art. 15 inventory & Art. 17 versioned erasure, EU AI Act Art. 50 provenance metadata, fail-closed `HTTP 503` screening, sliding-window rate limiters (`HTTP 429`), and collection quotas (`HTTP 403`).
-    - [`tests/observability.py`](tests/observability.py) — Structured GCP JSON logging, automatic query scrubbing filter, trace/span correlation, hierarchical per-stage latency breakdown, Time-to-First-Token (TTFT), multi-step Gemini token accounting, and retrieval/grounding telemetry.
-    - [`tests/scalability_elasticity.py`](tests/scalability_elasticity.py) — 4-package/2-service route isolation (`ingest-api` vs. `agent-api`), Cloud Run concurrency/CPU/memory/session-affinity HCL invariants, `/24` VPC subnet sizing, `/tmp` cache eviction under memory pressure, parallel DLP chunk screening, and Cloud Monitoring scaling alerts.
-  - **Multi-Tenant FastAPI Integration Suite (`tests/multi_tenant_api.py`):** Exercises the assembled FastAPI microservices (`src.ingest.app:app` and `src.agent.app:app`) via `fastapi.testclient.TestClient` across multi-user PDF upload, GCS archiving, similarity search, collection management, GDPR erasure, and live SSE streaming (`POST /agent/stream`), verifying that User Alice and User Bob remain strictly isolated even when creating collections and conversation threads with identical names.  
-    — *Implemented in [`tests/multi_tenant_api.py`](tests/multi_tenant_api.py) & [`tests/helpers.py`](tests/helpers.py)*
-  - **Live End-to-End HTTP & SSE Smoke Scripts (`tests/ingestion.py` & `tests/agent.py`):** Live E2E smoke tests execute against locally running `ingest-api` (port `8000`) and `agent-api` (port `8001`) instances using real PDF files in [`data/`](data/), local ChromaDB persistence, and live Vertex AI embeddings and Gemini tool-calling across both synchronous JSON (`POST /agent`) and Server-Sent Events streaming (`POST /agent/stream`).  
-    — *Implemented in [`tests/ingestion.py`](tests/ingestion.py) & [`tests/agent.py`](tests/agent.py)*
-
-- **13.2 Pillar 2 — Test & Policy Gate Automation**
-  - **Automated Pre-Deploy Policy & HCL Verification (`make policy-check`):** [`Makefile`](Makefile) automates [`infra/scripts/check_static_policies.py`](infra/scripts/check_static_policies.py) (`make check-static-policy`), [`infra/scripts/check_region_policy.py`](infra/scripts/check_region_policy.py) (`make check-region-policy`), and `terraform validate` (`make validate`) as mandatory pre-flight gates before `make plan` and `make deploy`.  
-    — *Implemented in [`infra/scripts/check_static_policies.py`](infra/scripts/check_static_policies.py), [`infra/scripts/check_region_policy.py`](infra/scripts/check_region_policy.py) & [`Makefile`](Makefile)*
-  - **Synthetic Repository Mutation Testing (`create_synthetic_repo_copy`):** [`tests/compliance.py`](tests/compliance.py) and [`tests/scalability_elasticity.py`](tests/scalability_elasticity.py) clone `infra/` and `src/core/config.py` into temporary synthetic directories (`create_synthetic_repo_copy` in [`tests/helpers.py`](tests/helpers.py)) and inject deliberate policy violations (such as `"global"` regions, disabled `model_armor_fail_closed`, missing `deletion_protection`, or undersized subnets) to verify that the static policy gate reliably catches regressions.  
-    — *Implemented in [`tests/helpers.py`](tests/helpers.py), [`tests/compliance.py`](tests/compliance.py) & [`tests/scalability_elasticity.py`](tests/scalability_elasticity.py)*
-
-- **13.3 Pillar 3 — Test Coverage Across Architectural Layers**
-  - **1-to-1 Architectural Layer & Pillar Verification:** Every backend package (`src/core/*`, `src/ingest/*`, `src/manage/*`, `src/query/*`, `src/agent/*`) and Terraform infrastructure module (`infra/terraform/*.tf`) is paired with dedicated positive and negative test cases covering authentication, cross-tenant isolation, AI security guardrails, DLP redaction, GDPR/EU AI Act compliance, observability telemetry, and scaling invariants.  
-    — *Implemented in [`tests/auth.py`](tests/auth.py), [`tests/storage.py`](tests/storage.py), [`tests/multi_tenant_api.py`](tests/multi_tenant_api.py), [`tests/ai_security.py`](tests/ai_security.py), [`tests/compliance.py`](tests/compliance.py), [`tests/observability.py`](tests/observability.py) & [`tests/scalability_elasticity.py`](tests/scalability_elasticity.py)*
+- **2.4 Timeout Handling & Stale-Lock Crash Recovery**
+  - **Bounded Distributed Lock Wait Timeout:** Distributed write lock acquisition enforces a strict timeout (60 seconds by default). If another active upload holds the user's lock past the deadline, the waiting request returns a clean conflict error rather than hanging worker threads indefinitely.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*  
+    — *Implemented in [`src/core/storage/locks.py`](src/core/storage/locks.py)*  
+    — *Called in [`src/ingest/routes.py`](src/ingest/routes.py), [`src/agent/routes.py`](src/agent/routes.py), [`src/manage/collections.py`](src/manage/collections.py) & [`src/manage/compliance.py`](src/manage/compliance.py)*
+  - **Automatic Expired-Lock Crash Recovery:** Every distributed lock file in Cloud Storage includes an expiration timestamp (300 seconds by default). If a container crashes mid-write while holding a user's lock, subsequent write requests automatically detect that the lock has expired and atomically take over the stale lock so a user's vector database never becomes permanently deadlocked.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf) & [`infra/terraform/variables.tf`](infra/terraform/variables.tf)*  
+    — *Implemented in [`src/core/storage/locks.py`](src/core/storage/locks.py)*
+  - **Workload-Tailored Cloud Run Request Timeouts:** Terraform configures request timeouts matched to each microservice's workload—300 seconds on the Ingestion and Agent services (to accommodate multi-PDF embedding and multi-step streaming reasoning) and 60 seconds on the static Frontend service.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
 
 > **Note on Unimplemented Pillars:**
-> - **Automated Load & Performance Benchmarking, Browser UI E2E Tests & Code-Coverage Threshold Gates (*Not Implemented — Relevant*):** While [`tests/scalability_elasticity.py`](tests/scalability_elasticity.py) verifies concurrency ceilings, parallel DLP worker pools, and `/tmp` memory eviction logic, a dedicated load and performance benchmarking suite (e.g., Locust or k6 stress-testing concurrent PDF ingestions and SSE streams against live Cloud Run instances), automated browser E2E tests (e.g., Playwright or Cypress for the React dashboard), and automated code-coverage percentage gates (`coverage.py` / `pytest-cov` in CI) are not yet implemented and remain relevant quality engineering enhancements.
+> - **Stateful Upstream Circuit Breakers & Automatic Cross-Model Failover (*Not Implemented — Relevant*):** While the platform enforces pre-flight fail-closed security short-circuiting, exponential backoff with jitter on distributed storage locks, bounded lock and request timeouts with automatic expired-lock crash recovery, and dense-only search fallback, a stateful circuit-breaker state machine (tracking consecutive upstream failure rates across requests) and automatic cross-model failover (such as automatically retrying a timed-out `gemini-2.5-pro` call with `gemini-2.5-flash`) are not yet implemented and remain relevant future resilience enhancements.
 
 ---
 
@@ -775,13 +1029,6 @@ InteractiveRAG/
 │       ├── variables.tf                # Parameterized infrastructure, scaling, security & compliance settings
 │       ├── outputs.tf                  # Deployed URLs, IPs, bucket names & template identifiers
 │       └── terraform.tfvars.example    # Template for environment-specific variable values
-├── docs/                               # Architecture, security, observability & scaling blueprints
-│   ├── GCP_DEPLOYMENT_PLAN.md          # Cloud Deployment, IaC, CI/CD, Config, Auth & Multi-Tenant Persistence
-│   ├── NETWORK_SECURITY_PLAN.md        # Zero-Internet VPC & Network Security
-│   ├── AI_SECURITY_PLAN.md             # AI-Specific Security & Cloud DLP (5 Pillars)
-│   ├── COMPLIANCE_GOVERNANCE_PLAN.md   # Compliance, Data Privacy & Governance
-│   ├── OBSERVABILITY_PLAN.md           # Observability & AI Monitoring (4 Pillars)
-│   └── SCALABILITY_ELASTICITY_PLAN.md  # Scalability, Elasticity & Resource Efficiency (6 Pillars)
 ├── tests/                              # Automated unit suites & live smoke scripts
 │   ├── helpers.py                      # Shared offline test doubles, fake GCS/LLM/embeddings & lifecycle utilities
 │   ├── auth.py                         # Token verification, tenant UID validation & bypass tests
