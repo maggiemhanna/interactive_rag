@@ -6,10 +6,12 @@ loading, and deletion operations over a tenant's `persist_directory`.
 """
 
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import chromadb
 from langchain_chroma import Chroma
+from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
@@ -160,41 +162,138 @@ def get_vectorstore(
     )
 
 
+def _tokenize_bm25(text: str) -> List[str]:
+    """Tokenizes text into lowercase alphanumeric and hyphenated terms for BM25 lexical matching."""
+    return re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)*", (text or "").lower())
+
+
+def _doc_rrf_key(doc: Document) -> Tuple[str, Tuple[Tuple[str, str], ...]]:
+    """Builds a deterministic hashable key from a `Document`'s content and metadata for RRF deduplication."""
+    meta = doc.metadata if isinstance(getattr(doc, "metadata", None), dict) else {}
+    sorted_meta = tuple(sorted((str(mk), str(mv)) for mk, mv in meta.items()))
+    return (doc.page_content, sorted_meta)
+
+
 def similarity_search_with_scores(
     vectorstore: Any,
     query: str,
     k: int = 5,
+    rrf_k: int = 60,
+    dense_weight: float = 0.5,
+    bm25_weight: float = 0.5,
 ) -> Tuple[List[Document], List[Any]]:
-    """Executes top-k similarity search and converts raw distances into normalized `[0.0, 1.0]` scores.
+    """Executes top-k hybrid search (dense Chroma similarity + sparse BM25 via RRF) with normalized `[0.0, 1.0]` scores.
 
-    Falls back to `vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": k})`
-    when `vectorstore` is a lightweight test double that does not implement
-    `similarity_search_with_score`.
+    Combines dense vector search (`vectorstore.similarity_search_with_score`) with lexical BM25
+    retrieval (`BM25Retriever` built over `vectorstore.get(include=["documents", "metadatas"])`)
+    using Reciprocal Rank Fusion (RRF), normalizing fused scores against the theoretical maximum
+    rank-1 RRF score (`(dense_weight + bm25_weight) / (1 + rrf_k)`). Gracefully degrades to
+    dense-only similarity scores when `vectorstore.get` is unavailable or returns no positive
+    BM25 matches, and falls back to `vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": k})`
+    when `vectorstore` is a lightweight test double without `similarity_search_with_score`.
 
     Args:
         vectorstore: Initialized `Chroma` vectorstore (or retriever-compatible mock).
         query: Validated search query string.
         k: Maximum number of chunks to retrieve.
+        rrf_k: Reciprocal Rank Fusion rank smoothing constant (defaults to `60`).
+        dense_weight: Relative RRF weight for dense vector similarity ranks (defaults to `0.5`).
+        bm25_weight: Relative RRF weight for sparse BM25 lexical ranks (defaults to `0.5`).
 
     Returns:
         Tuple of `(docs, scored_items)` where `docs` is `List[Document]` and `scored_items`
         is suitable for `record_retrieval_metrics(...)`.
     """
-    if hasattr(vectorstore, "similarity_search_with_score"):
-        raw_pairs = vectorstore.similarity_search_with_score(query, k=k)
-        docs = [doc for doc, _ in raw_pairs]
+    if not hasattr(vectorstore, "similarity_search_with_score"):
+        retriever = vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": k},
+        )
+        docs = list(retriever.invoke(query))
+        return docs, docs
+
+    # 1. Dense vector search (Chroma) — fetch a candidate pool for RRF when hybrid BM25 is enabled
+    use_hybrid = bm25_weight > 0.0 and hasattr(vectorstore, "get")
+    candidate_k = max(k * 2, 10) if use_hybrid else k
+    raw_pairs = vectorstore.similarity_search_with_score(query, k=candidate_k)
+
+    # 2. Sparse lexical search (BM25 over collection documents, retaining positive lexical matches)
+    bm25_docs: List[Document] = []
+    if use_hybrid:
+        try:
+            stored = vectorstore.get(include=["documents", "metadatas"])
+            raw_texts = (stored or {}).get("documents") if isinstance(stored, dict) else None
+            if isinstance(raw_texts, list) and raw_texts and all(isinstance(t, str) for t in raw_texts):
+                raw_metadatas = stored.get("metadatas") if isinstance(stored, dict) else None
+                if isinstance(raw_metadatas, list) and len(raw_metadatas) == len(raw_texts):
+                    metadatas = [m if isinstance(m, dict) else {} for m in raw_metadatas]
+                else:
+                    metadatas = [{} for _ in raw_texts]
+                bm25_retriever = BM25Retriever.from_texts(
+                    texts=raw_texts,
+                    metadatas=metadatas,
+                    k=candidate_k,
+                    preprocess_func=_tokenize_bm25,
+                )
+                query_tokens = bm25_retriever.preprocess_func(query)
+                if query_tokens and getattr(bm25_retriever, "vectorizer", None) is not None:
+                    raw_bm25_scores = bm25_retriever.vectorizer.get_scores(query_tokens)
+                    positive_keys = {
+                        _doc_rrf_key(doc)
+                        for doc, score in zip(bm25_retriever.docs, raw_bm25_scores)
+                        if float(score) > 0.0
+                    }
+                    if positive_keys:
+                        bm25_docs = [
+                            doc
+                            for doc in bm25_retriever.invoke(query)
+                            if _doc_rrf_key(doc) in positive_keys
+                        ]
+        except Exception:
+            bm25_docs = []
+
+    if not bm25_docs:
+        top_dense = raw_pairs[:k]
+        docs = [doc for doc, _ in top_dense]
         scored: List[Any] = [
             (doc, round(1.0 / (1.0 + max(0.0, float(dist))), 4))
-            for doc, dist in raw_pairs
+            for doc, dist in top_dense
         ]
         return docs, scored
 
-    retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": k},
-    )
-    docs = list(retriever.invoke(query))
-    return docs, docs
+    # 3. Reciprocal Rank Fusion (RRF) normalized to [0.0, 1.0]
+    safe_rrf_k = max(1, int(rrf_k))
+    total_weight = max(1e-9, float(dense_weight) + float(bm25_weight))
+    max_rrf = total_weight / (1.0 + safe_rrf_k)
+
+    fused_scores: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], float] = {}
+    doc_map: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], Document] = {}
+    seen_dense: set = set()
+    seen_bm25: set = set()
+
+    for rank, (doc, _dist) in enumerate(raw_pairs, start=1):
+        key = _doc_rrf_key(doc)
+        if key in seen_dense:
+            continue
+        seen_dense.add(key)
+        doc_map[key] = doc
+        fused_scores[key] = fused_scores.get(key, 0.0) + (float(dense_weight) / (rank + safe_rrf_k))
+
+    for rank, doc in enumerate(bm25_docs, start=1):
+        key = _doc_rrf_key(doc)
+        if key in seen_bm25:
+            continue
+        seen_bm25.add(key)
+        doc_map.setdefault(key, doc)
+        fused_scores[key] = fused_scores.get(key, 0.0) + (float(bm25_weight) / (rank + safe_rrf_k))
+
+    ranked_keys = sorted(fused_scores, key=lambda key: fused_scores[key], reverse=True)[:k]
+    docs = [doc_map[key] for key in ranked_keys]
+    scored = [
+        (doc_map[key], round(min(1.0, max(0.0, fused_scores[key] / max_rrf)), 4))
+        for key in ranked_keys
+    ]
+    return docs, scored
 
 
 def has_sqlite(persist_directory: str) -> bool:

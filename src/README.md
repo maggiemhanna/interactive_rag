@@ -48,7 +48,7 @@ To prevent CPU- and memory-intensive PDF ingestion from blocking interactive que
 - **`paths.py`**: Isolates per-user local directories (`/tmp/chroma_db/{uid}`, `/tmp/uploads/{uid}`), constructs GCS object prefixes, checkpoints SQLite WAL files, and evicts cached Chroma `SharedSystemClient` registries (`release_client_cache`).
 - **`gcs_sync.py`**: Pulls and pushes per-user ChromaDB snapshots between `/tmp` and `gs://<bucket>/users/{uid}/chroma_db/` with incremental MD5 delta sync (`_compute_file_md5_base64`, uploading only new or changed files and deleting stale remote blobs), `version.json` invalidation, and raw PDF upload archiving (`archive_upload`).
 - **`locks.py`**: Coordinates per-user `threading.RLock` instances, distributed `if_generation_match` GCS write locks with TTL stale-lock recovery (`user_write_lock`, `user_read_lock`), and bounded `/tmp` `tmpfs` LRU cache eviction (`evict_tmp_cache` enforcing `CHROMA_TMP_MAX_BYTES=512 MiB` and `CHROMA_TMP_MIN_FREE_BYTES=256 MiB`).
-- **`chroma.py`**: Instantiates regional Vertex AI `GoogleGenerativeAIEmbeddings`, persists and resolves each collection's bound `embedding_model` in Chroma collection metadata (`get_collection_embedding_model`, `resolve_collection_embedding_model`), executes normalized similarity search (`similarity_search_with_scores`), and manages per-user Chroma collections (`get_vectorstore`, `require_collection`, `list_collections`, `remove_collection`).
+- **`chroma.py`**: Instantiates regional Vertex AI `GoogleGenerativeAIEmbeddings`, persists and resolves each collection's bound `embedding_model` in Chroma collection metadata (`get_collection_embedding_model`, `resolve_collection_embedding_model`), executes normalized hybrid search combining dense Chroma vector similarity and `BM25Retriever` (`rank-bm25`) via Reciprocal Rank Fusion (`similarity_search_with_scores`), and manages per-user Chroma collections (`get_vectorstore`, `require_collection`, `list_collections`, `remove_collection`).
 
 ### `src/core/ai_security/` - Model Armor, Content Safety & Guardrails
 - **`armor.py`**: Regional Google Cloud Model Armor + Cloud Data Loss Prevention (SDP) screening for user prompts (`screen_user_prompt`), retrieved document chunks (`sanitize_chunk_text`, `sanitize_retrieved_documents`), and final LLM responses (`sanitize_model_output`) with fail-closed behavior in Cloud Run.
@@ -116,9 +116,9 @@ curl -X POST "http://localhost:8000/ingest" \
 
 ## 4. `src/query/` - Direct Vector Similarity Search Package
 
-`src/query/` encapsulates direct top-$k$ semantic similarity search against a user's ChromaDB collection, mounted onto `agent-api`:
+`src/query/` encapsulates direct top-$k$ hybrid search (dense vector similarity + sparse BM25 lexical matching via Reciprocal Rank Fusion) against a user's ChromaDB collection, mounted onto `agent-api`:
 - **`schemas.py`**: Defines `QueryRequest` (validating collection name, query text, `k`, and embedding model allowlist).
-- **`service.py`**: Implements `search_collection(uid, query, collection_name, k, embedding_model)` inside `user_read_lock(uid)`, automatically resolving the collection's bound `embedding_model` with Cloud DLP `[INFO_TYPE]` chunk masking and retrieval similarity score telemetry.
+- **`service.py`**: Implements `search_collection(uid, query, collection_name, k, embedding_model)` inside `user_read_lock(uid)`, automatically resolving the collection's bound `embedding_model` with Cloud DLP `[INFO_TYPE]` chunk masking and normalized retrieval score telemetry.
 - **`routes.py`**: Exposes `POST /query` (`query_router`), sharing `agent-api`'s warm `/tmp/chroma_db/{uid}` cache and `_QUERY_RATE_LIMITER`.
 
 ---
@@ -127,7 +127,7 @@ curl -X POST "http://localhost:8000/ingest" \
 
 ### Core Responsibilities
 `src/agent/` runs the stateful, safety-screened LangGraph RAG workflow and mounts `src/query` + `src/manage` + `src/agent` onto `agent-api`:
-1. **XML-Spotlighted Retriever Tool (`tools.py`)**: Queries the user's Chroma collection using its bound `embedding_model`, applies Cloud DLP `[INFO_TYPE]` chunk redaction, and formats retrieved chunks into `<retrieved_chunk source="..." page="...">` tags via `format_retrieved_chunks` and `safe_tool_name` from `src/core/ai_security/guardrails.py` (`get_retriever_tool`).
+1. **XML-Spotlighted Retriever Tool (`tools.py`)**: Queries the user's Chroma collection via hybrid RRF search using its bound `embedding_model`, applies Cloud DLP `[INFO_TYPE]` chunk redaction, and formats retrieved chunks into `<retrieved_chunk source="..." page="...">` tags via `format_retrieved_chunks` and `safe_tool_name` from `src/core/ai_security/guardrails.py` (`get_retriever_tool`).
 2. **Tenant-Isolated Memory (`memory.py`)**: Owns the `MEMORY_SAVER` (`InMemorySaver`) checkpointer and namespaces checkpoint threads under `{uid}:{thread_id}` (`make_user_thread_id`).
 3. **Safety-Screened LangGraph StateGraph (`graph.py`)**: Compiles `input_guard` $\rightarrow$ `model_call` $\leftrightarrow$ `tools` $\rightarrow$ `output_guard` with regional `ChatGoogleGenerativeAI`, Gemini safety thresholds, and `[source, p.X]` citation rules.
 4. **SSE & Interactive Streaming (`service.py`, `display.py`)**: Streams sanitized message events, tool traces, and EU AI Act Art. 50 `compliance` frames over SSE (`stream_sse`), emits canonical `agent.query` audit/telemetry events (`emit_agent_query_events`), or renders rich terminal panels (`run_interactive`).
@@ -251,7 +251,7 @@ src/
 │   │   ├── paths.py           # Per-user /tmp & GCS paths, SQLite WAL & Chroma cache helpers
 │   │   ├── gcs_sync.py        # Incremental MD5 delta GCS snapshot pull/push & PDF archiving
 │   │   ├── locks.py           # Per-user thread RLocks, distributed GCS locks & /tmp LRU eviction
-│   │   └── chroma.py          # Regional Vertex AI embeddings & ChromaDB collection helpers
+│   │   └── chroma.py          # Regional Vertex AI embeddings, ChromaDB collection helpers & hybrid RRF search
 │   ├── ai_security/
 │   │   ├── __init__.py
 │   │   ├── armor.py           # Regional Model Armor + Cloud DLP prompt/chunk/output screening
@@ -288,7 +288,7 @@ src/
 ├── query/                     # Package 3: Direct Vector Similarity Search (`agent-api`)
 │   ├── __init__.py
 │   ├── schemas.py             # Validated QueryRequest model
-│   ├── service.py             # DLP-sanitized top-k Chroma similarity search
+│   ├── service.py             # DLP-sanitized top-k Chroma hybrid search
 │   └── routes.py              # FastAPI router (`POST /query`)
 └── agent/                     # Package 4: Unified Interactive Agent, Query & Management Service (`agent-api`)
     ├── __init__.py

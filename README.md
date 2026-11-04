@@ -5,7 +5,7 @@
 Instead of combining unrelated documents into a single shared database, InteractiveRAG gives every signed-in user an isolated workspace where they can organize PDFs into domain-specific vector collections (for example, separating annual financial reports from clinical research). Through the web dashboard or REST APIs, users can:
 
 - **Ingest PDF Documents (`POST /ingest`)**: Upload PDF documents that are parsed page-by-page, split into overlapping text chunks, converted into vector embeddings using Vertex AI (`gemini-embedding-001`, `text-embedding-004`, or `text-embedding-005`), and indexed into a named vector collection bound to that embedding model.
-- **Run Direct Semantic Search (`POST /query`)**: Perform top-$k$ similarity searches scoped strictly to a selected collection (automatically using the collection's bound embedding model) to inspect relevant document chunks, similarity scores, and page numbers directly.
+- **Run Direct Hybrid Search (`POST /query`)**: Perform top-$k$ hybrid searches combining dense Vertex AI vector similarity with sparse BM25 lexical matching via Reciprocal Rank Fusion (RRF), scoped strictly to a selected collection (automatically using the collection's bound embedding model) to inspect relevant document chunks, normalized similarity scores, and page numbers directly.
 - **Chat with a Grounded AI Agent (`POST /agent`, `POST /agent/stream`)**: Ask questions in a multi-turn conversation with a stateful LangGraph agent that dynamically queries the user's chosen collection using its bound embedding model, grounds every factual statement in retrieved evidence with inline `[filename.pdf, p.X]` citations, and streams each workflow step in real time over Server-Sent Events (SSE).
 - **Manage Document Collections (`GET /collections`, `DELETE /collections/{collection_name}`)**: List all vector collections in the user's workspace along with their indexed chunk counts, bound `embedding_model`, and server-approved model catalogs (`allowed_llm_models`, `allowed_embedding_models`), or delete a collection when it is no longer needed.
 - **Exercise Self-Service Privacy Controls (`GET /compliance/my-data`, `DELETE /compliance/my-data`)**: Export a complete inventory of stored collections, uploaded PDFs, storage bytes, and active conversation threads, or permanently erase all personal data—including live and archived Cloud Storage object versions, local vector caches, and conversation memory—in a single action.
@@ -32,7 +32,7 @@ InteractiveRAG organizes its backend into **4 modular Python packages** (`src/in
   — *Implemented in [`src/ingest/service.py`](src/ingest/service.py)*  
   — *Called in [`src/ingest/routes.py`](src/ingest/routes.py)*
 
-### 2. Embedding Models & Domain-Scoped Vector Databases
+### 2. Embedding Models, Hybrid Search & Domain-Scoped Vector Databases
 - **Vertex AI Dense Vector Embeddings & Collection-Bound Embedding Consistency:** Document chunks (at ingestion time) and search queries (at retrieval time) are converted into dense semantic vectors using **Google Cloud Vertex AI** embedding models (`gemini-embedding-001` by default, `text-embedding-004`, or `text-embedding-005`). When a collection is first created, its chosen `embedding_model` is persisted in ChromaDB collection metadata (`resolve_collection_embedding_model`); all subsequent document appends (`POST /ingest`), direct similarity searches (`POST /query`), and agent retriever calls (`POST /agent`, `POST /agent/stream`) on that collection automatically resolve and use its bound embedding model so vectors always remain in a consistent embedding space.  
   — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
   — *Called in [`src/ingest/service.py`](src/ingest/service.py), [`src/query/service.py`](src/query/service.py) & [`src/agent/tools.py`](src/agent/tools.py)*
@@ -42,6 +42,9 @@ InteractiveRAG organizes its backend into **4 modular Python packages** (`src/in
 - **ChromaDB SQLite Metadata & HNSW Vector Index Storage:** Each collection persists its chunk text and page metadata in a SQLite catalog paired with a Hierarchical Navigable Small World (HNSW) approximate nearest-neighbor vector index for fast similarity lookups.  
   — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
   — *Called in [`src/ingest/service.py`](src/ingest/service.py) & [`src/query/service.py`](src/query/service.py)*
+- **Hybrid Search via Reciprocal Rank Fusion (Dense Vector + Sparse BM25):** Retrieval (`similarity_search_with_scores`) combines dense semantic vector search (`vectorstore.similarity_search_with_score`) with sparse lexical keyword matching (`BM25Retriever` backed by `rank-bm25` over the collection's stored documents) using **Reciprocal Rank Fusion (RRF)** (`rrf_k=60`, `dense_weight=0.5`, `bm25_weight=0.5`). Zero-score BM25 candidates are filtered out so non-matching chunks do not receive spurious lexical rank bonuses, fused RRF scores are normalized into `[0.0, 1.0]` for downstream observability telemetry, and retrieval gracefully degrades to dense-only similarity scores when no lexical token overlap exists.  
+  — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*  
+  — *Called in [`src/query/service.py`](src/query/service.py) & [`src/agent/tools.py`](src/agent/tools.py)*
 - **Collection-Targeted Search & Agent Retrieval:** Every similarity search (`POST /query`) and agent conversation (`POST /agent`, `POST /agent/stream`) targets one explicitly chosen collection at a time to keep retrieval focused and free of cross-topic noise.  
   — *Implemented in [`src/query/service.py`](src/query/service.py) & [`src/agent/tools.py`](src/agent/tools.py)*  
   — *Called in [`src/query/routes.py`](src/query/routes.py), [`src/agent/graph.py`](src/agent/graph.py) & [`src/agent/routes.py`](src/agent/routes.py)*
@@ -445,7 +448,7 @@ InteractiveRAG/
 │   │   │   ├── telemetry.py            # AI-specific monitoring & interactiverag-telemetry publisher
 │   │   │   └── tracing.py              # Hierarchical per-stage span tracer & Cloud Trace exporter
 │   │   ├── storage/                    # Multi-tenant ChromaDB & Cloud Storage persistence
-│   │   │   ├── chroma.py               # Regional Vertex AI embeddings & ChromaDB client factory
+│   │   │   ├── chroma.py               # Regional Vertex AI embeddings, ChromaDB client factory & hybrid RRF search
 │   │   │   ├── gcs_sync.py             # Incremental MD5 delta GCS <-> /tmp sync & PDF archive
 │   │   │   ├── locks.py                # Atomic GCS distributed write locks & bounded /tmp LRU eviction
 │   │   │   └── paths.py                # Tenant-isolated path helpers & client cache release
@@ -468,7 +471,7 @@ InteractiveRAG/
 │   ├── query/                          # Package 3: Direct Vector Similarity Search (`agent-api`)
 │   │   ├── routes.py                   # query_router (`POST /query`)
 │   │   ├── schemas.py                  # Validated QueryRequest model
-│   │   └── service.py                  # DLP-sanitized top-k Chroma similarity search
+│   │   └── service.py                  # DLP-sanitized top-k Chroma hybrid search
 │   ├── agent/                          # Package 4: Unified Interactive Agent, Query & Manage API (Port 8001, `agent-api`)
 │   │   ├── app.py                      # FastAPI service mounting agent_router, query_router & manage_router
 │   │   ├── display.py                  # Terminal message formatting helpers
@@ -511,7 +514,7 @@ InteractiveRAG/
 ├── tests/                              # Automated unit suites & live smoke scripts
 │   ├── helpers.py                      # Shared offline test doubles, fake GCS/LLM/embeddings & lifecycle utilities
 │   ├── auth.py                         # Token verification, tenant UID validation & bypass tests
-│   ├── storage.py                      # Per-user GCS sync, distributed lock & LRU cache tests
+│   ├── storage.py                      # Per-user GCS sync, distributed lock, LRU cache & hybrid RRF search tests
 │   ├── multi_tenant_api.py             # Cross-tenant isolation tests across REST & SSE APIs
 │   ├── ai_security.py                  # Unit tests for all 5 AI security pillars
 │   ├── compliance.py                   # Unit tests for residency, audit logs, DSAR, provenance & quotas

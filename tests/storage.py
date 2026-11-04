@@ -17,17 +17,25 @@ import unittest
 from unittest.mock import patch
 
 import chromadb
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
 
 from src.core.logger import setup_logging
 from src.core.storage import (
     LockTimeoutError,
     evict_tmp_cache,
     gcs_sync as gcs_sync_module,
+    similarity_search_with_scores,
     sync_user_dir,
     user_read_lock,
     user_write_lock,
 )
-from tests.helpers import FakeGCSBlob, FakeGCSBucket, cleanup_chroma_tmpdir
+from tests.helpers import (
+    DeterministicFakeEmbeddings,
+    FakeGCSBlob,
+    FakeGCSBucket,
+    cleanup_chroma_tmpdir,
+)
 
 logger = setup_logging(name="tests.storage")
 
@@ -229,6 +237,64 @@ class TestPerUserChromaStorage(unittest.TestCase):
                 chromadb.PersistentClient(path=restored_middle).get_collection("notes").count(),
                 1,
             )
+
+    def test_06_hybrid_search_rrf_combines_dense_and_bm25_with_normalized_scores(self) -> None:
+        """Verifies `similarity_search_with_scores` fuses dense Chroma similarity and BM25 lexical ranks with normalized `[0.0, 1.0]` scores."""
+        vs = Chroma(
+            collection_name="hybrid_test_col",
+            persist_directory=self.container1_tmp,
+            embedding_function=DeterministicFakeEmbeddings(),
+        )
+        vs.add_documents(
+            [
+                Document(
+                    page_content="General quarterly financial overview and outlook",
+                    metadata={"source": "overview.pdf", "page": 1},
+                ),
+                Document(
+                    page_content="General revenue commentary and forecast",
+                    metadata={"source": "commentary.pdf", "page": 2},
+                ),
+                Document(
+                    page_content="Alice critical incident ticket ERR-9042-X remediation runbook",
+                    metadata={"source": "runbook.pdf", "page": 7},
+                ),
+            ]
+        )
+
+        # Query 'ERR-9042-X':
+        # - Dense fake embedding gives query vec[0]=0.1 (no 'alice'), so 'Alice ... ERR-9042-X' (vec[0]=1.0) ranks last in dense search
+        # - Hybrid RRF fuses BM25 exact token match on 'ERR-9042-X' so runbook.pdf ranks #1 with default equal weights
+        dense_only_docs, dense_only_scored = similarity_search_with_scores(
+            vs,
+            "ERR-9042-X",
+            k=2,
+            bm25_weight=0.0,
+        )
+        self.assertEqual(len(dense_only_docs), 2)
+        self.assertNotIn("ERR-9042-X", dense_only_docs[0].page_content)
+        self.assertTrue(0.0 < dense_only_scored[0][1] <= 1.0)
+
+        hybrid_docs, hybrid_scored = similarity_search_with_scores(
+            vs,
+            "ERR-9042-X",
+            k=2,
+        )
+        self.assertEqual(len(hybrid_docs), 2)
+        self.assertIn("ERR-9042-X", hybrid_docs[0].page_content)
+        for _doc, score in hybrid_scored:
+            self.assertIsInstance(score, float)
+            self.assertGreater(score, 0.0)
+            self.assertLessEqual(score, 1.0)
+
+        # When a chunk ranks #1 in both dense and BM25, its normalized RRF score equals 1.0
+        top_docs, top_scored = similarity_search_with_scores(
+            vs,
+            "Alice ERR-9042-X remediation runbook",
+            k=2,
+        )
+        self.assertIn("ERR-9042-X", top_docs[0].page_content)
+        self.assertEqual(top_scored[0][1], 1.0)
 
 
 if __name__ == "__main__":
