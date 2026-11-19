@@ -42,6 +42,7 @@ Instead of combining unrelated documents into a single shared database, Interact
   - [**VI/ Reliability & Resilience**](#vi-reliability--resilience)
     - [1. Observability](#1-observability)
     - [2. Graceful Degradation](#2-graceful-degradation)
+    - [3. Availability Design](#3-availability-design)
 - [**Repository Structure**](#-repository-structure)
 - [**Local Setup & Prerequisites**](#-local-setup--prerequisites)
   - [1. Authenticate with Google Cloud & Configure `.env`](#1-authenticate-with-google-cloud--configure-env)
@@ -125,7 +126,7 @@ Instead of combining unrelated documents into a single shared database, Interact
 
 ## 🏗 Cloud Architecture & Production Engineering Layers
 
-InteractiveRAG is engineered for reproducible deployment on **Google Cloud Platform (GCP)** across **6 architectural domains (`I`–`VI`) and 16 defense-in-depth engineering layers**, verified by the automated test and policy suites in [`tests/`](tests/) and [`infra/scripts/`](infra/scripts/):
+InteractiveRAG is engineered for reproducible deployment on **Google Cloud Platform (GCP)** across **6 architectural domains (`I`–`VI`) and 17 defense-in-depth engineering layers**, verified by the automated test and policy suites in [`tests/`](tests/) and [`infra/scripts/`](infra/scripts/):
 
 | Domain | Layer | Pillars & Focus Areas |
 | :--- | :--- | :--- |
@@ -145,6 +146,7 @@ InteractiveRAG is engineered for reproducible deployment on **Google Cloud Platf
 | [**V. Security, Privacy, and Compliance**](#v-security-privacy-and-compliance) | [**5. Compliance & Governance**](#5-compliance--governance) | Single-region data residency & live Org Policy verification, privacy-safe SHA-256 hashed audit & Data Access logging, GDPR self-service access & erasure, EU AI Act provenance badges, fail-closed screening, and rate/quota enforcement |
 | [**VI. Reliability & Resilience**](#vi-reliability--resilience) | [**1. Observability**](#1-observability) | Structured JSON operational logging & request correlation, Cloud Monitoring metrics, dashboards & automated alerts, distributed per-stage Cloud Trace waterfall spans, and AI latency, token & retrieval quality telemetry |
 | [**VI. Reliability & Resilience**](#vi-reliability--resilience) | [**2. Graceful Degradation**](#2-graceful-degradation) | Hybrid-to-dense search & bounded-agent step-limit fallbacks, mid-stream SSE error recovery, exponential backoff with random jitter on storage locks, and bounded timeouts with stale-lock crash recovery |
+| [**VI. Reliability & Resilience**](#vi-reliability--resilience) | [**3. Availability Design**](#3-availability-design) | Unauthenticated backend `/health` & frontend `/healthz` probes, collection-bound embedding & deterministic model consistency, and decoupled GCS-synchronized & Load Balancer-routed inter-service communication |
 
 ---
 
@@ -855,6 +857,50 @@ The platform is engineered to handle partial component failures, search edge cas
 
 > **Note on Unimplemented Pillars:**
 > - **Stateful Upstream Circuit Breakers & Automatic Cross-Model Failover (*Not Implemented — Relevant*):** While the platform enforces pre-flight fail-closed security short-circuiting, exponential backoff with jitter on distributed storage locks, bounded lock and request timeouts with automatic expired-lock crash recovery, and dense-only search fallback, a stateful circuit-breaker state machine (tracking consecutive upstream failure rates across requests) and automatic cross-model failover (such as automatically retrying a timed-out `gemini-2.5-pro` call with `gemini-2.5-flash`) are not yet implemented and remain relevant future resilience enhancements.
+
+---
+
+### 3. Availability Design
+
+High availability across serverless microservices requires lightweight readiness verification, deterministic model behavior without vector-space drift, and fault-isolated inter-service communication:
+
+- **3.1 Health Checks**
+  - **Unauthenticated Backend Liveness & Readiness Probes (`GET /health`):** Both `ingest-api` and `agent-api` expose a lightweight, unauthenticated `GET /health` endpoint via the shared FastAPI application factory returning `{"status": "ok", "service": "<service_name>"}` so Cloud Run, Load Balancers, and deployment verifications can confirm container readiness without requiring Firebase JWT credentials or triggering downstream Vertex AI or Cloud Storage calls.  
+    — *Implemented in [`src/core/app_factory.py`](src/core/app_factory.py)*  
+    — *Called in [`src/ingest/app.py`](src/ingest/app.py) & [`src/agent/app.py`](src/agent/app.py)*  
+    — *Verified in [`tests/multi_tenant_api.py`](tests/multi_tenant_api.py) & [`tests/scalability_elasticity.py`](tests/scalability_elasticity.py)*
+  - **Zero-Noise Frontend Nginx Health Endpoint (`GET /healthz`):** The Nginx container serving the React SPA exposes a dedicated `/healthz` endpoint returning `HTTP 200 "ok"` with `access_log off` so frequent health probes verify web server availability without polluting HTTP access logs or triggering SPA fallback routing.  
+    — *Implemented in [`infra/docker/nginx.conf.template`](infra/docker/nginx.conf.template)*
+  - **Health-Gated Container Rollouts & Startup CPU Boost:** All three Cloud Run microservices (`ingest-api`, `agent-api`, and `frontend`) run on Gen2 serverless compute with `startup_cpu_boost = true` to accelerate cold-start initialization and ensure new container revisions pass readiness checks before receiving live traffic.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
+
+- **3.2 Model Consistency**
+  - **Per-Collection Embedding Model Binding & Automatic Resolution:** When a vector collection is created during ingestion, its approved Vertex AI embedding model is persisted in the collection's ChromaDB metadata (`embedding_model`). Every subsequent upload, direct similarity search, and agent retrieval call automatically resolves and binds to that stored embedding model—falling back to vector-dimension inference (`3072` → `gemini-embedding-001`) for legacy collections—preventing vector-space or dimension mismatches across services and user sessions.  
+    — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py) & [`src/ingest/service.py`](src/ingest/service.py)*  
+    — *Called in [`src/query/service.py`](src/query/service.py), [`src/agent/tools.py`](src/agent/tools.py) & [`src/manage/collections.py`](src/manage/collections.py)*
+  - **Synchronized Approved Model Catalogs Across Infrastructure, Backend & Frontend:** Approved Gemini LLM (`ALLOWED_LLM_MODELS`) and Vertex AI embedding (`ALLOWED_EMBEDDING_MODELS`) catalogs are defined once in Terraform variables, injected identically into `ingest-api`, `agent-api`, and `frontend` runtime configuration (`/env-config.js`), and served dynamically via `GET /collections`—while the web dashboard locks existing collections to their bound embedding model so UI selections never drift from backend enforcement.  
+    — *Provisioned in [`infra/terraform/variables.tf`](infra/terraform/variables.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
+    — *Implemented in [`src/core/config.py`](src/core/config.py), [`src/core/ai_security/guardrails.py`](src/core/ai_security/guardrails.py) & [`src/manage/collections.py`](src/manage/collections.py)*  
+    — *Called in [`frontend/src/firebase.js`](frontend/src/firebase.js) & [`frontend/src/App.jsx`](frontend/src/App.jsx)*
+  - **Deterministic Generation & Single-Region Model Pinning:** Every Vertex AI Gemini agent call runs at `temperature=0` with strict regional endpoint pinning (`GOOGLE_CLOUD_LOCATION`) across both chat and embedding clients, keeping retrieval embeddings and grounded agent outputs reproducible and consistent across container instances.  
+    — *Implemented in [`src/agent/graph.py`](src/agent/graph.py), [`src/core/storage/chroma.py`](src/core/storage/chroma.py) & [`src/core/compliance/residency.py`](src/core/compliance/residency.py)*
+
+- **3.3 Inter-Service Communication**
+  - **Single-Origin Load Balancer Path Routing & Prefix Rewriting:** Browser clients never call internal `*.run.app` URLs directly. All traffic enters through the Global External HTTPS Load Balancer, which routes `/*` to `frontend`, strips `/api/ingest` and forwards uploads to `ingest-api`, and strips `/api/agent` and forwards REST and SSE traffic to `agent-api` via private Serverless NEGs—eliminating cross-origin drift while shielding backend services behind `INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER`.  
+    — *Provisioned in [`infra/terraform/load_balancer.tf`](infra/terraform/load_balancer.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
+    — *Called in [`frontend/src/firebase.js`](frontend/src/firebase.js) & [`frontend/src/api.js`](frontend/src/api.js)*
+  - **Decoupled Asynchronous State Exchange Between `ingest-api` and `agent-api`:** Rather than coupling `ingest-api` and `agent-api` with synchronous service-to-service RPC calls, the two backend microservices exchange state exclusively through versioned per-tenant snapshots (`version.json` + incremental MD5 delta sync) and atomic distributed write locks (`users/{uid}/locks/chroma.lock`) in Google Cloud Storage. Because `version.json` is written last after all data blobs are durable and local read swaps are atomic (`os.replace`), an `ingest-api` scaling spike or failure never blocks `agent-api` reads, and `agent-api` never reads partially written indexes.  
+    — *Implemented in [`src/core/storage/gcs_sync.py`](src/core/storage/gcs_sync.py) & [`src/core/storage/locks.py`](src/core/storage/locks.py)*  
+    — *Called in [`src/ingest/service.py`](src/ingest/service.py), [`src/query/service.py`](src/query/service.py), [`src/agent/tools.py`](src/agent/tools.py) & [`src/manage/collections.py`](src/manage/collections.py)*
+  - **Private Backbone Communication with Managed Google Cloud Services:** Outbound calls from `ingest-api` and `agent-api` to Vertex AI, Cloud Storage, Cloud DLP, Identity Platform, Cloud Logging, and Cloud Trace traverse Google's private internal network via Direct VPC Egress (`ALL_TRAFFIC`), Private Google Access (`199.36.153.8/30`), and a Regional Private Service Connect (PSC) endpoint for Model Armor (`modelarmor.<region>.rep.googleapis.com`)—ensuring reliable managed-service communication with zero public internet egress.  
+    — *Provisioned in [`infra/terraform/network.tf`](infra/terraform/network.tf) & [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*
+  - **End-to-End Request Correlation & Session Affinity:** Every request across the Load Balancer, `ingest-api`, and `agent-api` propagates `X-Request-Id` and `X-Cloud-Trace-Context` headers for cross-service traceability, while Cloud Run `session_affinity = true` on `agent-api` keeps multi-turn chat, search, and collection requests routed to a warm container instance.  
+    — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
+    — *Implemented in [`src/core/context.py`](src/core/context.py) & [`src/core/app_factory.py`](src/core/app_factory.py)*
+
+> **Note on Unimplemented Pillars:**
+> - **Explicit Terraform HTTP Probe Blocks & Deep Dependency Readiness Checks (*Not Implemented — Relevant*):** While `/health` and `/healthz` endpoints are implemented and tested across all services, explicit Terraform `startup_probe` / `liveness_probe` blocks targeting `/health` and `/healthz` (currently relying on Cloud Run's default TCP port-8080 startup check) and a deep `/ready` probe verifying live Cloud Storage / Vertex AI reachability are not yet configured and remain relevant future availability enhancements.
+> - **Multi-Region Active-Active Failover (*Not Implemented — Intentional Trade-Off*):** The platform is intentionally pinned to a single concrete GCP region to enforce strict data residency (`constraints/gcp.resourceLocations`), relying on Google Cloud's intra-region multi-zone redundancy across Cloud Run and regional Cloud Storage rather than cross-region replication.
 
 ---
 
