@@ -369,6 +369,84 @@ def _check_observability_tf(infra_dir: str) -> List[str]:
     return violations
 
 
+def _check_availability_tf(infra_dir: str) -> List[str]:
+    """Checks `infra/availability.tf` for HTTPS uptime checks, custom services, declarative SLOs, and burn-rate alerts.
+
+    Args:
+        infra_dir: Path to the `infra/` Terraform directory.
+
+    Returns:
+        List of policy violation messages (empty when compliant).
+    """
+    violations: List[str] = []
+    avail_path = os.path.join(infra_dir, "availability.tf")
+    if not os.path.isfile(avail_path):
+        return [f"Missing required Terraform file: {avail_path}"]
+
+    with open(avail_path, encoding="utf-8") as fh:
+        content = fh.read()
+
+    for check_name in ("frontend_health", "ingest_api_health", "agent_api_health"):
+        check_match = re.search(
+            rf'resource\s+"google_monitoring_uptime_check_config"\s+"{check_name}"\s*\{{(?P<body>.*?)\n\}}',
+            content,
+            re.DOTALL,
+        )
+        if not check_match:
+            violations.append(
+                f'infra/availability.tf is missing google_monitoring_uptime_check_config "{check_name}".'
+            )
+            continue
+        check_body = check_match.group("body")
+        if not re.search(r"^\s*use_ssl\s*=\s*true\s*$", check_body, re.MULTILINE):
+            violations.append(
+                f'infra/availability.tf uptime check "{check_name}" must enforce use_ssl = true.'
+            )
+        if not re.search(r"^\s*validate_ssl\s*=\s*true\s*$", check_body, re.MULTILINE):
+            violations.append(
+                f'infra/availability.tf uptime check "{check_name}" must enforce validate_ssl = true.'
+            )
+
+    for svc_name in ("agent_api", "ingest_api", "frontend"):
+        if not re.search(
+            rf'resource\s+"google_monitoring_custom_service"\s+"{svc_name}"\s*\{{',
+            content,
+        ):
+            violations.append(
+                f'infra/availability.tf is missing google_monitoring_custom_service "{svc_name}".'
+            )
+
+    for slo_name in (
+        "agent_api_availability_slo",
+        "agent_api_latency_slo",
+        "ingest_api_availability_slo",
+        "frontend_availability_slo",
+    ):
+        if not re.search(
+            rf'resource\s+"google_monitoring_slo"\s+"{slo_name}"\s*\{{',
+            content,
+        ):
+            violations.append(
+                f'infra/availability.tf is missing google_monitoring_slo "{slo_name}".'
+            )
+
+    for alert_name in ("uptime_check_failure_alert", "slo_fast_burn_alert"):
+        if not re.search(
+            rf'resource\s+"google_monitoring_alert_policy"\s+"{alert_name}"\s*\{{',
+            content,
+        ):
+            violations.append(
+                f'infra/availability.tf is missing google_monitoring_alert_policy "{alert_name}".'
+            )
+
+    if "select_slo_burn_rate(" not in content:
+        violations.append(
+            'infra/availability.tf must configure error-budget burn-rate alerting via select_slo_burn_rate(...).'
+        )
+
+    return violations
+
+
 def _check_all_tf_locations_and_tfvars(infra_dir: str) -> List[str]:
     """Scans all `infra/*.tf` files and optional `terraform.tfvars` for forbidden global/multi-region or fail-open overrides.
 
@@ -441,6 +519,7 @@ def evaluate_repo_static_policies(repo_root: str) -> Tuple[bool, List[str]]:
     violations.extend(_check_terraform_variables(infra_dir))
     violations.extend(_check_cloud_run_tf(infra_dir))
     violations.extend(_check_observability_tf(infra_dir))
+    violations.extend(_check_availability_tf(infra_dir))
     violations.extend(_check_all_tf_locations_and_tfvars(infra_dir))
     return len(violations) == 0, violations
 

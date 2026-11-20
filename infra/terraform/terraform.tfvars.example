@@ -65,3 +65,14 @@ observability_log_retention_days   = 30
 alert_agent_latency_p95_ms         = 15000
 alert_memory_utilization_threshold = 0.85
 
+# Availability Design (Cloud Monitoring Uptime Checks & Declarative SLOs)
+uptime_check_period_seconds    = 60
+uptime_check_timeout_seconds   = 10
+slo_rolling_period_days        = 28
+slo_agent_availability_goal    = 0.995
+slo_agent_latency_goal         = 0.95
+slo_agent_latency_threshold_ms = 15000
+slo_ingest_availability_goal   = 0.995
+slo_frontend_availability_goal = 0.999
+slo_fast_burn_rate_threshold   = 14.4
+

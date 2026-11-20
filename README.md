@@ -146,7 +146,7 @@ InteractiveRAG is engineered for reproducible deployment on **Google Cloud Platf
 | [**V. Security, Privacy, and Compliance**](#v-security-privacy-and-compliance) | [**5. Compliance & Governance**](#5-compliance--governance) | Single-region data residency & live Org Policy verification, privacy-safe SHA-256 hashed audit & Data Access logging, GDPR self-service access & erasure, EU AI Act provenance badges, fail-closed screening, and rate/quota enforcement |
 | [**VI. Reliability & Resilience**](#vi-reliability--resilience) | [**1. Observability**](#1-observability) | Structured JSON operational logging & request correlation, Cloud Monitoring metrics, dashboards & automated alerts, distributed per-stage Cloud Trace waterfall spans, and AI latency, token & retrieval quality telemetry |
 | [**VI. Reliability & Resilience**](#vi-reliability--resilience) | [**2. Graceful Degradation**](#2-graceful-degradation) | Hybrid-to-dense search & bounded-agent step-limit fallbacks, mid-stream SSE error recovery, exponential backoff with random jitter on storage locks, and bounded timeouts with stale-lock crash recovery |
-| [**VI. Reliability & Resilience**](#vi-reliability--resilience) | [**3. Availability Design**](#3-availability-design) | Unauthenticated backend `/health` & frontend `/healthz` probes, collection-bound embedding & deterministic model consistency, and decoupled GCS-synchronized & Load Balancer-routed inter-service communication |
+| [**VI. Reliability & Resilience**](#vi-reliability--resilience) | [**3. Availability Design**](#3-availability-design) | Unauthenticated backend `/health` & frontend `/healthz` probes, collection-bound embedding & deterministic model consistency, decoupled GCS-synchronized & Load Balancer-routed inter-service communication, Cloud Monitoring HTTPS uptime checks, declarative 28-day Cloud Monitoring SLOs with burn-rate alerts, and SLI / SLO / Reference SLA hierarchy |
 
 ---
 
@@ -898,6 +898,32 @@ High availability across serverless microservices requires lightweight readiness
     — *Provisioned in [`infra/terraform/cloud_run.tf`](infra/terraform/cloud_run.tf)*  
     — *Implemented in [`src/core/context.py`](src/core/context.py) & [`src/core/app_factory.py`](src/core/app_factory.py)*
 
+- **3.4 Cloud Monitoring Uptime Checks**
+  - **Multi-Region Synthetic HTTPS Probing Across All Three Services:** Terraform provisions three Google Cloud Monitoring synthetic HTTPS uptime checks (`frontend_health`, `ingest_api_health`, and `agent_api_health`) probing `https://<lb_domain>/healthz`, `https://<lb_domain>/api/ingest/health`, and `https://<lb_domain>/api/agent/health` every 60 seconds (10-second timeout) with full TLS certificate validation (`use_ssl = true`, `validate_ssl = true`), HTTP `2xx` status verification, and response-body content matchers (`ok`, `ingest-api`, `agent-api`) to verify both Load Balancer path rewriting and live container reachability end to end.  
+    — *Provisioned in [`infra/terraform/availability.tf`](infra/terraform/availability.tf), [`infra/terraform/variables.tf`](infra/terraform/variables.tf) & [`infra/terraform/outputs.tf`](infra/terraform/outputs.tf)*  
+    — *Verified in [`infra/scripts/check_static_policies.py`](infra/scripts/check_static_policies.py) & [`tests/availability.py`](tests/availability.py)*
+  - **Quorum-Based Multi-Region Uptime Alerting:** A unified Cloud Monitoring alert policy (`uptime_check_failure_alert`) monitors `monitoring.googleapis.com/uptime_check/check_passed` using `REDUCE_COUNT_FALSE > 1` over 120 seconds across all three probes, eliminating single-location transient noise while paging operators whenever two or more global probe regions fail concurrently.  
+    — *Provisioned in [`infra/terraform/availability.tf`](infra/terraform/availability.tf)*
+
+- **3.5 Declarative Cloud Monitoring SLOs**
+  - **Explicit Cloud Monitoring Service Identities & 28-Day Rolling SLOs:** Terraform declares dedicated `google_monitoring_custom_service` resources for `agent-api`, `ingest-api`, and `frontend`, anchored by four declarative `google_monitoring_slo` resources evaluated over a 28-day rolling compliance window (`var.slo_rolling_period_days = 28`):
+    - **Request Availability SLOs (`good_total_ratio`):** Measure non-`5xx` Cloud Run requests (`run.googleapis.com/request_count`) against total requests for `agent-api` (99.5%), `ingest-api` (99.5%), and `frontend` (99.9%).
+    - **Agent Turn Latency SLO (`distribution_cut`):** Measures the fraction of Agentic RAG turns completing within 15,000 ms (`var.slo_agent_latency_threshold_ms`) over the custom `agent_turn_latency_ms` log-based distribution metric (target 95.0%).  
+    — *Provisioned in [`infra/terraform/availability.tf`](infra/terraform/availability.tf), [`infra/terraform/variables.tf`](infra/terraform/variables.tf) & [`infra/terraform/outputs.tf`](infra/terraform/outputs.tf)*  
+    — *Verified in [`infra/scripts/check_static_policies.py`](infra/scripts/check_static_policies.py) & [`tests/availability.py`](tests/availability.py)*
+  - **Error-Budget Fast Burn-Rate Alerting (`select_slo_burn_rate`):** A declarative fast-burn alert policy (`slo_fast_burn_alert`) evaluates `select_slo_burn_rate(<slo_id>, "60m") > 14.4` across all three availability SLOs—alerting operators immediately whenever an outage consumes 2% of the 28-day error budget within a single hour.  
+    — *Provisioned in [`infra/terraform/availability.tf`](infra/terraform/availability.tf)*
+
+- **3.6 SLI / SLO / Reference SLA Hierarchy**
+  - **Defense-in-Depth Reliability Target Hierarchy:** InteractiveRAG separates internal operational targets (**SLOs**) from external contractual commitments (**Reference SLAs**) so engineering teams absorb incidents within an explicit error-budget buffer before any external SLA is threatened. Because backend API requests compose single-region Google Cloud managed services—Global External Load Balancing (99.99%), Cloud Run (99.95%), Cloud Storage (99.95%), Identity Platform (99.95%), Vertex AI (99.9%), and Model Armor (99.9%)—the theoretical serial dependency ceiling for AI-backed endpoints is approximately **99.64%**, which directly informs our realistic **99.5%** internal availability SLO and **99.0%** external Reference SLA:
+
+| Service | SLI (Measured Indicator) | Internal SLO Target (28-Day Rolling) | 28-Day Error Budget | Burn-Rate / Probe Alerting | Reference External SLA |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`frontend`** (React SPA + Nginx) | Non-`5xx` HTTP requests / total requests (`run.googleapis.com/request_count`) + `/healthz` HTTPS probe | **99.9%** (`0.999`) | 0.1% (~40.3 min / 28d) | `select_slo_burn_rate(60m) > 14.4x` + multi-region `/healthz` probe | **99.5%** (~201.6 min / 28d) |
+| **`agent-api`** (Availability) | Non-`5xx` HTTP requests / total requests (`run.googleapis.com/request_count`) + `/api/agent/health` HTTPS probe | **99.5%** (`0.995`) | 0.5% (~201.6 min / 28d) | `select_slo_burn_rate(60m) > 14.4x` + multi-region `/api/agent/health` probe | **99.0%** (~403.2 min / 28d) |
+| **`agent-api`** (Turn Latency) | Fraction of `agent.query` turns with `total_latency_ms <= 15,000 ms` (`agent_turn_latency_ms` distribution cut) | **95.0%** (`0.95`) | 5.0% of turns | p95 turn latency > 15,000 ms for 5 min (`agent_high_latency_alert`) | **Best-Effort** (non-contractual UX target) |
+| **`ingest-api`** (Availability) | Non-`5xx` HTTP requests / total requests (`run.googleapis.com/request_count`) + `/api/ingest/health` HTTPS probe | **99.5%** (`0.995`) | 0.5% (~201.6 min / 28d) | `select_slo_burn_rate(60m) > 14.4x` + multi-region `/api/ingest/health` probe | **99.0%** (~403.2 min / 28d) |
+
 > **Note on Unimplemented Pillars:**
 > - **Explicit Terraform HTTP Probe Blocks & Deep Dependency Readiness Checks (*Not Implemented — Relevant*):** While `/health` and `/healthz` endpoints are implemented and tested across all services, explicit Terraform `startup_probe` / `liveness_probe` blocks targeting `/health` and `/healthz` (currently relying on Cloud Run's default TCP port-8080 startup check) and a deep `/ready` probe verifying live Cloud Storage / Vertex AI reachability are not yet configured and remain relevant future availability enhancements.
 > - **Multi-Region Active-Active Failover (*Not Implemented — Intentional Trade-Off*):** The platform is intentionally pinned to a single concrete GCP region to enforce strict data residency (`constraints/gcp.resourceLocations`), relying on Google Cloud's intra-region multi-zone redundancy across Cloud Run and regional Cloud Storage rather than cross-region replication.
@@ -988,6 +1014,7 @@ InteractiveRAG/
 │       ├── cloud_run.tf                # Frontend, Ingestion API & Agent API Cloud Run services
 │       ├── compliance.tf               # Cloud Audit Logs, 365-day regional audit bucket & log sink
 │       ├── observability.tf            # Regional telemetry log bucket, sink, log metrics, dashboard & alerts
+│       ├── availability.tf             # HTTPS uptime checks, custom monitoring services, declarative SLOs & burn alerts
 │       ├── variables.tf                # Parameterized infrastructure, scaling, security & compliance settings
 │       ├── outputs.tf                  # Deployed URLs, IPs, bucket names & template identifiers
 │       └── terraform.tfvars.example    # Template for environment-specific variable values
@@ -999,6 +1026,7 @@ InteractiveRAG/
 │   ├── ai_security.py                  # Unit tests for all 5 AI security pillars
 │   ├── compliance.py                   # Unit tests for residency, audit logs, DSAR, provenance & quotas
 │   ├── observability.py                # Unit tests for structured logs, spans, tokens, TTFT & telemetry
+│   ├── availability.py                 # Unit tests for uptime checks, declarative SLOs, burn alerts & SLI/SLO/SLA hierarchy
 │   ├── scalability_elasticity.py       # Unit tests for 4-package split, concurrency, /tmp caps, MD5 delta sync & alerts
 │   ├── ingestion.py                    # Live local PDF ingestion & similarity search smoke test
 │   └── agent.py                        # Live local JSON & SSE agent streaming smoke test
@@ -1151,7 +1179,7 @@ The root [`Makefile`](Makefile) automates the complete deployment lifecycle. It 
 Run the full offline test suite and static policy verifier (no live cloud resources required):
 ```bash
 make check-static-policy
-python -m unittest tests.auth tests.storage tests.multi_tenant_api tests.ai_security tests.compliance tests.observability tests.scalability_elasticity -v
+python -m unittest tests.auth tests.storage tests.multi_tenant_api tests.ai_security tests.compliance tests.observability tests.availability tests.scalability_elasticity -v
 ```
 
 ### 2. Live Local Smoke Scripts

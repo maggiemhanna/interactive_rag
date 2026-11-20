@@ -146,3 +146,43 @@ output "alert_policy_ids" {
   }
 }
 
+# ==============================================================================
+# 7. Availability Design Outputs (Uptime Checks, Services, SLOs & Burn Alerts)
+# ==============================================================================
+
+output "uptime_check_ids" {
+  description = "Cloud Monitoring HTTPS uptime check IDs probing frontend, ingest-api, and agent-api via the Load Balancer."
+  value = {
+    frontend   = google_monitoring_uptime_check_config.frontend_health.uptime_check_id
+    ingest_api = google_monitoring_uptime_check_config.ingest_api_health.uptime_check_id
+    agent_api  = google_monitoring_uptime_check_config.agent_api_health.uptime_check_id
+  }
+}
+
+output "monitoring_service_ids" {
+  description = "Cloud Monitoring custom service IDs anchoring InteractiveRAG SLOs."
+  value = {
+    agent_api  = google_monitoring_custom_service.agent_api.service_id
+    ingest_api = google_monitoring_custom_service.ingest_api.service_id
+    frontend   = google_monitoring_custom_service.frontend.service_id
+  }
+}
+
+output "slo_ids" {
+  description = "Cloud Monitoring declarative SLO resource IDs for availability and agent turn latency."
+  value = {
+    agent_api_availability  = google_monitoring_slo.agent_api_availability_slo.id
+    agent_api_latency       = google_monitoring_slo.agent_api_latency_slo.id
+    ingest_api_availability = google_monitoring_slo.ingest_api_availability_slo.id
+    frontend_availability   = google_monitoring_slo.frontend_availability_slo.id
+  }
+}
+
+output "availability_alert_policy_ids" {
+  description = "Cloud Monitoring alert policy IDs for multi-region uptime failures and SLO error-budget fast burn."
+  value = {
+    uptime_check_failure = google_monitoring_alert_policy.uptime_check_failure_alert.id
+    slo_fast_burn        = google_monitoring_alert_policy.slo_fast_burn_alert.id
+  }
+}
+

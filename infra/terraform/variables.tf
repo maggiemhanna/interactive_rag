@@ -477,3 +477,106 @@ variable "alert_memory_utilization_threshold" {
   }
 }
 
+# ==============================================================================
+# 8. Availability Design (Cloud Monitoring Uptime Checks & Declarative SLOs)
+# ==============================================================================
+
+variable "uptime_check_period_seconds" {
+  description = "Synthetic HTTPS uptime check probe interval in seconds (60, 300, 600, or 900)."
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = contains([60, 300, 600, 900], var.uptime_check_period_seconds)
+    error_message = "uptime_check_period_seconds must be one of 60, 300, 600, or 900."
+  }
+}
+
+variable "uptime_check_timeout_seconds" {
+  description = "Maximum response timeout in seconds for each synthetic HTTPS uptime check probe (1 to 60)."
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.uptime_check_timeout_seconds >= 1 && var.uptime_check_timeout_seconds <= 60 && floor(var.uptime_check_timeout_seconds) == var.uptime_check_timeout_seconds
+    error_message = "uptime_check_timeout_seconds must be an integer between 1 and 60."
+  }
+}
+
+variable "slo_rolling_period_days" {
+  description = "Rolling compliance window in days for Cloud Monitoring SLOs (1 to 30; default 28 days)."
+  type        = number
+  default     = 28
+
+  validation {
+    condition     = var.slo_rolling_period_days >= 1 && var.slo_rolling_period_days <= 30 && floor(var.slo_rolling_period_days) == var.slo_rolling_period_days
+    error_message = "slo_rolling_period_days must be an integer between 1 and 30."
+  }
+}
+
+variable "slo_agent_availability_goal" {
+  description = "Target availability ratio (0.90 to 0.9999) for agent-api non-5xx HTTP requests (default 0.995 = 99.5%)."
+  type        = number
+  default     = 0.995
+
+  validation {
+    condition     = var.slo_agent_availability_goal >= 0.90 && var.slo_agent_availability_goal <= 0.9999
+    error_message = "slo_agent_availability_goal must be between 0.90 and 0.9999."
+  }
+}
+
+variable "slo_agent_latency_goal" {
+  description = "Target fraction (0.80 to 0.999) of Agentic RAG turns completing within slo_agent_latency_threshold_ms (default 0.95 = 95%)."
+  type        = number
+  default     = 0.95
+
+  validation {
+    condition     = var.slo_agent_latency_goal >= 0.80 && var.slo_agent_latency_goal <= 0.999
+    error_message = "slo_agent_latency_goal must be between 0.80 and 0.999."
+  }
+}
+
+variable "slo_agent_latency_threshold_ms" {
+  description = "Upper latency threshold in milliseconds for the agent-api turn latency SLO distribution cut (default 15000 ms)."
+  type        = number
+  default     = 15000
+
+  validation {
+    condition     = var.slo_agent_latency_threshold_ms >= 1000
+    error_message = "slo_agent_latency_threshold_ms must be >= 1000 ms."
+  }
+}
+
+variable "slo_ingest_availability_goal" {
+  description = "Target availability ratio (0.90 to 0.9999) for ingest-api non-5xx HTTP requests (default 0.995 = 99.5%)."
+  type        = number
+  default     = 0.995
+
+  validation {
+    condition     = var.slo_ingest_availability_goal >= 0.90 && var.slo_ingest_availability_goal <= 0.9999
+    error_message = "slo_ingest_availability_goal must be between 0.90 and 0.9999."
+  }
+}
+
+variable "slo_frontend_availability_goal" {
+  description = "Target availability ratio (0.95 to 0.9999) for frontend SPA non-5xx HTTP requests (default 0.999 = 99.9%)."
+  type        = number
+  default     = 0.999
+
+  validation {
+    condition     = var.slo_frontend_availability_goal >= 0.95 && var.slo_frontend_availability_goal <= 0.9999
+    error_message = "slo_frontend_availability_goal must be between 0.95 and 0.9999."
+  }
+}
+
+variable "slo_fast_burn_rate_threshold" {
+  description = "60-minute error-budget burn-rate multiplier for fast-burn SLO alerting (default 14.4 = 2% of 28d budget in 1h)."
+  type        = number
+  default     = 14.4
+
+  validation {
+    condition     = var.slo_fast_burn_rate_threshold >= 1.0 && var.slo_fast_burn_rate_threshold <= 100.0
+    error_message = "slo_fast_burn_rate_threshold must be between 1.0 and 100.0."
+  }
+}
+
