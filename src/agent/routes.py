@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from src.agent.memory import MEMORY_SAVER
-from src.agent.schemas import AgentRequest
+from src.agent.schemas import AgentRequest, AgentResponse
 from src.agent.service import (
     SSE_HEADERS,
     emit_agent_query_events,
@@ -117,14 +117,14 @@ def agent(
             compliance_meta=compliance_meta,
         )
 
-        return {
-            "status": "success",
-            "query": request.query,
-            "answer": final_answer,
-            "collection_name": request.collection_name,
-            "messages": formatted_messages,
-            "compliance": compliance_meta,
-        }
+        return AgentResponse(
+            status="success",
+            query=request.query,
+            answer=final_answer,
+            collection_name=request.collection_name,
+            messages=formatted_messages,
+            compliance=compliance_meta,
+        ).model_dump()
     except SecurityScreeningUnavailableError as e:
         logger.error(
             f"Fail-closed screening unavailable on /agent for uid='{uid}' (reason={e.reason})."

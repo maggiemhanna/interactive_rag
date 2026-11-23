@@ -19,27 +19,31 @@ from fastapi.testclient import TestClient
 from google.cloud import modelarmor_v1
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage
-from langchain_google_genai import HarmBlockThreshold, HarmCategory
+from pydantic import ValidationError
 
 from src.agent import app as agent_app_module
 from src.agent import graph as agent_graph_module
+from src.agent import routes as agent_routes_module
+from src.agent import service as agent_service_module
 from src.agent.graph import SYSTEM_PROMPT
+from src.agent.schemas import AgentResponse
 from src.agent.tools import get_retriever_tool
+from src.core import config as config_module
 from src.core.ai_security import (
     EMPTY_RETRIEVAL_MARKER,
     INTERNAL_ERROR_MESSAGE,
     PROMPT_BLOCKED_MESSAGE,
     RECURSION_LIMIT_MESSAGE,
     format_retrieved_chunks,
-    get_gemini_safety_settings,
-    is_safety_blocked,
 )
 from src.core.ai_security import armor as armor_module
+from src.core.ai_security import safety as safety_module
 from src.core.compliance.policy import reset_rate_limiters
 from src.core.logger import setup_logging
 from src.core.storage import chroma as chroma_module
 from src.core.storage import gcs_sync as gcs_sync_module
 from src.ingest import app as ingest_app_module
+from src.ingest import upload_parser as upload_parser_module
 from tests.helpers import (
     DeterministicFakeEmbeddings,
     FakeGCSBucket,
@@ -218,6 +222,17 @@ class TestAISecuritySuite(unittest.TestCase):
         with patch.dict(os.environ, self._env(), clear=False):
             self.assertEqual(
                 self.ingest_client.post("/ingest", json={"pdf_paths": ["doc.pdf"]}).status_code,
+                422,
+            )
+            self.assertEqual(
+                self.ingest_client.post("/ingest", json={"collection_name": "valid_col"}).status_code,
+                422,
+            )
+            self.assertEqual(
+                self.ingest_client.post(
+                    "/ingest",
+                    json={"pdf_paths": ["doc.pdf"], "collection_name": "valid_col", "embedding_model": 123},
+                ).status_code,
                 422,
             )
             self.assertEqual(
@@ -587,8 +602,14 @@ class TestAISecuritySuite(unittest.TestCase):
             self.assertIn(RECURSION_LIMIT_MESSAGE, r_loop_sse.text)
             self.assertTrue(r_loop_sse.text.strip().endswith("data: [DONE]"))
 
-    def test_08_gemini_safety_settings_refusal_fallback_and_sanitized_500_responses(self) -> None:
-        """Verifies safety.py helpers remain reusable, build_agent omits redundant Gemini safety_settings, and 500s are leak-free."""
+    def test_08_schema_enforcement_removed_orphan_controls_and_sanitized_500_responses(self) -> None:
+        """Verifies orphan safety/CLI helpers are removed, IngestRequest & AgentResponse are enforced, and 500s are leak-free."""
+        self.assertFalse(hasattr(safety_module, "get_gemini_safety_settings"))
+        self.assertFalse(hasattr(safety_module, "is_safety_blocked"))
+        self.assertFalse(hasattr(config_module, "GEMINI_SAFETY_THRESHOLD"))
+        self.assertFalse(hasattr(config_module, "get_gemini_safety_threshold"))
+        self.assertFalse(hasattr(agent_service_module, "run_interactive"))
+
         captured_llm_kwargs = {}
 
         class CapturingLLM(GroundedCitingChatModel):
@@ -598,13 +619,20 @@ class TestAISecuritySuite(unittest.TestCase):
 
         with patch.dict(
             os.environ,
-            self._env(GEMINI_SAFETY_THRESHOLD="BLOCK_MEDIUM_AND_ABOVE"),
+            self._env(),
             clear=False,
         ), patch.object(
             chroma_module, "GoogleGenerativeAIEmbeddings", return_value=DeterministicFakeEmbeddings()
         ), patch.object(
             agent_graph_module, "ChatGoogleGenerativeAI", side_effect=CapturingLLM
         ):
+            parsed_paths, parsed_col, parsed_emb = upload_parser_module._parse_json_body(
+                {"pdf_paths": " ./sample.pdf ", "collection_name": "safety_col"}
+            )
+            self.assertEqual(parsed_paths, ["./sample.pdf"])
+            self.assertEqual(parsed_col, "safety_col")
+            self.assertEqual(parsed_emb, "gemini-embedding-001")
+
             self._seed_collection("safety_col")
 
             r_agent = self.agent_client.post(
@@ -618,18 +646,28 @@ class TestAISecuritySuite(unittest.TestCase):
             )
             self.assertEqual(r_agent.status_code, 200)
             self.assertNotIn("safety_settings", captured_llm_kwargs)
+            validated_agent_resp = AgentResponse.model_validate(r_agent.json())
+            self.assertEqual(validated_agent_resp.status, "success")
 
-            expected_settings = {
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-            }
-            self.assertEqual(get_gemini_safety_settings(), expected_settings)
-            self.assertTrue(
-                is_safety_blocked(AIMessage(content="", response_metadata={"finish_reason": "SAFETY"}))
-            )
-            self.assertFalse(is_safety_blocked(AIMessage(content="ok", response_metadata={"finish_reason": "STOP"})))
+            with patch.object(
+                agent_routes_module,
+                "build_compliance_metadata",
+                return_value=MagicMock(model_dump=lambda: {"invalid": True}),
+            ):
+                r_bad_resp = self.agent_client.post(
+                    "/agent",
+                    json={
+                        "query": "Borderline query",
+                        "collection_name": "safety_col",
+                        "thread_id": "safety-2",
+                        "stream": False,
+                    },
+                )
+                self.assertEqual(r_bad_resp.status_code, 500)
+                self.assertEqual(r_bad_resp.json()["detail"], INTERNAL_ERROR_MESSAGE)
+
+            with self.assertRaises(ValidationError):
+                AgentResponse.model_validate({"status": "success", "query": "q"})
 
             secret_exc = RuntimeError("DB_MASTER_PASSWORD_LEAK=hunter2")
 

@@ -142,7 +142,7 @@ InteractiveRAG is engineered for reproducible deployment on **Google Cloud Platf
 | [**V. Security, Privacy, and Compliance**](#v-security-privacy-and-compliance) | [**1. Authentication & Authorization**](#1-authentication--authorization) | Dedicated runtime & deployer service accounts, declarative IAM, Principle of Least Privilege, Google Sign-In & Email/Password authentication with token-derived tenant identity, and keyless service credentials |
 | [**V. Security, Privacy, and Compliance**](#v-security-privacy-and-compliance) | [**2. Infrastructure & Network Security**](#2-infrastructure--network-security) | Disabled CDN edge caching for private traffic, locked-down Cloud Run ingress, zero-internet private VPC with segmented subnets, Private Google Access, and Regional Private Service Connect |
 | [**V. Security, Privacy, and Compliance**](#v-security-privacy-and-compliance) | [**3. Data Protection & Privacy**](#3-data-protection--privacy) | Encryption in transit (managed TLS & HTTP-to-HTTPS redirect) and at rest (AES-256 & ephemeral RAM-backed working directories), 4-tier data classification & storage segregation, and Secret Manager integration |
-| [**V. Security, Privacy, and Compliance**](#v-security-privacy-and-compliance) | [**4. AI-Specific Security**](#4-ai-specific-security) | Prompt injection mitigation (Model Armor & XML spotlighting), approved model allowlists, query & PDF upload guardrails, Cloud Sensitive Data Protection (Cloud DLP) two-stage redaction, and dual-layer content safety |
+| [**V. Security, Privacy, and Compliance**](#v-security-privacy-and-compliance) | [**4. AI-Specific Security**](#4-ai-specific-security) | Prompt injection mitigation (Model Armor & XML spotlighting), approved model allowlists, query & PDF upload guardrails, Cloud Sensitive Data Protection (Cloud DLP) two-stage redaction, and Model Armor content safety screening |
 | [**V. Security, Privacy, and Compliance**](#v-security-privacy-and-compliance) | [**5. Compliance & Governance**](#5-compliance--governance) | Single-region data residency & live Org Policy verification, privacy-safe SHA-256 hashed audit & Data Access logging, GDPR self-service access & erasure, EU AI Act provenance badges, fail-closed screening, and rate/quota enforcement |
 | [**VI. Reliability & Resilience**](#vi-reliability--resilience) | [**1. Observability**](#1-observability) | Structured JSON operational logging & request correlation, Cloud Monitoring metrics, dashboards & automated alerts, distributed per-stage Cloud Trace waterfall spans, and AI latency, token & retrieval quality telemetry |
 | [**VI. Reliability & Resilience**](#vi-reliability--resilience) | [**2. Graceful Degradation**](#2-graceful-degradation) | Hybrid-to-dense search & bounded-agent step-limit fallbacks, mid-stream SSE error recovery, exponential backoff with random jitter on storage locks, and bounded timeouts with stale-lock crash recovery |
@@ -703,12 +703,9 @@ Every user question, retrieved document chunk, and AI reply flows through a mult
     — *Provisioned in [`infra/terraform/ai_security.tf`](infra/terraform/ai_security.tf)*  
     — *Implemented in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py)*  
     — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
-  - **Vertex AI Gemini Harm-Blocking Thresholds:** Every Gemini model call is configured with explicit harm-blocking thresholds (`GEMINI_SAFETY_THRESHOLD`) across all four safety categories and post-generation safety block detection.  
+  - **Polite Refusal Fallback Messages:** Whenever Model Armor blocks a prompt or output due to content safety rules, the backend replaces the blocked output with a clear, polite refusal explanation so users never see a blank message bubble.  
     — *Implemented in [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*  
-    — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
-  - **Polite Refusal Fallback Messages:** Whenever Model Armor or Gemini blocks a prompt or halts generation due to content safety rules, the backend replaces the blocked output with a clear, polite refusal explanation so users never see a blank message bubble.  
-    — *Implemented in [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*  
-    — *Called in [`src/agent/graph.py`](src/agent/graph.py)*
+    — *Called in [`src/core/ai_security/armor.py`](src/core/ai_security/armor.py) & [`src/agent/graph.py`](src/agent/graph.py)*
 
 ---
 
@@ -836,8 +833,8 @@ The platform is engineered to handle partial component failures, search edge cas
     — *Implemented in [`src/core/compliance/audit.py`](src/core/compliance/audit.py) & [`src/core/observability/telemetry.py`](src/core/observability/telemetry.py)*
   - **Cloud Trace Outage Isolation:** Optional Cloud Trace export errors are caught and isolated in the background so a tracing service outage can never interrupt live user traffic.  
     — *Implemented in [`src/core/observability/tracing.py`](src/core/observability/tracing.py)*
-  - **Collection Embedding Model & Safety Threshold Configuration Fallbacks:** If an older collection lacks explicit embedding model metadata, the backend automatically infers the embedding model from the stored vector dimensions or falls back to the primary approved embedding model; similarly, unrecognized safety threshold strings automatically fall back to the strictest harm-blocking level.  
-    — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py) & [`src/core/ai_security/safety.py`](src/core/ai_security/safety.py)*
+  - **Collection Embedding Model Fallback:** If an older collection lacks explicit embedding model metadata, the backend automatically infers the embedding model from the stored vector dimensions or falls back to the primary approved embedding model.  
+    — *Implemented in [`src/core/storage/chroma.py`](src/core/storage/chroma.py)*
 
 - **2.2 Retry Policies**
   - **Exponential Backoff with Random Jitter on Distributed Storage Locks:** When two concurrent write requests for the same user contend for the user's distributed vector database lock in Cloud Storage, the waiting container retries lock acquisition using exponential backoff (starting at 0.25 seconds and scaling up to 2 seconds) plus random jitter to prevent synchronized retry collisions across containers.  
@@ -939,7 +936,7 @@ InteractiveRAG/
 │   │   ├── ai_security/                # 5-pillar AI security package
 │   │   │   ├── armor.py                # Model Armor & Cloud DLP screening/redaction client
 │   │   │   ├── guardrails.py           # Model/query/upload guardrails, XML spotlighting & tool-name sanitization
-│   │   │   └── safety.py               # Gemini safety settings & refusal detection
+│   │   │   └── safety.py               # Standardized user-safe refusal & fallback error messages
 │   │   ├── compliance/                 # 4-pillar compliance & governance package
 │   │   │   ├── audit.py                # Structured JSON audit logger & SHA-256 query hashing
 │   │   │   ├── dsar.py                 # GDPR Art. 15 inventory, Art. 17 versioned erasure & memory thread wiping
@@ -1065,11 +1062,10 @@ CHROMA_TMP_MIN_FREE_BYTES="268435456"
 # ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173"
 ANONYMIZED_TELEMETRY="FALSE"
 
-# AI Security: Model Armor, Cloud DLP & Gemini Safety Settings
+# AI Security: Model Armor & Cloud DLP Screening
 # MODEL_ARMOR_TEMPLATE_ID=""
 MODEL_ARMOR_LOCATION="us-central1"
 MODEL_ARMOR_FAIL_CLOSED="false"
-GEMINI_SAFETY_THRESHOLD="BLOCK_LOW_AND_ABOVE"
 
 # Approved Model Catalogs & Guardrail Ceilings
 ALLOWED_LLM_MODELS="gemini-2.5-flash,gemini-2.5-pro,gemini-2.5-flash-lite"

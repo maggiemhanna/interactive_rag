@@ -2,7 +2,7 @@
 
 Divides AI-specific runtime protections into three focused modules:
 - `armor`: Regional Google Cloud Model Armor + Cloud DLP prompt, chunk, and output screening.
-- `safety`: Vertex AI Gemini `HarmBlockThreshold` settings, safety-block inspection, and refusal messages.
+- `safety`: Standardized, sanitized user-facing refusal and fallback error messages.
 - `guardrails`: Approved LLM/embedding model catalogs, input/ingestion ceilings, and recursion limits.
 """
 
@@ -39,8 +39,6 @@ if TYPE_CHECKING:
         RECURSION_LIMIT_MESSAGE,
         SAFETY_REFUSAL_MESSAGE,
         SCREENING_UNAVAILABLE_MESSAGE,
-        get_gemini_safety_settings,
-        is_safety_blocked,
     )
 
 _EXPORT_MAP: dict[str, str] = {
@@ -68,8 +66,6 @@ _EXPORT_MAP: dict[str, str] = {
     "RECURSION_LIMIT_MESSAGE": "src.core.ai_security.safety",
     "SAFETY_REFUSAL_MESSAGE": "src.core.ai_security.safety",
     "SCREENING_UNAVAILABLE_MESSAGE": "src.core.ai_security.safety",
-    "get_gemini_safety_settings": "src.core.ai_security.safety",
-    "is_safety_blocked": "src.core.ai_security.safety",
 }
 
 __all__ = sorted(_EXPORT_MAP.keys())

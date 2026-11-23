@@ -12,7 +12,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.errors import GraphRecursionError
 
-from src.agent.display import print_event, print_header
+from src.agent.display import print_event
 from src.agent.graph import build_agent, extract_message_text
 from src.agent.memory import MEMORY_SAVER
 from src.agent.schemas import AgentRequest
@@ -27,15 +27,13 @@ from src.core.compliance.audit import emit_audit_event
 from src.core.compliance.provenance import build_compliance_metadata
 from src.core.config import (
     get_agent_recursion_limit,
-    get_dev_user_id,
     is_agent_console_trace_enabled,
     is_cloud_run,
 )
-from src.core.context import scrub_query_fields
 from src.core.logger import setup_logging
 from src.core.observability.state import record_ttft
 from src.core.observability.telemetry import emit_telemetry_event
-from src.core.storage import has_sqlite, user_read_lock
+from src.core.storage import user_read_lock
 
 logger = setup_logging(name="agent.service")
 
@@ -317,39 +315,9 @@ def stream_sse(
         yield "data: [DONE]\n\n"
 
 
-def run_interactive(
-    collection_name: str,
-    query: str = "What is ARM Holdings?",
-) -> None:
-    """Runs an interactive local CLI query and renders Rich message panels to the terminal.
-
-    Args:
-        collection_name: Target Chroma collection identifier.
-        query: Sample or custom question to execute against the collection.
-    """
-    print_header("Agentic RAG Assistant Initialized", "magenta")
-    scrubbed = scrub_query_fields({"query": query})
-    logger.info(
-        f"Running interactive agent on collection '{collection_name}' "
-        f"(query_sha256='{scrubbed['query_sha256']}', query_chars={scrubbed['query_chars']})."
-    )
-    cli_uid = get_dev_user_id()
-    with user_read_lock(cli_uid) as resolved_dir:
-        target_dir = resolved_dir if has_sqlite(resolved_dir) else "chroma_db"
-        for _ in stream_events(
-            query=query,
-            collection_name=collection_name,
-            thread_id=f"{cli_uid}:1",
-            persist_directory=target_dir,
-            verbose_console=True,
-        ):
-            pass
-
-
 __all__ = [
     "SSE_HEADERS",
     "emit_agent_query_events",
-    "run_interactive",
     "stream_events",
     "stream_sse",
 ]

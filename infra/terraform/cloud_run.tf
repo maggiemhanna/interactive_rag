@@ -355,10 +355,6 @@ resource "google_cloud_run_v2_service" "agent_api" {
         value = tostring(var.model_armor_fail_closed)
       }
       env {
-        name  = "GEMINI_SAFETY_THRESHOLD"
-        value = var.gemini_safety_threshold
-      }
-      env {
         name  = "ALLOWED_LLM_MODELS"
         value = var.allowed_llm_models
       }

@@ -52,7 +52,7 @@ To prevent CPU- and memory-intensive PDF ingestion from blocking interactive que
 
 ### `src/core/ai_security/` - Model Armor, Content Safety & Guardrails
 - **`armor.py`**: Regional Google Cloud Model Armor + Cloud Data Loss Prevention (SDP) screening for user prompts (`screen_user_prompt`), retrieved document chunks (`sanitize_chunk_text`, `sanitize_retrieved_documents`), and final LLM responses (`sanitize_model_output`) with fail-closed behavior in Cloud Run.
-- **`safety.py`**: Vertex AI Gemini `HarmBlockThreshold` safety configuration (`get_gemini_safety_settings`), `finish_reason="SAFETY"` refusal detection (`is_safety_blocked`), and standardized user-safe refusal/error messages.
+- **`safety.py`**: Standardized user-safe refusal and fallback error messages shared across Model Armor screening, bounded execution, and REST/SSE error responses.
 - **`guardrails.py`**: Server-enforced LLM and embedding model allowlists (`validate_llm_model`, `validate_embedding_model`), collection and tool identifier sanitization (`validate_collection_name`, `safe_tool_name`), query/upload/chunk ceilings (`validate_query_text`, `validate_file_count`, `validate_chunk_count`), PDF file-signature and upload path guardrails (`sanitize_filename`, `validate_pdf_bytes`, `validate_server_pdf_paths`), and XML spotlighting for retrieved chunks (`EMPTY_RETRIEVAL_MARKER`, `format_retrieved_chunks`).
 
 ### `src/core/compliance/` - Data Residency, Audit Logging, Provenance & DSAR
@@ -129,8 +129,8 @@ curl -X POST "http://localhost:8000/ingest" \
 `src/agent/` runs the stateful, safety-screened LangGraph RAG workflow and mounts `src/query` + `src/manage` + `src/agent` onto `agent-api`:
 1. **XML-Spotlighted Retriever Tool (`tools.py`)**: Queries the user's Chroma collection via hybrid RRF search using its bound `embedding_model`, applies Cloud DLP `[INFO_TYPE]` chunk redaction, and formats retrieved chunks into `<retrieved_chunk source="..." page="...">` tags via `format_retrieved_chunks` and `safe_tool_name` from `src/core/ai_security/guardrails.py` (`get_retriever_tool`).
 2. **Tenant-Isolated Memory (`memory.py`)**: Owns the `MEMORY_SAVER` (`InMemorySaver`) checkpointer and namespaces checkpoint threads under `{uid}:{thread_id}` (`make_user_thread_id`).
-3. **Safety-Screened LangGraph StateGraph (`graph.py`)**: Compiles `input_guard` $\rightarrow$ `model_call` $\leftrightarrow$ `tools` $\rightarrow$ `output_guard` with regional `ChatGoogleGenerativeAI`, Gemini safety thresholds, and `[source, p.X]` citation rules.
-4. **SSE & Interactive Streaming (`service.py`, `display.py`)**: Streams sanitized message events, tool traces, and EU AI Act Art. 50 `compliance` frames over SSE (`stream_sse`), emits canonical `agent.query` audit/telemetry events (`emit_agent_query_events`), or renders rich terminal panels (`run_interactive`).
+3. **Safety-Screened LangGraph StateGraph (`graph.py`)**: Compiles `input_guard` $\rightarrow$ `model_call` $\leftrightarrow$ `tools` $\rightarrow$ `output_guard` with regional `ChatGoogleGenerativeAI` and `[source, p.X]` citation rules.
+4. **SSE Streaming & Audit Publishing (`service.py`, `display.py`)**: Streams sanitized message events, tool traces, and EU AI Act Art. 50 `compliance` frames over SSE (`stream_sse`), emits canonical `agent.query` audit/telemetry events (`emit_agent_query_events`), and optionally renders rich terminal trace panels when `AGENT_CONSOLE_TRACE=true`.
 5. **Unified Interactive FastAPI Service (`routes.py`, `app.py`, `schemas.py`)**: Defines `agent_router` (`POST /agent`, `POST /agent/stream`) in `routes.py` and mounts `agent_router`, `query_router` (`POST /query`), and `manage_router` (`GET /collections`, `DELETE /collections/{collection_name}`, `GET/DELETE /compliance/my-data`) plus `GET /health` in `app.py`.
 
 ### LangGraph Agent Workflow
@@ -255,7 +255,7 @@ src/
 │   ├── ai_security/
 │   │   ├── __init__.py
 │   │   ├── armor.py           # Regional Model Armor + Cloud DLP prompt/chunk/output screening
-│   │   ├── safety.py          # Gemini HarmBlockThreshold settings & refusal messages
+│   │   ├── safety.py          # Standardized user-safe refusal & fallback error messages
 │   │   └── guardrails.py      # Model allowlists, query/upload/chunk ceilings, XML spotlighting & tool-name sanitization
 │   ├── compliance/
 │   │   ├── __init__.py
@@ -293,11 +293,11 @@ src/
 └── agent/                     # Package 4: Unified Interactive Agent, Query & Management Service (`agent-api`)
     ├── __init__.py
     ├── __main__.py            # Entrypoint (`python -m src.agent`)
-    ├── schemas.py             # AgentRequest & AgentState models
+    ├── schemas.py             # AgentRequest, AgentResponse & AgentState models
     ├── memory.py              # Tenant-namespaced InMemorySaver checkpointer (`MEMORY_SAVER`)
     ├── tools.py               # DLP-masked Chroma retriever tool delegating XML spotlighting to guardrails
     ├── graph.py               # Safety-screened LangGraph StateGraph builder
-    ├── service.py             # Agent event runner, SSE formatter & CLI interactive runner
+    ├── service.py             # Agent event runner & SSE frame generator
     ├── display.py             # Rich terminal message rendering
     ├── routes.py              # FastAPI router (`POST /agent`, `POST /agent/stream`)
     └── app.py                 # Agent FastAPI service (`agent_router`, `query_router`, `manage_router`)

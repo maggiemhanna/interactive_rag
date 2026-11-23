@@ -13,11 +13,12 @@ import contextlib
 from dataclasses import dataclass
 import os
 import shutil
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 import uuid
 
 from fastapi import HTTPException, Request
 from langchain_core.documents import Document
+from pydantic import ValidationError
 
 from src.core.ai_security.guardrails import (
     sanitize_filename,
@@ -38,6 +39,7 @@ from src.core.config import (
 )
 from src.core.logger import setup_logging
 from src.core.storage import archive_upload, get_bucket_name, get_upload_user_dir
+from src.ingest.schemas import IngestRequest
 from src.ingest.splitter import split_pdfs
 
 logger = setup_logging(name="ingest.upload_parser")
@@ -61,32 +63,30 @@ class IngestPayload:
 
 
 def _parse_json_body(
-    body: Dict[str, Any],
-) -> Tuple[List[str], Optional[str], Optional[str]]:
-    """Extracts `pdf_paths`, `collection_name`, and `embedding_model` from a JSON request body.
+    body: Any,
+) -> Tuple[List[str], str, str]:
+    """Validates a JSON `/ingest` payload with `IngestRequest` and extracts normalized fields.
 
     Args:
-        body: Parsed JSON dictionary from `await request.json()`.
+        body: Parsed JSON value from `await request.json()`.
 
     Returns:
         Tuple `(raw_server_paths, collection_name, embedding_model)`.
 
     Raises:
-        HTTPException: HTTP 422 if `embedding_model` is provided with a non-string type.
+        HTTPException: HTTP 422 if `body` fails `IngestRequest` schema or guardrail validation.
     """
-    raw_server_paths: List[str] = []
-    raw_paths = body.get("pdf_paths")
-    if isinstance(raw_paths, str) and raw_paths.strip():
-        raw_server_paths.append(raw_paths.strip())
-    elif isinstance(raw_paths, list):
-        raw_server_paths.extend([str(p).strip() for p in raw_paths if str(p).strip()])
+    try:
+        parsed = IngestRequest.model_validate(body)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=exc.errors(include_url=False, include_context=False),
+        ) from exc
 
-    raw_col = body.get("collection_name")
-    collection_name = raw_col if isinstance(raw_col, str) else None
-    raw_emb = body.get("embedding_model")
-    if raw_emb is not None and not isinstance(raw_emb, str):
-        raise HTTPException(status_code=422, detail="embedding_model must be a string.")
-    return raw_server_paths, collection_name, raw_emb
+    raw_items = [parsed.pdf_paths] if isinstance(parsed.pdf_paths, str) else parsed.pdf_paths
+    raw_server_paths = [p.strip() for p in raw_items if p.strip()]
+    return raw_server_paths, parsed.collection_name, parsed.embedding_model
 
 
 def _validate_ingest_params(

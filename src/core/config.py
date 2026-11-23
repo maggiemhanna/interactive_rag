@@ -363,11 +363,6 @@ def get_max_chunks_per_ingest() -> int:
     return _parse_positive_int("MAX_CHUNKS_PER_INGEST", 1000)
 
 
-def get_gemini_safety_threshold() -> str:
-    """Returns the configured Vertex AI Gemini `HarmBlockThreshold` name."""
-    return os.getenv("GEMINI_SAFETY_THRESHOLD", "BLOCK_LOW_AND_ABOVE").strip().upper() or "BLOCK_LOW_AND_ABOVE"
-
-
 def get_google_cloud_location() -> str:
     """Returns the unified single-region GCP location (`GOOGLE_CLOUD_LOCATION`, defaulting to `'us-central1'`)."""
     return os.getenv("GOOGLE_CLOUD_LOCATION", "").strip() or "us-central1"
@@ -420,7 +415,6 @@ AGENT_RECURSION_LIMIT: int = get_agent_recursion_limit()
 MAX_UPLOAD_MB: int = get_max_upload_mb()
 MAX_FILES_PER_REQUEST: int = get_max_files_per_request()
 MAX_CHUNKS_PER_INGEST: int = get_max_chunks_per_ingest()
-GEMINI_SAFETY_THRESHOLD: str = get_gemini_safety_threshold()
 MODEL_ARMOR_TEMPLATE_ID: str = get_model_armor_template_id()
 MODEL_ARMOR_LOCATION: str = get_model_armor_location()
 MODEL_ARMOR_FAIL_CLOSED: bool = is_model_armor_fail_closed()
@@ -446,7 +440,6 @@ __all__ = [
     "DEFAULT_TELEMETRY_LOG_NAME",
     "FALSE_ENV_VALUES",
     "GCP_REGION_PATTERN",
-    "GEMINI_SAFETY_THRESHOLD",
     "GOOGLE_CLOUD_LOCATION",
     "INGEST_PORT",
     "MAX_CHUNKS_PER_INGEST",
@@ -477,7 +470,6 @@ __all__ = [
     "get_default_llm_model",
     "get_dev_user_id",
     "get_firebase_project_id",
-    "get_gemini_safety_threshold",
     "get_google_cloud_location",
     "get_google_cloud_project",
     "get_local_chroma_root",

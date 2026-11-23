@@ -288,7 +288,7 @@ variable "psc_subnet_cidr" {
 }
 
 # ==============================================================================
-# 5. AI-Specific Security (Model Allowlists, Safety Thresholds & Upload Ceilings)
+# 5. AI-Specific Security (Model Allowlists, Model Armor & Upload Ceilings)
 # ==============================================================================
 
 variable "allowed_llm_models" {
@@ -301,20 +301,6 @@ variable "allowed_embedding_models" {
   description = "Comma-separated allowlist of approved regional Vertex AI embedding models."
   type        = string
   default     = "gemini-embedding-001,text-embedding-004,text-embedding-005"
-}
-
-variable "gemini_safety_threshold" {
-  description = "Gemini HarmBlockThreshold applied to all content safety categories."
-  type        = string
-  default     = "BLOCK_LOW_AND_ABOVE"
-
-  validation {
-    condition = contains(
-      ["BLOCK_LOW_AND_ABOVE", "BLOCK_MEDIUM_AND_ABOVE", "BLOCK_ONLY_HIGH"],
-      var.gemini_safety_threshold
-    )
-    error_message = "gemini_safety_threshold must be BLOCK_LOW_AND_ABOVE, BLOCK_MEDIUM_AND_ABOVE, or BLOCK_ONLY_HIGH."
-  }
 }
 
 variable "model_armor_pi_confidence" {
