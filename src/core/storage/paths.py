@@ -24,18 +24,22 @@ logger = setup_logging(name="storage.paths")
 
 VERSION_FILENAME = "version.json"
 SQLITE_FILENAME = "chroma.sqlite3"
+CHROMA_SUBDIR = "chroma"
+FTS_SUBDIR = "fts"
+UPLOADS_SUBDIR = "uploads"
+SYNCED_SUBDIRS = (CHROMA_SUBDIR, FTS_SUBDIR)
 TRANSIENT_SQLITE_SUFFIXES = ("-wal", "-shm", "-journal")
 SAFE_FILENAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 
 
 def get_chroma_root() -> str:
-    """Returns the root directory where per-user ChromaDB working directories are stored.
+    """Returns the root directory where per-user working directories are stored.
 
     Resolves `LOCAL_CHROMA_ROOT` when explicitly set, `/tmp/chroma_db` inside Cloud Run,
     or `./chroma_db/users` during local development.
 
     Returns:
-        Absolute filesystem path to the multi-tenant ChromaDB root directory.
+        Absolute filesystem path to the multi-tenant root directory.
     """
     configured = get_local_chroma_root()
     if configured:
@@ -46,13 +50,16 @@ def get_chroma_root() -> str:
 
 
 def get_user_dir(uid: str) -> str:
-    """Returns the validated, isolated local ChromaDB directory path for a specific user.
+    """Returns the validated, isolated local root directory path for a specific user.
+
+    Contains `version.json`, `chroma/` (ChromaDB SQLite + HNSW segments), `fts/`
+    (per-collection SQLite FTS5 indexes), and (in local mode) `uploads/`.
 
     Args:
         uid: Verified tenant user identifier.
 
     Returns:
-        Absolute path `<chroma_root>/<uid>` verified via `os.path.commonpath`.
+        Absolute path `<root>/<uid>` verified via `os.path.commonpath`.
 
     Raises:
         HTTPException: HTTP 401 if `uid` fails `validate_uid`.
@@ -66,8 +73,23 @@ def get_user_dir(uid: str) -> str:
     return user_dir
 
 
+def get_chroma_dir(user_dir: str) -> str:
+    """Returns the ChromaDB subdirectory (`<user_dir>/chroma`) inside a tenant's working directory."""
+    return os.path.join(user_dir, CHROMA_SUBDIR)
+
+
+def get_fts_dir(user_dir: str) -> str:
+    """Returns the SQLite FTS5 subdirectory (`<user_dir>/fts`) inside a tenant's working directory."""
+    return os.path.join(user_dir, FTS_SUBDIR)
+
+
+def get_user_uploads_dir(user_dir: str) -> str:
+    """Returns the archived uploads subdirectory (`<user_dir>/uploads`) inside a tenant's directory."""
+    return os.path.join(user_dir, UPLOADS_SUBDIR)
+
+
 def get_upload_user_dir(uid: str) -> str:
-    """Returns the validated, isolated temporary PDF upload directory for a specific user.
+    """Returns the validated, isolated ephemeral PDF upload staging directory for a specific user.
 
     Args:
         uid: Verified tenant user identifier.
@@ -90,8 +112,20 @@ def get_upload_user_dir(uid: str) -> str:
     return user_upload_dir
 
 
+def user_gcs_prefix(uid: str) -> str:
+    """Returns the canonical root GCS prefix (`users/{uid}/`) for a user's persisted files.
+
+    Args:
+        uid: Verified path-safe user identifier.
+
+    Returns:
+        Trailing-slash root GCS prefix string for `uid`.
+    """
+    return f"users/{uid}/"
+
+
 def user_chroma_gcs_prefix(uid: str) -> str:
-    """Returns the canonical GCS object prefix (`users/{uid}/chroma_db/`) for a user's vector store.
+    """Returns the canonical GCS object prefix (`users/{uid}/chroma/`) for a user's ChromaDB files.
 
     Args:
         uid: Verified path-safe user identifier.
@@ -99,11 +133,35 @@ def user_chroma_gcs_prefix(uid: str) -> str:
     Returns:
         Trailing-slash GCS prefix string for `uid`'s ChromaDB files.
     """
-    return f"users/{uid}/chroma_db/"
+    return f"users/{uid}/{CHROMA_SUBDIR}/"
+
+
+def user_fts_gcs_prefix(uid: str) -> str:
+    """Returns the canonical GCS object prefix (`users/{uid}/fts/`) for a user's FTS5 indexes.
+
+    Args:
+        uid: Verified path-safe user identifier.
+
+    Returns:
+        Trailing-slash GCS prefix string for `uid`'s FTS5 inverted index files.
+    """
+    return f"users/{uid}/{FTS_SUBDIR}/"
+
+
+def user_uploads_gcs_prefix(uid: str) -> str:
+    """Returns the canonical GCS object prefix (`users/{uid}/uploads/`) for a user's archived PDFs.
+
+    Args:
+        uid: Verified path-safe user identifier.
+
+    Returns:
+        Trailing-slash GCS prefix string for `uid`'s archived uploads.
+    """
+    return f"users/{uid}/{UPLOADS_SUBDIR}/"
 
 
 def user_lock_gcs_blob_name(uid: str) -> str:
-    """Returns the canonical GCS object name (`users/{uid}/locks/chroma.lock`) for write locking.
+    """Returns the canonical GCS object name (`users/{uid}/locks/write.lock`) for tenant write locking.
 
     Args:
         uid: Verified path-safe user identifier.
@@ -111,27 +169,36 @@ def user_lock_gcs_blob_name(uid: str) -> str:
     Returns:
         GCS blob path used for atomic `if_generation_match` distributed write locks.
     """
-    return f"users/{uid}/locks/chroma.lock"
+    return f"users/{uid}/locks/write.lock"
 
 
 def release_client_cache(persist_directory: str) -> None:
-    """Stops and evicts ChromaDB's cached `System` instance for `persist_directory`.
+    """Stops and evicts ChromaDB's cached `System` instance(s) at or inside `persist_directory`.
 
     ChromaDB's `PersistentClient` caches `RustBindingsAPI`/`SegmentAPI` handles per directory
-    path. Releasing this handle is mandatory before replacing local SQLite/HNSW files on GCS
-    refresh and before snapshotting SQLite files back to GCS.
+    path (`<user_dir>/chroma`). Releasing matching handles is mandatory before replacing local
+    SQLite/HNSW files on GCS refresh and before snapshotting SQLite files back to GCS.
 
     Args:
-        persist_directory: Local filesystem path of the ChromaDB tenant directory.
+        persist_directory: Local filesystem path of the tenant directory or its `chroma/` subdirectory.
     """
     try:
         from chromadb.api.client import SharedSystemClient
     except ImportError:
         return
 
-    candidates = {persist_directory, os.path.abspath(persist_directory)}
+    target_abs = os.path.abspath(persist_directory)
+    candidates = {persist_directory, target_abs}
     for key in list(getattr(SharedSystemClient, "_identifier_to_system", {}).keys()):
-        if key in candidates or os.path.abspath(str(key)) in candidates:
+        key_str = str(key)
+        key_abs = os.path.abspath(key_str)
+        is_match = key in candidates or key_abs in candidates
+        if not is_match:
+            try:
+                is_match = os.path.commonpath([target_abs, key_abs]) == target_abs
+            except ValueError:
+                is_match = False
+        if is_match:
             system = SharedSystemClient._identifier_to_system.pop(key, None)
             SharedSystemClient._identifier_to_refcount.pop(key, None)
             if system is not None:
@@ -142,12 +209,12 @@ def release_client_cache(persist_directory: str) -> None:
 
 
 def checkpoint_sqlite_wal(user_dir: str) -> None:
-    """Folds any SQLite Write-Ahead Log frames cleanly into `chroma.sqlite3` before GCS upload.
+    """Folds any SQLite Write-Ahead Log frames cleanly into `chroma/chroma.sqlite3` before GCS upload.
 
     Args:
-        user_dir: Local ChromaDB tenant directory containing `chroma.sqlite3`.
+        user_dir: Local tenant working directory containing `chroma/chroma.sqlite3`.
     """
-    sqlite_path = os.path.join(user_dir, SQLITE_FILENAME)
+    sqlite_path = os.path.join(get_chroma_dir(user_dir), SQLITE_FILENAME)
     if not os.path.exists(sqlite_path):
         return
     try:
@@ -184,16 +251,16 @@ def directory_size_bytes(path: str) -> int:
 
 
 def read_local_version(user_dir: str) -> Optional[str]:
-    """Reads the local snapshot UUID from `<user_dir>/version.json` when SQLite is present.
+    """Reads the local snapshot UUID from `<user_dir>/version.json` when `chroma/chroma.sqlite3` is present.
 
     Args:
-        user_dir: Local ChromaDB tenant directory.
+        user_dir: Local tenant working directory.
 
     Returns:
-        Version UUID string if both `version.json` and `chroma.sqlite3` exist, otherwise `None`.
+        Version UUID string if both `version.json` and `chroma/chroma.sqlite3` exist, otherwise `None`.
     """
     version_path = os.path.join(user_dir, VERSION_FILENAME)
-    sqlite_path = os.path.join(user_dir, SQLITE_FILENAME)
+    sqlite_path = os.path.join(get_chroma_dir(user_dir), SQLITE_FILENAME)
     if not os.path.exists(version_path) or not os.path.exists(sqlite_path):
         return None
     try:
@@ -205,18 +272,28 @@ def read_local_version(user_dir: str) -> Optional[str]:
 
 
 __all__ = [
+    "CHROMA_SUBDIR",
+    "FTS_SUBDIR",
     "SAFE_FILENAME_RE",
     "SQLITE_FILENAME",
+    "SYNCED_SUBDIRS",
     "TRANSIENT_SQLITE_SUFFIXES",
+    "UPLOADS_SUBDIR",
     "VERSION_FILENAME",
     "checkpoint_sqlite_wal",
     "directory_size_bytes",
     "get_bucket_name",
+    "get_chroma_dir",
     "get_chroma_root",
+    "get_fts_dir",
     "get_upload_user_dir",
     "get_user_dir",
+    "get_user_uploads_dir",
     "read_local_version",
     "release_client_cache",
     "user_chroma_gcs_prefix",
+    "user_fts_gcs_prefix",
+    "user_gcs_prefix",
     "user_lock_gcs_blob_name",
+    "user_uploads_gcs_prefix",
 ]

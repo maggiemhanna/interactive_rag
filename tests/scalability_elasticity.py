@@ -248,17 +248,25 @@ class TestStorageCacheBoundsAndIncrementalMD5Sync(unittest.TestCase):
             service_name="ingest-api",
             uid=uid,
         )
+        # Seed an archived PDF under users/{uid}/uploads/ to ensure snapshot push never touches uploads/
+        upload_blob_name = f"users/{uid}/uploads/20261124T000000Z_abc123_report.pdf"
+        self.fake_bucket.blob(upload_blob_name).upload_from_string(b"%PDF-1.4 archived")
+
         t1 = bind_request_context(ctx1)
         try:
             with patch.dict(os.environ, env, clear=False), patch.object(
                 gcs_sync_module, "_get_bucket", return_value=self.fake_bucket
             ):
                 with user_write_lock(uid) as user_dir:
-                    seg_dir = os.path.join(user_dir, "hnsw_segment_01")
+                    chroma_dir = os.path.join(user_dir, "chroma")
+                    seg_dir = os.path.join(chroma_dir, "hnsw_segment_01")
+                    fts_dir = os.path.join(user_dir, "fts")
                     os.makedirs(seg_dir, exist_ok=True)
-                    sqlite_file = os.path.join(user_dir, "chroma.sqlite3")
+                    os.makedirs(fts_dir, exist_ok=True)
+                    sqlite_file = os.path.join(chroma_dir, "chroma.sqlite3")
                     hnsw_data = os.path.join(seg_dir, "data_level0.bin")
                     hnsw_header = os.path.join(seg_dir, "header.bin")
+                    fts_file = os.path.join(fts_dir, "financial_reports.sqlite3")
 
                     with open(sqlite_file, "wb") as fh:
                         fh.write(b"sqlite-v1-content")
@@ -266,20 +274,25 @@ class TestStorageCacheBoundsAndIncrementalMD5Sync(unittest.TestCase):
                         fh.write(b"hnsw-graph-vectors-unchanged" * 50)
                     with open(hnsw_header, "wb") as fh:
                         fh.write(b"hnsw-header-unchanged")
+                    with open(fts_file, "wb") as fh:
+                        fh.write(b"fts5-index-unchanged")
 
                 spans_1 = [s for s in get_recorded_spans() if s["name"] == "storage.gcs_push"]
                 self.assertEqual(len(spans_1), 1)
-                self.assertEqual(spans_1[0]["attributes"]["uploaded_files"], 3)
+                self.assertEqual(spans_1[0]["attributes"]["uploaded_files"], 4)
                 self.assertEqual(spans_1[0]["attributes"]["skipped_files"], 0)
                 self.assertEqual(spans_1[0]["attributes"]["deleted_files"], 0)
         finally:
             reset_request_context(t1)
 
         gen_data_before = self.fake_bucket.blob(
-            f"users/{uid}/chroma_db/hnsw_segment_01/data_level0.bin"
+            f"users/{uid}/chroma/hnsw_segment_01/data_level0.bin"
         ).generation
         gen_header_before = self.fake_bucket.blob(
-            f"users/{uid}/chroma_db/hnsw_segment_01/header.bin"
+            f"users/{uid}/chroma/hnsw_segment_01/header.bin"
+        ).generation
+        gen_fts_before = self.fake_bucket.blob(
+            f"users/{uid}/fts/financial_reports.sqlite3"
         ).generation
 
         ctx2 = RequestContext(
@@ -294,8 +307,8 @@ class TestStorageCacheBoundsAndIncrementalMD5Sync(unittest.TestCase):
                 gcs_sync_module, "_get_bucket", return_value=self.fake_bucket
             ):
                 with user_write_lock(uid) as user_dir:
-                    sqlite_file = os.path.join(user_dir, "chroma.sqlite3")
-                    hnsw_header = os.path.join(user_dir, "hnsw_segment_01", "header.bin")
+                    sqlite_file = os.path.join(user_dir, "chroma", "chroma.sqlite3")
+                    hnsw_header = os.path.join(user_dir, "chroma", "hnsw_segment_01", "header.bin")
                     with open(sqlite_file, "wb") as fh:
                         fh.write(b"sqlite-v2-modified-content")
                     os.remove(hnsw_header)
@@ -303,21 +316,29 @@ class TestStorageCacheBoundsAndIncrementalMD5Sync(unittest.TestCase):
                 spans_2 = [s for s in get_recorded_spans() if s["name"] == "storage.gcs_push"]
                 self.assertEqual(len(spans_2), 1)
                 self.assertEqual(spans_2[0]["attributes"]["uploaded_files"], 1)
-                self.assertEqual(spans_2[0]["attributes"]["skipped_files"], 1)
+                self.assertEqual(spans_2[0]["attributes"]["skipped_files"], 2)
                 self.assertEqual(spans_2[0]["attributes"]["deleted_files"], 1)
         finally:
             reset_request_context(t2)
 
         gen_data_after = self.fake_bucket.blob(
-            f"users/{uid}/chroma_db/hnsw_segment_01/data_level0.bin"
+            f"users/{uid}/chroma/hnsw_segment_01/data_level0.bin"
+        ).generation
+        gen_fts_after = self.fake_bucket.blob(
+            f"users/{uid}/fts/financial_reports.sqlite3"
         ).generation
         self.assertEqual(gen_data_before, gen_data_after)
+        self.assertEqual(gen_fts_before, gen_fts_after)
         self.assertIsNotNone(gen_header_before)
         self.assertFalse(
-            self.fake_bucket.blob(f"users/{uid}/chroma_db/hnsw_segment_01/header.bin").exists()
+            self.fake_bucket.blob(f"users/{uid}/chroma/hnsw_segment_01/header.bin").exists()
+        )
+        self.assertTrue(
+            self.fake_bucket.blob(upload_blob_name).exists(),
+            "Snapshot push must never delete archived PDFs under users/{uid}/uploads/",
         )
         version_doc = json.loads(
-            self.fake_bucket.blob(f"users/{uid}/chroma_db/version.json").download_as_text()
+            self.fake_bucket.blob(f"users/{uid}/version.json").download_as_text()
         )
         self.assertIn("version", version_doc)
 

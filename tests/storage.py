@@ -1,11 +1,14 @@
-"""Automated offline unit test suite for Per-User GCS <-> ChromaDB Storage (`src.core.storage`).
+"""Automated offline unit test suite for Per-User GCS <-> ChromaDB + FTS5 Storage (`src.core.storage`).
 
 Verifies:
-- Strict per-tenant directory and GCS prefix isolation (`users/<uid>/chroma_db/`).
+- Strict per-tenant directory and GCS prefix isolation (`users/<uid>/{version.json, chroma/, fts/, uploads/}`).
 - Cross-service `version.json` invalidation and Chroma `PersistentClient` cache refresh.
-- Remote GCS blob cleanup upon collection deletion.
-- Distributed GCS write-lock TTL recovery (`users/<uid>/locks/chroma.lock`) and contention timeouts.
+- Remote GCS blob cleanup upon collection deletion (both Chroma segments and FTS5 sidecar).
+- Distributed GCS write-lock TTL recovery (`users/<uid>/locks/write.lock`) and contention timeouts.
 - `/tmp` LRU cache eviction preserving actively locked readers.
+- Hybrid dense + lexical RRF search via persisted SQLite FTS5 sidecar (`fts/<collection_name>.sqlite3`)
+  and single-pass `BM25Retriever` fallback.
+- Local-mode PDF archiving under `<user_dir>/uploads/` and DSAR inventory/erasure.
 """
 
 import json
@@ -18,18 +21,28 @@ from unittest.mock import patch
 
 import chromadb
 from langchain_chroma import Chroma
+from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 
+from src.core.compliance.dsar import get_user_data_inventory, purge_all_user_data
 from src.core.logger import setup_logging
 from src.core.storage import (
     LockTimeoutError,
+    archive_upload,
+    chroma as chroma_module,
     evict_tmp_cache,
+    fts_index_path,
     gcs_sync as gcs_sync_module,
+    get_chroma_dir,
+    get_user_uploads_dir,
+    get_vectorstore,
+    remove_collection,
     similarity_search_with_scores,
     sync_user_dir,
     user_read_lock,
     user_write_lock,
 )
+from src.ingest.service import ingest_documents
 from tests.helpers import (
     DeterministicFakeEmbeddings,
     FakeGCSBlob,
@@ -41,7 +54,7 @@ logger = setup_logging(name="tests.storage")
 
 
 class TestPerUserChromaStorage(unittest.TestCase):
-    """Unit tests for per-user GCS synchronization, distributed locking, and `/tmp` LRU cache eviction."""
+    """Unit tests for per-user GCS synchronization, distributed locking, `/tmp` LRU eviction, and FTS5 sidecar search."""
 
     def setUp(self) -> None:
         self.container1_tmp = tempfile.mkdtemp(prefix="chroma_c1_")
@@ -70,7 +83,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
         ):
             # Alice creates 'stock_market_vs' with 2 documents
             with user_write_lock("user_alice") as alice_dir:
-                client_a = chromadb.PersistentClient(path=alice_dir)
+                client_a = chromadb.PersistentClient(path=get_chroma_dir(alice_dir))
                 col_a = client_a.get_or_create_collection("stock_market_vs")
                 col_a.add(
                     ids=["a1", "a2"],
@@ -80,7 +93,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
 
             # Bob creates 'stock_market_vs' with 1 completely different document
             with user_write_lock("user_bob") as bob_dir:
-                client_b = chromadb.PersistentClient(path=bob_dir)
+                client_b = chromadb.PersistentClient(path=get_chroma_dir(bob_dir))
                 col_b = client_b.get_or_create_collection("stock_market_vs")
                 col_b.add(
                     ids=["b1"],
@@ -98,8 +111,8 @@ class TestPerUserChromaStorage(unittest.TestCase):
 
             self.assertFalse(os.path.exists(charlie_read_dir), "New user should have no DB directory yet")
 
-            alice_col = chromadb.PersistentClient(path=alice_read_dir).get_collection("stock_market_vs")
-            bob_col = chromadb.PersistentClient(path=bob_read_dir).get_collection("stock_market_vs")
+            alice_col = chromadb.PersistentClient(path=get_chroma_dir(alice_read_dir)).get_collection("stock_market_vs")
+            bob_col = chromadb.PersistentClient(path=get_chroma_dir(bob_read_dir)).get_collection("stock_market_vs")
 
             self.assertEqual(alice_col.count(), 2)
             self.assertEqual(bob_col.count(), 1)
@@ -112,7 +125,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
             os.environ, self._env(self.container1_tmp), clear=False
         ):
             with user_write_lock("user_alice") as dir_c1:
-                col = chromadb.PersistentClient(path=dir_c1).get_or_create_collection("reports")
+                col = chromadb.PersistentClient(path=get_chroma_dir(dir_c1)).get_or_create_collection("reports")
                 col.add(ids=["1"], documents=["Doc 1"], embeddings=[[0.1, 0.2, 0.3]])
 
         # Step 2: Container 2 (agent-api) syncs and opens PersistentClient (populates Chroma internal cache)
@@ -120,14 +133,17 @@ class TestPerUserChromaStorage(unittest.TestCase):
             os.environ, self._env(self.container2_tmp), clear=False
         ):
             dir_c2 = sync_user_dir("user_alice")
-            self.assertEqual(chromadb.PersistentClient(path=dir_c2).get_collection("reports").count(), 1)
+            self.assertEqual(
+                chromadb.PersistentClient(path=get_chroma_dir(dir_c2)).get_collection("reports").count(),
+                1,
+            )
 
         # Step 3: Container 1 adds a second doc -> bumps version.json in GCS
         with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container1_tmp), clear=False
         ):
             with user_write_lock("user_alice") as dir_c1:
-                col = chromadb.PersistentClient(path=dir_c1).get_collection("reports")
+                col = chromadb.PersistentClient(path=get_chroma_dir(dir_c1)).get_or_create_collection("reports")
                 col.add(ids=["2"], documents=["Doc 2"], embeddings=[[0.4, 0.5, 0.6]])
 
         # Step 4: Container 2 syncs again -> detects version bump, invalidates Chroma system cache, sees 2 docs!
@@ -136,7 +152,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
         ):
             dir_c2_refreshed = sync_user_dir("user_alice")
             self.assertEqual(
-                chromadb.PersistentClient(path=dir_c2_refreshed).get_collection("reports").count(),
+                chromadb.PersistentClient(path=get_chroma_dir(dir_c2_refreshed)).get_collection("reports").count(),
                 2,
             )
 
@@ -146,27 +162,28 @@ class TestPerUserChromaStorage(unittest.TestCase):
             os.environ, self._env(self.container1_tmp), clear=False
         ):
             with user_write_lock("user_alice") as alice_dir:
-                client = chromadb.PersistentClient(path=alice_dir)
+                client = chromadb.PersistentClient(path=get_chroma_dir(alice_dir))
                 c1 = client.create_collection("keep_me")
                 c1.add(ids=["1"], documents=["Keep"], embeddings=[[1.0, 0.0, 0.0]])
                 c2 = client.create_collection("delete_me")
                 c2.add(ids=["2"], documents=["Drop"], embeddings=[[0.0, 1.0, 0.0]])
 
-            blobs_before = [b.name for b in self.fake_bucket.list_blobs("users/user_alice/chroma_db/")]
+            blobs_before = [b.name for b in self.fake_bucket.list_blobs("users/user_alice/chroma/")]
 
             with user_write_lock("user_alice") as alice_dir:
-                client = chromadb.PersistentClient(path=alice_dir)
+                client = chromadb.PersistentClient(path=get_chroma_dir(alice_dir))
                 client.delete_collection("delete_me")
 
-            blobs_after = [b.name for b in self.fake_bucket.list_blobs("users/user_alice/chroma_db/")]
+            blobs_after = [b.name for b in self.fake_bucket.list_blobs("users/user_alice/chroma/")]
             self.assertLessEqual(len(blobs_after), len(blobs_before))
+            self.assertTrue(self.fake_bucket.blob("users/user_alice/version.json").exists())
 
         # Fresh container only sees 'keep_me'
         with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
             os.environ, self._env(self.container2_tmp), clear=False
         ):
             restored_dir = sync_user_dir("user_alice")
-            cols = [c.name for c in chromadb.PersistentClient(path=restored_dir).list_collections()]
+            cols = [c.name for c in chromadb.PersistentClient(path=get_chroma_dir(restored_dir)).list_collections()]
             self.assertEqual(cols, ["keep_me"])
 
     def test_04_stale_gcs_lock_ttl_recovery_and_active_lock_contention(self) -> None:
@@ -179,7 +196,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
                 "expires_at": time.time() - 600,
             }
         )
-        self.fake_bucket.blob("users/user_alice/locks/chroma.lock").upload_from_string(
+        self.fake_bucket.blob("users/user_alice/locks/write.lock").upload_from_string(
             expired_lock, if_generation_match=0
         )
 
@@ -187,10 +204,10 @@ class TestPerUserChromaStorage(unittest.TestCase):
             os.environ, self._env(self.container1_tmp), clear=False
         ):
             with user_write_lock("user_alice") as alice_dir:
-                chromadb.PersistentClient(path=alice_dir).create_collection("recovered_col")
+                chromadb.PersistentClient(path=get_chroma_dir(alice_dir)).create_collection("recovered_col")
 
             self.assertFalse(
-                self.fake_bucket.blob("users/user_alice/locks/chroma.lock").exists(),
+                self.fake_bucket.blob("users/user_alice/locks/write.lock").exists(),
                 "Lock must be deleted after write context exits",
             )
 
@@ -202,7 +219,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
                 "expires_at": time.time() + 300,
             }
         )
-        self.fake_bucket.blob("users/user_bob/locks/chroma.lock").upload_from_string(
+        self.fake_bucket.blob("users/user_bob/locks/write.lock").upload_from_string(
             active_lock, if_generation_match=0
         )
 
@@ -222,7 +239,7 @@ class TestPerUserChromaStorage(unittest.TestCase):
         ):
             for uid in ("u_oldest", "u_middle", "u_newest"):
                 with user_write_lock(uid) as udir:
-                    col = chromadb.PersistentClient(path=udir).create_collection("notes")
+                    col = chromadb.PersistentClient(path=get_chroma_dir(udir)).create_collection("notes")
                     col.add(ids=["1"], documents=[f"Data for {uid}"], embeddings=[[0.2, 0.3, 0.5]])
                 time.sleep(0.02)
 
@@ -234,12 +251,12 @@ class TestPerUserChromaStorage(unittest.TestCase):
 
             restored_middle = sync_user_dir("u_middle")
             self.assertEqual(
-                chromadb.PersistentClient(path=restored_middle).get_collection("notes").count(),
+                chromadb.PersistentClient(path=get_chroma_dir(restored_middle)).get_collection("notes").count(),
                 1,
             )
 
     def test_06_hybrid_search_rrf_combines_dense_and_bm25_with_normalized_scores(self) -> None:
-        """Verifies `similarity_search_with_scores` fuses dense Chroma similarity and BM25 lexical ranks with normalized `[0.0, 1.0]` scores."""
+        """Verifies fallback `BM25Retriever` hybrid search runs single-pass scoring and fuses ranks with normalized `[0.0, 1.0]` scores."""
         vs = Chroma(
             collection_name="hybrid_test_col",
             persist_directory=self.container1_tmp,
@@ -308,7 +325,210 @@ class TestPerUserChromaStorage(unittest.TestCase):
         self.assertIn("ERR-9042-X", top_docs[0].page_content)
         self.assertEqual(top_scored[0][1], 1.0)
 
+    def test_07_persisted_fts5_sidecar_layout_gcs_sync_hybrid_search_and_delete(self) -> None:
+        """Verifies `users/{uid}/{version.json, chroma/, fts/<collection>.sqlite3, uploads/}` layout, FTS5 hybrid search without BM25 rebuilds, and clean deletion."""
+        uid = "fts_user"
+        col_name = "financial_reports"
+        upload_blob_name = f"users/{uid}/uploads/20261124T000000Z_abc123_runbook.pdf"
+        self.fake_bucket.blob(upload_blob_name).upload_from_string(b"%PDF-1.4 original")
+
+        initial_docs = [
+            Document(
+                page_content="General quarterly financial overview and outlook",
+                metadata={"source": "overview.pdf", "page": 1},
+            ),
+            Document(
+                page_content="General revenue commentary and forecast",
+                metadata={"source": "commentary.pdf", "page": 2},
+            ),
+            Document(
+                page_content="Alice critical incident ticket ERR-9042-X remediation runbook",
+                metadata={"source": "runbook.pdf", "page": 7},
+            ),
+        ]
+
+        # 1. Ingest on Container 1 -> creates chroma/ + fts/financial_reports.sqlite3 + root version.json in GCS
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.object(
+            chroma_module, "get_embeddings", side_effect=lambda *a, **kw: DeterministicFakeEmbeddings()
+        ), patch.dict(
+            os.environ,
+            self._env(self.container1_tmp, ALLOWED_EMBEDDING_MODELS="gemini-embedding-001"),
+            clear=False,
+        ):
+            ingest_documents(
+                uid=uid,
+                documents=initial_docs,
+                collection_name=col_name,
+                embedding_model="gemini-embedding-001",
+            )
+
+        # Verify exact GCS layout: version.json at root, chroma/chroma.sqlite3, fts/<collection_name>.sqlite3, uploads/ intact
+        self.assertTrue(self.fake_bucket.blob(f"users/{uid}/version.json").exists())
+        self.assertTrue(self.fake_bucket.blob(f"users/{uid}/chroma/chroma.sqlite3").exists())
+        self.assertTrue(self.fake_bucket.blob(f"users/{uid}/fts/{col_name}.sqlite3").exists())
+        self.assertTrue(self.fake_bucket.blob(upload_blob_name).exists())
+
+        # 2. Query on fresh Container 2 -> pulls chroma/ + fts/ + version.json (never downloads uploads/)
+        #    and executes hybrid search using FTS5 WITHOUT ever calling BM25Retriever.from_texts or vectorstore.get!
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.object(
+            chroma_module, "get_embeddings", side_effect=lambda *a, **kw: DeterministicFakeEmbeddings()
+        ), patch.dict(
+            os.environ,
+            self._env(self.container2_tmp, ALLOWED_EMBEDDING_MODELS="gemini-embedding-001"),
+            clear=False,
+        ):
+            with user_read_lock(uid) as read_dir:
+                self.assertTrue(os.path.exists(os.path.join(read_dir, "version.json")))
+                self.assertTrue(os.path.exists(os.path.join(read_dir, "chroma", "chroma.sqlite3")))
+                self.assertTrue(os.path.exists(fts_index_path(read_dir, col_name)))
+                self.assertFalse(
+                    os.path.exists(get_user_uploads_dir(read_dir)),
+                    "Query sync must not download archived PDFs from users/{uid}/uploads/",
+                )
+
+                vs = get_vectorstore(
+                    collection_name=col_name,
+                    persist_directory=read_dir,
+                    embedding_model="gemini-embedding-001",
+                )
+
+                with patch.object(
+                    BM25Retriever,
+                    "from_texts",
+                    side_effect=AssertionError("BM25Retriever.from_texts must not be called when FTS5 sidecar exists"),
+                ), patch.object(
+                    vs,
+                    "get",
+                    side_effect=AssertionError("vectorstore.get must not be called when FTS5 sidecar exists"),
+                ):
+                    # Hyphenated code + FTS5 operator words ('NOT', 'OR', quotes, '*') must rank runbook #1 safely
+                    docs, scored = similarity_search_with_scores(
+                        vs,
+                        'What was NOT the "ERR-9042-X"* ticket OR status:critical?',
+                        k=2,
+                    )
+                    self.assertEqual(len(docs), 2)
+                    self.assertIn("ERR-9042-X", docs[0].page_content)
+                    self.assertEqual(docs[0].metadata.get("source"), "runbook.pdf")
+                    self.assertTrue(0.0 < scored[0][1] <= 1.0)
+
+                    # Zero lexical hits must degrade cleanly to dense-only without rebuilding BM25Retriever
+                    no_lex_docs, no_lex_scored = similarity_search_with_scores(
+                        vs,
+                        "zzzzunmatchedtoken9999",
+                        k=2,
+                    )
+                    self.assertEqual(len(no_lex_docs), 2)
+                    self.assertTrue(0.0 < no_lex_scored[0][1] <= 1.0)
+
+        # 3. Append a new chunk on Container 1 -> Container 2 sees the updated FTS5 index via version.json
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.object(
+            chroma_module, "get_embeddings", side_effect=lambda *a, **kw: DeterministicFakeEmbeddings()
+        ), patch.dict(
+            os.environ,
+            self._env(self.container1_tmp, ALLOWED_EMBEDDING_MODELS="gemini-embedding-001"),
+            clear=False,
+        ):
+            ingest_documents(
+                uid=uid,
+                documents=[
+                    Document(
+                        page_content="Alice postmortem reference CODE-7711-Z signed off",
+                        metadata={"source": "postmortem.pdf", "page": 3},
+                    )
+                ],
+                collection_name=col_name,
+                embedding_model="gemini-embedding-001",
+            )
+
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.object(
+            chroma_module, "get_embeddings", side_effect=lambda *a, **kw: DeterministicFakeEmbeddings()
+        ), patch.dict(
+            os.environ,
+            self._env(self.container2_tmp, ALLOWED_EMBEDDING_MODELS="gemini-embedding-001"),
+            clear=False,
+        ):
+            with user_read_lock(uid) as read_dir:
+                vs2 = get_vectorstore(
+                    collection_name=col_name,
+                    persist_directory=read_dir,
+                    embedding_model="gemini-embedding-001",
+                )
+                with patch.object(
+                    BM25Retriever,
+                    "from_texts",
+                    side_effect=AssertionError("BM25Retriever.from_texts must not be called on refreshed FTS5"),
+                ):
+                    appended_docs, _ = similarity_search_with_scores(vs2, "CODE-7711-Z", k=2)
+                self.assertIn("CODE-7711-Z", appended_docs[0].page_content)
+
+        # 4. Deleting the collection removes fts/<collection_name>.sqlite3 locally & in GCS, keeping uploads/ intact
+        with patch.object(gcs_sync_module, "_get_bucket", return_value=self.fake_bucket), patch.dict(
+            os.environ, self._env(self.container1_tmp), clear=False
+        ):
+            with user_write_lock(uid) as write_dir:
+                remove_collection(write_dir, col_name)
+                self.assertFalse(os.path.exists(fts_index_path(write_dir, col_name)))
+
+        self.assertFalse(self.fake_bucket.blob(f"users/{uid}/fts/{col_name}.sqlite3").exists())
+        self.assertTrue(
+            self.fake_bucket.blob(upload_blob_name).exists(),
+            "Deleting a collection must preserve archived PDFs under users/{uid}/uploads/",
+        )
+
+    def test_08_local_mode_upload_archive_mirrors_layout_and_dsar_cleans_up(self) -> None:
+        """Verifies local dev mode (no GCS) archives PDFs under `<user_dir>/uploads/` alongside `chroma/` and `fts/`, reflected in DSAR export and erased on purge."""
+        uid = "local_alice"
+        uploads_tmp = tempfile.mkdtemp(prefix="uploads_tmp_")
+        try:
+            staged_pdf = os.path.join(uploads_tmp, "quarterly.pdf")
+            with open(staged_pdf, "wb") as fh:
+                fh.write(b"%PDF-1.4 local test document")
+
+            local_env = {
+                "GCS_BUCKET_NAME": "",
+                "LOCAL_CHROMA_ROOT": self.container1_tmp,
+                "UPLOAD_TMP_ROOT": uploads_tmp,
+                "GOOGLE_CLOUD_LOCATION": "us-central1",
+                "ALLOWED_EMBEDDING_MODELS": "gemini-embedding-001",
+            }
+            with patch.dict(os.environ, local_env, clear=False), patch.object(
+                chroma_module, "get_embeddings", side_effect=lambda *a, **kw: DeterministicFakeEmbeddings()
+            ):
+                gcs_uri = archive_upload(uid, staged_pdf, "quarterly.pdf")
+                self.assertIsNone(gcs_uri)
+
+                ingest_documents(
+                    uid=uid,
+                    documents=[
+                        Document(
+                            page_content="Local mode revenue summary Q4",
+                            metadata={"source": "quarterly.pdf", "page": 1},
+                        )
+                    ],
+                    collection_name="local_reports",
+                    embedding_model="gemini-embedding-001",
+                )
+
+                user_dir = os.path.join(self.container1_tmp, uid)
+                self.assertTrue(os.path.exists(os.path.join(user_dir, "chroma", "chroma.sqlite3")))
+                self.assertTrue(os.path.exists(os.path.join(user_dir, "fts", "local_reports.sqlite3")))
+                archived_files = os.listdir(os.path.join(user_dir, "uploads"))
+                self.assertEqual(len(archived_files), 1)
+                self.assertTrue(archived_files[0].endswith("_quarterly.pdf"))
+
+                inv = get_user_data_inventory(uid)
+                self.assertEqual(inv["storage_backend"], "local")
+                self.assertEqual(inv["collection_count"], 1)
+                self.assertEqual(inv["uploaded_pdf_count"], 1)
+                self.assertEqual(inv["uploaded_pdfs"][0]["filename"], "quarterly.pdf")
+
+                purge_all_user_data(uid)
+                self.assertFalse(os.path.exists(user_dir))
+        finally:
+            cleanup_chroma_tmpdir(uploads_tmp)
+
 
 if __name__ == "__main__":
-    logger.info("Running Per-User GCS <-> ChromaDB Storage unit test suite...")
+    logger.info("Running Per-User GCS <-> ChromaDB + FTS5 Storage unit test suite...")
     unittest.main(verbosity=2)

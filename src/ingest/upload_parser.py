@@ -38,7 +38,7 @@ from src.core.config import (
     is_archive_uploads_enabled,
 )
 from src.core.logger import setup_logging
-from src.core.storage import archive_upload, get_bucket_name, get_upload_user_dir
+from src.core.storage import archive_upload, get_upload_user_dir
 from src.ingest.schemas import IngestRequest
 from src.ingest.splitter import split_pdfs
 
@@ -185,7 +185,7 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                 if valid_uploads:
                     request_upload_dir = os.path.join(user_upload_dir, uuid.uuid4().hex)
                     os.makedirs(request_upload_dir, exist_ok=True)
-                    should_archive = bool(get_bucket_name()) and is_archive_uploads_enabled()
+                    should_archive = is_archive_uploads_enabled()
 
                     used_names = set()
                     for idx, file_item in enumerate(valid_uploads):

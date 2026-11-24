@@ -98,10 +98,10 @@ To keep the deployment and persistence architecture cost-effective, fast, and re
 **Goal:** Provide fast local ChromaDB reads and writes backed by durable, lock-protected per-user storage in Google Cloud Storage.
 
 - [x] **Isolated Tenant Paths & Client Cache (`src/core/storage/paths.py`):**
-  - Map each user `uid` to isolated local directories (`/tmp/chroma_db/{uid}` and `/tmp/uploads/{uid}`) and Cloud Storage prefixes (`users/{uid}/chroma_db/`, `users/{uid}/uploads/`, and `users/{uid}/locks/chroma.lock`).
+  - Map each user `uid` to isolated local directories (`/tmp/chroma_db/{uid}` and `/tmp/uploads/{uid}`) and Cloud Storage prefixes (`users/{uid}/chroma/`, `users/{uid}/fts/`, `users/{uid}/uploads/`, and `users/{uid}/locks/write.lock`).
   - Manage cached ChromaDB client instances with `release_client_cache()` so stale SQLite connections are cleanly closed before refreshing files from Cloud Storage.
 - [x] **Cloud Storage Synchronization (`src/core/storage/gcs_sync.py`):**
-  - Compare the remote `users/{uid}/chroma_db/version.json` marker against the local `/tmp/chroma_db/{uid}/version.json` file and download updated blobs only when a newer snapshot exists.
+  - Compare the remote `users/{uid}/version.json` marker against the local `/tmp/chroma_db/{uid}/version.json` file and download updated blobs only when a newer snapshot exists.
   - Upload modified local ChromaDB files, delete remote blobs that were removed locally (such as deleted collection folders), write an updated `version.json` marker, and optionally archive uploaded source PDFs under `users/{uid}/uploads/`.
 - [x] **Distributed Locks & Local Cache Eviction (`src/core/storage/locks.py`):**
   - Implement `user_read_lock(uid)` and `user_write_lock(uid)` combining per-user in-process locks with an atomic Cloud Storage lock object (`if_generation_match=0` and automatic stale-lock TTL recovery).

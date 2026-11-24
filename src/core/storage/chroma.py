@@ -7,7 +7,6 @@ loading, and deletion operations over a tenant's `persist_directory`.
 
 import heapq
 import os
-import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import chromadb
@@ -25,7 +24,13 @@ from src.core.config import (
     get_allowed_embedding_models,
     get_google_cloud_project,
 )
-from src.core.storage.paths import SQLITE_FILENAME
+from src.core.storage.fts import (
+    has_fts_index,
+    remove_fts_index,
+    search_fts,
+    tokenize_lexical,
+)
+from src.core.storage.paths import CHROMA_SUBDIR, SQLITE_FILENAME, get_chroma_dir
 
 
 def get_embeddings(
@@ -88,7 +93,7 @@ def get_collection_embedding_model(
     """Looks up the stored or inferred embedding model for `collection_name` in `persist_directory`.
 
     Args:
-        persist_directory: Local tenant ChromaDB directory path.
+        persist_directory: Local tenant working directory path (containing `chroma/`).
         collection_name: Validated Chroma collection identifier.
 
     Returns:
@@ -98,7 +103,7 @@ def get_collection_embedding_model(
     if not has_sqlite(persist_directory):
         return None
     try:
-        client = chromadb.PersistentClient(path=persist_directory)
+        client = chromadb.PersistentClient(path=get_chroma_dir(persist_directory))
         for col in client.list_collections():
             if getattr(col, "name", None) == safe_collection:
                 return _infer_collection_embedding_model(col)
@@ -119,7 +124,7 @@ def resolve_collection_embedding_model(
     when `collection_name` already exists in `persist_directory`.
 
     Args:
-        persist_directory: Local tenant ChromaDB directory path.
+        persist_directory: Local tenant working directory path.
         collection_name: Target Chroma collection identifier.
         embedding_model: Optional caller-requested embedding model identifier.
 
@@ -136,7 +141,7 @@ def get_vectorstore(
     persist_directory: str = "chroma_db",
     embedding_model: Optional[str] = None,
 ) -> Chroma:
-    """Initializes or loads a `Chroma` vectorstore instance for `persist_directory` and `collection_name`.
+    """Initializes or loads a `Chroma` vectorstore instance under `<persist_directory>/chroma`.
 
     Automatically binds `embedding_function` to the collection's stored embedding model when the
     collection already exists in `persist_directory`, ensuring query and retrieval embeddings
@@ -144,7 +149,7 @@ def get_vectorstore(
 
     Args:
         collection_name: Validated Chroma collection identifier.
-        persist_directory: Local filesystem path of the tenant's ChromaDB directory.
+        persist_directory: Local filesystem path of the tenant's working directory.
         embedding_model: Optional approved Vertex AI embedding model identifier (used when creating a new collection).
 
     Returns:
@@ -156,8 +161,10 @@ def get_vectorstore(
         collection_name=safe_collection,
         embedding_model=embedding_model,
     )
+    chroma_dir = get_chroma_dir(persist_directory)
+    os.makedirs(chroma_dir, exist_ok=True)
     return Chroma(
-        persist_directory=persist_directory,
+        persist_directory=chroma_dir,
         embedding_function=get_embeddings(embedding_model=resolved_model),
         collection_name=safe_collection,
     )
@@ -165,7 +172,29 @@ def get_vectorstore(
 
 def _tokenize_bm25(text: str) -> List[str]:
     """Tokenizes text into lowercase alphanumeric and hyphenated terms for BM25 lexical matching."""
-    return re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)*", (text or "").lower())
+    return tokenize_lexical(text)
+
+
+def _resolve_fts_target(vectorstore: Any) -> Optional[Tuple[str, str]]:
+    """Derives `(user_dir, collection_name)` from a `Chroma` instance for FTS5 sidecar lookup."""
+    client = getattr(vectorstore, "_client", None)
+    collection = getattr(vectorstore, "_collection", None)
+    chroma_path = getattr(client, "_identifier", None)
+    collection_name = getattr(collection, "name", None)
+    if (
+        not isinstance(chroma_path, str)
+        or not chroma_path
+        or not isinstance(collection_name, str)
+        or not collection_name
+    ):
+        return None
+    chroma_abs = os.path.abspath(chroma_path)
+    user_dir = (
+        os.path.dirname(chroma_abs)
+        if os.path.basename(chroma_abs) == CHROMA_SUBDIR
+        else chroma_abs
+    )
+    return user_dir, collection_name
 
 
 def _doc_rrf_key(doc: Document) -> Tuple[str, Tuple[Tuple[str, str], ...]]:
@@ -185,13 +214,15 @@ def similarity_search_with_scores(
 ) -> Tuple[List[Document], List[Any]]:
     """Executes top-k hybrid search (dense Chroma similarity + sparse BM25 via RRF) with normalized `[0.0, 1.0]` scores.
 
-    Combines dense vector search (`vectorstore.similarity_search_with_score`) with lexical BM25
-    retrieval (`BM25Retriever` built over `vectorstore.get(include=["documents", "metadatas"])`)
-    using Reciprocal Rank Fusion (RRF), normalizing fused scores against the theoretical maximum
-    rank-1 RRF score (`(dense_weight + bm25_weight) / (1 + rrf_k)`). Gracefully degrades to
-    dense-only similarity scores when `vectorstore.get` is unavailable or returns no positive
-    BM25 matches, and falls back to `vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": k})`
-    when `vectorstore` is a lightweight test double without `similarity_search_with_score`.
+    Combines dense vector search (`vectorstore.similarity_search_with_score`) with sparse lexical
+    BM25 retrieval — querying the persisted per-collection SQLite FTS5 inverted index
+    (`<user_dir>/fts/<collection_name>.sqlite3`) when present, and falling back to an in-memory
+    single-pass `BM25Retriever` only when no FTS5 sidecar exists — using Reciprocal Rank Fusion
+    (RRF), normalizing fused scores against the theoretical maximum rank-1 RRF score
+    (`(dense_weight + bm25_weight) / (1 + rrf_k)`). Gracefully degrades to dense-only similarity
+    scores when no positive lexical matches exist, and falls back to
+    `vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": k})` when `vectorstore`
+    is a lightweight test double without `similarity_search_with_score`.
 
     Args:
         vectorstore: Initialized `Chroma` vectorstore (or retriever-compatible mock).
@@ -214,39 +245,52 @@ def similarity_search_with_scores(
         return docs, docs
 
     # 1. Dense vector search (Chroma) — fetch a candidate pool for RRF when hybrid BM25 is enabled
-    use_hybrid = bm25_weight > 0.0 and hasattr(vectorstore, "get")
+    fts_target = _resolve_fts_target(vectorstore) if bm25_weight > 0.0 else None
+    fts_available = bool(fts_target and has_fts_index(fts_target[0], fts_target[1]))
+    use_hybrid = bm25_weight > 0.0 and (fts_available or hasattr(vectorstore, "get"))
     candidate_k = max(k * 2, 10) if use_hybrid else k
     raw_pairs = vectorstore.similarity_search_with_score(query, k=candidate_k)
 
-    # 2. Sparse lexical search (BM25 over collection documents, retaining positive lexical matches)
+    # 2. Sparse lexical search — prefer persisted SQLite FTS5 sidecar; fall back to in-memory BM25 only when absent
     bm25_docs: List[Document] = []
     if use_hybrid:
-        try:
-            stored = vectorstore.get(include=["documents", "metadatas"])
-            raw_texts = (stored or {}).get("documents") if isinstance(stored, dict) else None
-            if isinstance(raw_texts, list) and raw_texts and all(isinstance(t, str) for t in raw_texts):
-                raw_metadatas = stored.get("metadatas") if isinstance(stored, dict) else None
-                if isinstance(raw_metadatas, list) and len(raw_metadatas) == len(raw_texts):
-                    metadatas = [m if isinstance(m, dict) else {} for m in raw_metadatas]
-                else:
-                    metadatas = [{} for _ in raw_texts]
-                bm25_retriever = BM25Retriever.from_texts(
-                    texts=raw_texts,
-                    metadatas=metadatas,
-                    k=candidate_k,
-                    preprocess_func=_tokenize_bm25,
+        if fts_available and fts_target is not None:
+            try:
+                bm25_docs = search_fts(
+                    user_dir=fts_target[0],
+                    collection_name=fts_target[1],
+                    query=query,
+                    limit=candidate_k,
                 )
-                query_tokens = bm25_retriever.preprocess_func(query)
-                if query_tokens and getattr(bm25_retriever, "vectorizer", None) is not None:
-                    raw_bm25_scores = bm25_retriever.vectorizer.get_scores(query_tokens)
-                    top_indices = heapq.nlargest(
-                        candidate_k,
-                        (idx for idx, score in enumerate(raw_bm25_scores) if float(score) > 0.0),
-                        key=lambda idx: float(raw_bm25_scores[idx]),
+            except Exception:
+                bm25_docs = []
+        elif hasattr(vectorstore, "get"):
+            try:
+                stored = vectorstore.get(include=["documents", "metadatas"])
+                raw_texts = (stored or {}).get("documents") if isinstance(stored, dict) else None
+                if isinstance(raw_texts, list) and raw_texts and all(isinstance(t, str) for t in raw_texts):
+                    raw_metadatas = stored.get("metadatas") if isinstance(stored, dict) else None
+                    if isinstance(raw_metadatas, list) and len(raw_metadatas) == len(raw_texts):
+                        metadatas = [m if isinstance(m, dict) else {} for m in raw_metadatas]
+                    else:
+                        metadatas = [{} for _ in raw_texts]
+                    bm25_retriever = BM25Retriever.from_texts(
+                        texts=raw_texts,
+                        metadatas=metadatas,
+                        k=candidate_k,
+                        preprocess_func=_tokenize_bm25,
                     )
-                    bm25_docs = [bm25_retriever.docs[idx] for idx in top_indices]
-        except Exception:
-            bm25_docs = []
+                    query_tokens = bm25_retriever.preprocess_func(query)
+                    if query_tokens and getattr(bm25_retriever, "vectorizer", None) is not None:
+                        raw_bm25_scores = bm25_retriever.vectorizer.get_scores(query_tokens)
+                        top_indices = heapq.nlargest(
+                            candidate_k,
+                            (idx for idx, score in enumerate(raw_bm25_scores) if float(score) > 0.0),
+                            key=lambda idx: float(raw_bm25_scores[idx]),
+                        )
+                        bm25_docs = [bm25_retriever.docs[idx] for idx in top_indices]
+            except Exception:
+                bm25_docs = []
 
     if not bm25_docs:
         top_dense = raw_pairs[:k]
@@ -293,23 +337,24 @@ def similarity_search_with_scores(
 
 
 def has_sqlite(persist_directory: str) -> bool:
-    """Checks whether a Chroma SQLite database file exists inside `persist_directory`.
+    """Checks whether a Chroma SQLite database file exists under `<persist_directory>/chroma/`.
 
     Args:
-        persist_directory: Local tenant ChromaDB directory path.
+        persist_directory: Local tenant working directory path.
 
     Returns:
-        True when `<persist_directory>/chroma.sqlite3` exists on disk.
+        True when `<persist_directory>/chroma/chroma.sqlite3` exists on disk.
     """
-    sqlite_path = os.path.join(persist_directory, SQLITE_FILENAME)
-    return os.path.exists(persist_directory) and os.path.exists(sqlite_path)
+    chroma_dir = get_chroma_dir(persist_directory)
+    sqlite_path = os.path.join(chroma_dir, SQLITE_FILENAME)
+    return os.path.exists(chroma_dir) and os.path.exists(sqlite_path)
 
 
 def require_collection(persist_directory: str, collection_name: str) -> None:
     """Verifies that the tenant's Chroma SQLite database and `collection_name` exist.
 
     Args:
-        persist_directory: Local tenant ChromaDB directory path.
+        persist_directory: Local tenant working directory path.
         collection_name: Target Chroma collection name to check.
 
     Raises:
@@ -318,17 +363,17 @@ def require_collection(persist_directory: str, collection_name: str) -> None:
     if not has_sqlite(persist_directory):
         raise FileNotFoundError(f"Collection '{collection_name}' not found.")
 
-    client = chromadb.PersistentClient(path=persist_directory)
+    client = chromadb.PersistentClient(path=get_chroma_dir(persist_directory))
     existing = [col.name for col in client.list_collections()]
     if collection_name not in existing:
         raise FileNotFoundError(f"Collection '{collection_name}' not found.")
 
 
 def list_collections(persist_directory: str) -> Dict[str, Any]:
-    """Lists all Chroma collections and their document chunk counts inside `persist_directory`.
+    """Lists all Chroma collections and their document chunk counts inside `<persist_directory>/chroma/`.
 
     Args:
-        persist_directory: Local tenant ChromaDB directory path.
+        persist_directory: Local tenant working directory path.
 
     Returns:
         Dictionary containing `'collections'` (list of names) and `'details'` (`[{'name', 'count', 'embedding_model'}]`).
@@ -336,7 +381,7 @@ def list_collections(persist_directory: str) -> Dict[str, Any]:
     if not has_sqlite(persist_directory):
         return {"collections": [], "details": []}
 
-    client = chromadb.PersistentClient(path=persist_directory)
+    client = chromadb.PersistentClient(path=get_chroma_dir(persist_directory))
     collections = client.list_collections()
     collection_names = [col.name for col in collections]
     details = []
@@ -354,18 +399,19 @@ def list_collections(persist_directory: str) -> Dict[str, Any]:
 
 
 def remove_collection(persist_directory: str, collection_name: str) -> None:
-    """Deletes `collection_name` from `persist_directory`, raising `FileNotFoundError` if absent.
+    """Deletes `collection_name` from Chroma and removes its persisted FTS5 sidecar index.
 
     Args:
-        persist_directory: Local tenant ChromaDB directory path.
+        persist_directory: Local tenant working directory path.
         collection_name: Target Chroma collection name to delete.
 
     Raises:
         FileNotFoundError: If `collection_name` does not exist in `persist_directory`.
     """
     require_collection(persist_directory, collection_name)
-    client = chromadb.PersistentClient(path=persist_directory)
+    client = chromadb.PersistentClient(path=get_chroma_dir(persist_directory))
     client.delete_collection(name=collection_name)
+    remove_fts_index(persist_directory, collection_name)
 
 
 __all__ = [

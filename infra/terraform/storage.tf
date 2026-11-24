@@ -2,9 +2,11 @@
 # Regional Multi-Tenant Persistence Bucket (ChromaDB Snapshots & PDF Archives)
 #
 # Bucket layout per authenticated user (`uid`):
-#   gs://<bucket>/users/<uid>/chroma_db/  -> SQLite + HNSW vector index + `version.json`
-#   gs://<bucket>/users/<uid>/uploads/    -> Archived original PDF uploads
-#   gs://<bucket>/users/<uid>/locks/      -> Distributed write lock (`chroma.lock`)
+#   gs://<bucket>/users/<uid>/version.json              -> Snapshot version covering `chroma/` + `fts/`
+#   gs://<bucket>/users/<uid>/chroma/                   -> ChromaDB `chroma.sqlite3` + HNSW segment dirs
+#   gs://<bucket>/users/<uid>/fts/<collection>.sqlite3  -> Per-collection SQLite FTS5 inverted index
+#   gs://<bucket>/users/<uid>/uploads/                  -> Archived original PDF uploads
+#   gs://<bucket>/users/<uid>/locks/                    -> Distributed write lock (`write.lock`)
 # ==============================================================================
 
 # Private regional Cloud Storage bucket pinned to `var.region`.

@@ -14,6 +14,7 @@ from src.core.compliance.policy import enforce_collection_quota
 from src.core.logger import setup_logging
 from src.core.observability.tracing import start_span
 from src.core.storage import (
+    add_documents_to_fts,
     get_vectorstore,
     resolve_collection_embedding_model,
     user_write_lock,
@@ -28,11 +29,12 @@ def ingest_documents(
     collection_name: str,
     embedding_model: Optional[str] = None,
 ) -> None:
-    """Indexes document chunks into `uid`'s isolated ChromaDB inside the distributed GCS write lock.
+    """Indexes document chunks into `uid`'s ChromaDB (`chroma/`) and SQLite FTS5 (`fts/`) inside the write lock.
 
     Re-verifies `MAX_COLLECTIONS_PER_USER` inside `user_write_lock` to prevent concurrent
-    multi-instance new-collection uploads from bypassing the tenant collection quota, and
-    indexes chunks in batches of 100.
+    multi-instance new-collection uploads from bypassing the tenant collection quota, indexes
+    chunks in batches of 100 into ChromaDB, and appends the same chunks to the collection's
+    persisted FTS5 inverted index (`fts/<collection_name>.sqlite3`).
 
     Args:
         uid: Verified tenant user identifier.
@@ -92,6 +94,12 @@ def ingest_documents(
                         )
                 except Exception:
                     pass
+
+                add_documents_to_fts(
+                    user_dir=persist_directory,
+                    collection_name=collection_name,
+                    documents=documents,
+                )
 
                 logger.info(
                     f"Successfully added {total_chunks} documents to collection '{collection_name}' in '{persist_directory}'."

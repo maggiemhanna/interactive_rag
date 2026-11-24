@@ -3,7 +3,7 @@
 Coordinates concurrent reads and writes across local worker threads and distributed Cloud Run
 container revisions:
 - In-process `threading.RLock` and active reference counters pinning `/tmp/chroma_db/{uid}` during reads/SSE.
-- Distributed GCS write locks (`users/{uid}/locks/chroma.lock`) using atomic `if_generation_match=0`
+- Distributed GCS write locks (`users/{uid}/locks/write.lock`) using atomic `if_generation_match=0`
   preconditions with automatic TTL crash recovery.
 - LRU cache eviction (`evict_tmp_cache`) keeping Cloud Run RAM-disk `/tmp` usage bounded.
 """
@@ -222,7 +222,7 @@ def sync_user_dir(uid: str) -> str:
 
 
 def acquire_gcs_write_lock(bucket: storage.Bucket, uid: str) -> storage.Blob:
-    """Acquires `users/{uid}/locks/chroma.lock` via atomic `if_generation_match=0` with TTL recovery.
+    """Acquires `users/{uid}/locks/write.lock` via atomic `if_generation_match=0` with TTL recovery.
 
     Args:
         bucket: Target GCS `Bucket` hosting lock blobs.

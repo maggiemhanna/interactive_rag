@@ -39,6 +39,7 @@ from src.core.storage.paths import (
     get_bucket_name,
     get_upload_user_dir,
     get_user_dir,
+    get_user_uploads_dir,
     release_client_cache,
     user_lock_gcs_blob_name,
 )
@@ -223,6 +224,30 @@ def get_user_data_inventory(uid: str, checkpointer: Optional[Any] = None) -> Dic
                         "updated_at": updated_iso,
                     }
                 )
+    else:
+        local_archive_dir = get_user_uploads_dir(get_user_dir(safe_uid))
+        if os.path.isdir(local_archive_dir):
+            for entry in os.scandir(local_archive_dir):
+                if not entry.is_file():
+                    continue
+                try:
+                    stat_res = entry.stat()
+                    size_bytes = int(stat_res.st_size)
+                    updated_iso = datetime.fromtimestamp(
+                        stat_res.st_mtime, tz=timezone.utc
+                    ).isoformat()
+                except OSError:
+                    size_bytes = 0
+                    updated_iso = None
+                display_name = _ARCHIVE_PREFIX_RE.sub("", entry.name) or entry.name
+                uploaded_pdfs.append(
+                    {
+                        "filename": display_name,
+                        "blob_name": f"users/{safe_uid}/uploads/{entry.name}",
+                        "size_bytes": size_bytes,
+                        "updated_at": updated_iso,
+                    }
+                )
 
     uploaded_pdfs.sort(key=lambda item: (item["filename"].lower(), item["blob_name"]))
     total_bytes = gcs_total_bytes if bucket_name else local_cache_bytes
@@ -275,16 +300,17 @@ def purge_all_user_data(uid: str, checkpointer: Optional[Any] = None) -> Dict[st
         upload_dir = get_upload_user_dir(safe_uid)
 
         release_client_cache(user_dir)
+        had_archived_uploads = os.path.exists(get_user_uploads_dir(user_dir))
         had_chroma = os.path.exists(user_dir)
         if had_chroma:
             shutil.rmtree(user_dir, ignore_errors=True)
 
-        had_uploads = os.path.exists(upload_dir)
-        if had_uploads:
+        had_tmp_uploads = os.path.exists(upload_dir)
+        if had_tmp_uploads:
             shutil.rmtree(upload_dir, ignore_errors=True)
 
         clear_user_last_used(safe_uid)
-        return had_chroma, had_uploads
+        return had_chroma, (had_tmp_uploads or had_archived_uploads)
 
     with user_thread_lock, track_active_user(safe_uid):
         bucket_name = get_bucket_name()
