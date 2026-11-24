@@ -10,17 +10,20 @@ Verifies:
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 from typing import Dict
 import unittest
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+import httpx
 
 from infra.scripts.check_static_policies import evaluate_repo_static_policies
 import src.agent
@@ -31,6 +34,7 @@ from src.core.compliance.policy import reset_rate_limiters
 from src.core.context import (
     RequestContext,
     bind_request_context,
+    get_request_id,
     reset_request_context,
 )
 from src.core.logger import setup_logging
@@ -40,6 +44,7 @@ from src.core.storage import evict_tmp_cache, gcs_sync as gcs_sync_module, user_
 import src.ingest
 from src.ingest import app as ingest_app_module
 from src.ingest import routes as ingest_routes_module
+from src.ingest import upload_parser as upload_parser_module
 import src.manage
 import src.query
 from tests.helpers import (
@@ -93,8 +98,8 @@ class TestModularPackageSplitAndTwoServiceIsolation(unittest.TestCase):
         env.update(overrides)
         return env
 
-    def test_four_modular_packages_and_no_run_in_threadpool(self) -> None:
-        """Verifies `src/ingest`, `src/manage`, `src/query`, and `src/agent` exist cleanly and `POST /ingest` does not use `run_in_threadpool`."""
+    def test_four_modular_packages_and_nonblocking_ingest(self) -> None:
+        """Verifies `src/ingest`, `src/manage`, `src/query`, and `src/agent` exist cleanly and `POST /ingest` offloads blocking work via `asyncio.to_thread`."""
         self.assertTrue(hasattr(src.ingest, "ingest_router"))
         self.assertTrue(hasattr(src.manage, "collections_router"))
         self.assertTrue(hasattr(src.manage, "compliance_router"))
@@ -106,8 +111,89 @@ class TestModularPackageSplitAndTwoServiceIsolation(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(REPO_ROOT, "src", "ingestion")))
 
         self.assertTrue(inspect.iscoroutinefunction(ingest_routes_module.ingest))
-        routes_source = inspect.getsource(ingest_routes_module)
-        self.assertNotIn("run_in_threadpool", routes_source)
+        self.assertIn("asyncio.to_thread", inspect.getsource(ingest_routes_module))
+        self.assertIn("asyncio.to_thread", inspect.getsource(upload_parser_module))
+
+    def test_ingest_does_not_block_event_loop_for_health_checks(self) -> None:
+        """Verifies concurrent `GET /health` responds on the same event loop while `POST /ingest` is blocked in PDF splitting or vector indexing, and that `RequestContext` propagates to worker threads."""
+        entered_split = threading.Event()
+        release_split = threading.Event()
+        entered_ingest = threading.Event()
+        release_ingest = threading.Event()
+        observed_request_ids: Dict[str, str] = {}
+
+        real_split_pdfs = upload_parser_module.split_pdfs
+        real_ingest_documents = ingest_routes_module.ingest_documents
+
+        def gated_split_pdfs(*args, **kwargs):
+            observed_request_ids["split_pdfs"] = get_request_id()
+            entered_split.set()
+            self.assertTrue(release_split.wait(timeout=5.0))
+            return real_split_pdfs(*args, **kwargs)
+
+        def gated_ingest_documents(*args, **kwargs):
+            observed_request_ids["ingest_documents"] = get_request_id()
+            entered_ingest.set()
+            self.assertTrue(release_ingest.wait(timeout=5.0))
+            return real_ingest_documents(*args, **kwargs)
+
+        async def _exercise() -> None:
+            transport = httpx.ASGITransport(app=ingest_app_module.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                ingest_task = asyncio.create_task(
+                    client.post(
+                        "/ingest",
+                        headers={"X-Request-Id": "req-nonblocking-test"},
+                        data={"collection_name": "nonblocking_col"},
+                        files=[("files", ("doc.pdf", make_test_pdf("Non-blocking ingest"), "application/pdf"))],
+                    )
+                )
+
+                try:
+                    # 1. Verify GET /health succeeds while split_pdfs is blocked on a worker thread
+                    self.assertTrue(
+                        await asyncio.wait_for(asyncio.to_thread(entered_split.wait, 5.0), timeout=5.0)
+                    )
+                    health_during_split = await asyncio.wait_for(client.get("/health"), timeout=2.0)
+                    self.assertEqual(health_during_split.status_code, 200)
+                    self.assertEqual(health_during_split.json()["service"], "ingest-api")
+                finally:
+                    release_split.set()
+
+                try:
+                    # 2. Verify GET /health succeeds while ingest_documents is blocked on a worker thread
+                    self.assertTrue(
+                        await asyncio.wait_for(asyncio.to_thread(entered_ingest.wait, 5.0), timeout=5.0)
+                    )
+                    health_during_ingest = await asyncio.wait_for(client.get("/health"), timeout=2.0)
+                    self.assertEqual(health_during_ingest.status_code, 200)
+                    self.assertEqual(health_during_ingest.json()["service"], "ingest-api")
+                finally:
+                    release_ingest.set()
+
+                ingest_response = await asyncio.wait_for(ingest_task, timeout=10.0)
+                self.assertEqual(ingest_response.status_code, 200)
+                self.assertEqual(ingest_response.headers.get("X-Request-Id"), "req-nonblocking-test")
+
+        with patch.dict(
+            os.environ,
+            self._env(),
+            clear=False,
+        ), patch.object(
+            gcs_sync_module, "_get_bucket", return_value=self.fake_bucket
+        ), patch.object(
+            chroma_module,
+            "GoogleGenerativeAIEmbeddings",
+            return_value=DeterministicFakeEmbeddings(),
+        ), patch.object(
+            upload_parser_module, "split_pdfs", side_effect=gated_split_pdfs
+        ), patch.object(
+            ingest_routes_module, "ingest_documents", side_effect=gated_ingest_documents
+        ):
+            asyncio.run(_exercise())
+
+        self.assertEqual(observed_request_ids.get("split_pdfs"), "req-nonblocking-test")
+        self.assertEqual(observed_request_ids.get("ingest_documents"), "req-nonblocking-test")
 
     def test_two_service_route_isolation_and_shared_agent_cache_and_rate_limiter(self) -> None:
         """Verifies `ingest-api` mounts only `/ingest` + `/health`, while `agent-api` mounts `/query`, `/collections`, `/compliance/my-data`, `/agent`, `/agent/stream` + `/health`."""

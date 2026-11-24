@@ -5,6 +5,7 @@ so heavy PDF parsing, chunking, Vertex AI embedding, and GCS snapshot sync are
 completely isolated from interactive `/query`, `/collections`, and `/agent` requests.
 """
 
+import asyncio
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -50,14 +51,16 @@ async def ingest(
             f"(embedding_model='{payload.embedding_model}', files={payload.processed_files})."
         )
 
-        ingest_documents(
+        await asyncio.to_thread(
+            ingest_documents,
             uid=uid,
             documents=payload.chunks,
             collection_name=payload.collection_name,
             embedding_model=payload.embedding_model,
         )
 
-        emit_audit_event(
+        await asyncio.to_thread(
+            emit_audit_event,
             "document.ingest",
             uid=uid,
             collection_name=payload.collection_name,
@@ -66,7 +69,8 @@ async def ingest(
             file_count=len(payload.processed_files),
             processed_files=payload.processed_files,
         )
-        emit_telemetry_event(
+        await asyncio.to_thread(
+            emit_telemetry_event,
             "document.ingest",
             uid=uid,
             collection_name=payload.collection_name,
@@ -84,7 +88,8 @@ async def ingest(
             "processed_files": payload.processed_files,
         }
     except SecurityScreeningUnavailableError as e:
-        emit_audit_event(
+        await asyncio.to_thread(
+            emit_audit_event,
             "document.ingest",
             severity="ERROR",
             status="screening_unavailable",
@@ -95,7 +100,8 @@ async def ingest(
         )
         raise HTTPException(status_code=503, detail=SCREENING_UNAVAILABLE_MESSAGE)
     except LockTimeoutError as e:
-        emit_audit_event(
+        await asyncio.to_thread(
+            emit_audit_event,
             "document.ingest",
             severity="WARNING",
             status="lock_timeout",
@@ -106,7 +112,8 @@ async def ingest(
         raise HTTPException(status_code=409, detail=str(e))
     except FileNotFoundError as e:
         logger.error(f"File not found error during ingestion for uid='{uid}': {e}")
-        emit_audit_event(
+        await asyncio.to_thread(
+            emit_audit_event,
             "document.ingest",
             severity="WARNING",
             status="not_found",
@@ -116,7 +123,8 @@ async def ingest(
         )
         raise HTTPException(status_code=404, detail=str(e))
     except HTTPException as e:
-        emit_audit_event(
+        await asyncio.to_thread(
+            emit_audit_event,
             "document.ingest",
             severity="WARNING",
             status="rejected",
@@ -127,7 +135,8 @@ async def ingest(
         raise
     except Exception:
         logger.exception(f"Failed to ingest documents for uid='{uid}'.")
-        emit_audit_event(
+        await asyncio.to_thread(
+            emit_audit_event,
             "document.ingest",
             severity="ERROR",
             status="error",

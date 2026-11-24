@@ -9,6 +9,7 @@ Handles both `multipart/form-data` binary PDF uploads and local-dev `application
   per-request `/tmp/uploads/{uid}/{request_uuid}` cleanup inside a `finally` block.
 """
 
+import asyncio
 import contextlib
 from dataclasses import dataclass
 import os
@@ -117,6 +118,48 @@ def _validate_ingest_params(
     return safe_col, safe_emb
 
 
+def _stage_and_archive_upload(
+    uid: str,
+    save_path: str,
+    safe_name: str,
+    content: bytes,
+    should_archive: bool,
+) -> Optional[str]:
+    """Writes validated PDF bytes to `/tmp` staging and optionally archives the file to GCS."""
+    with open(save_path, "wb") as f:
+        f.write(content)
+    return archive_upload(uid, save_path, safe_name) if should_archive else None
+
+
+def _load_and_split_sources(
+    uploaded_files_info: List[Tuple[str, str, Optional[str]]],
+    raw_server_paths: List[str],
+) -> Tuple[List[Document], List[str]]:
+    """Loads and splits staged upload PDFs and local server PDF paths into chunks."""
+    all_chunks: List[Document] = []
+    processed_files: List[str] = []
+
+    # 1. Load & split uploaded files (preserving source, page, and gcs_uri metadata)
+    for save_path, display_name, gcs_uri in uploaded_files_info:
+        file_chunks = split_pdfs([save_path])
+        for chunk in file_chunks:
+            chunk.metadata["source"] = display_name
+            if gcs_uri:
+                chunk.metadata["gcs_uri"] = gcs_uri
+        all_chunks.extend(file_chunks)
+        validate_chunk_count(len(all_chunks))
+        processed_files.append(display_name)
+
+    # 2. Load & split local server paths (local dev mode only)
+    for server_path in raw_server_paths:
+        file_chunks = split_pdfs([server_path])
+        all_chunks.extend(file_chunks)
+        validate_chunk_count(len(all_chunks))
+        processed_files.append(server_path)
+
+    return all_chunks, processed_files
+
+
 async def prepare_payload(request: Request, uid: str) -> IngestPayload:
     """Parses JSON or multipart PDF uploads, enforces upload ceilings, splits chunks, and cleans `/tmp`.
 
@@ -146,8 +189,8 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
         if "application/json" in content_type:
             body = await request.json()
             raw_server_paths, raw_col, raw_emb = _parse_json_body(body)
-            collection_name, embedding_model = _validate_ingest_params(
-                uid, raw_col, raw_emb
+            collection_name, embedding_model = await asyncio.to_thread(
+                _validate_ingest_params, uid, raw_col, raw_emb
             )
         elif "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
             async with request.form() as form:
@@ -161,8 +204,8 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                     raw_embedding = raw_embedding[0] if raw_embedding else None
                 emb_str = raw_embedding if isinstance(raw_embedding, str) else None
 
-                collection_name, embedding_model = _validate_ingest_params(
-                    uid, col_str, emb_str
+                collection_name, embedding_model = await asyncio.to_thread(
+                    _validate_ingest_params, uid, col_str, emb_str
                 )
 
                 # Handle pdf_paths field if provided in form
@@ -200,13 +243,13 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                         )
 
                         save_path = os.path.join(request_upload_dir, save_name)
-                        with open(save_path, "wb") as f:
-                            f.write(content)
-
-                        gcs_uri = (
-                            archive_upload(uid, save_path, safe_name)
-                            if should_archive
-                            else None
+                        gcs_uri = await asyncio.to_thread(
+                            _stage_and_archive_upload,
+                            uid,
+                            save_path,
+                            safe_name,
+                            content,
+                            should_archive,
                         )
                         uploaded_files_info.append((save_path, safe_name, gcs_uri))
         else:
@@ -220,8 +263,8 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                     status_code=400,
                     detail="Unsupported Content-Type. Please send application/json or multipart/form-data.",
                 )
-            collection_name, embedding_model = _validate_ingest_params(
-                uid, raw_col, raw_emb
+            collection_name, embedding_model = await asyncio.to_thread(
+                _validate_ingest_params, uid, raw_col, raw_emb
             )
 
         validate_server_pdf_paths(raw_server_paths, uid)
@@ -233,26 +276,11 @@ async def prepare_payload(request: Request, uid: str) -> IngestPayload:
                 detail="No PDF files uploaded or PDF paths provided.",
             )
 
-        all_chunks: List[Document] = []
-        processed_files: List[str] = []
-
-        # 1. Load & split uploaded files (preserving source, page, and gcs_uri metadata)
-        for save_path, display_name, gcs_uri in uploaded_files_info:
-            file_chunks = split_pdfs([save_path])
-            for chunk in file_chunks:
-                chunk.metadata["source"] = display_name
-                if gcs_uri:
-                    chunk.metadata["gcs_uri"] = gcs_uri
-            all_chunks.extend(file_chunks)
-            validate_chunk_count(len(all_chunks))
-            processed_files.append(display_name)
-
-        # 2. Load & split local server paths (local dev mode only)
-        for server_path in raw_server_paths:
-            file_chunks = split_pdfs([server_path])
-            all_chunks.extend(file_chunks)
-            validate_chunk_count(len(all_chunks))
-            processed_files.append(server_path)
+        all_chunks, processed_files = await asyncio.to_thread(
+            _load_and_split_sources,
+            uploaded_files_info,
+            raw_server_paths,
+        )
 
         return IngestPayload(
             chunks=all_chunks,
