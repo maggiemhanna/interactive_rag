@@ -466,6 +466,14 @@ def _check_availability_tf(infra_dir: str) -> List[str]:
             violations.append(
                 f'infra/availability.tf uptime check "{check_name}" must enforce validate_ssl = true.'
             )
+        if not re.search(r"^\s*count\s*=\s*local\.enable_uptime_checks\s*\?\s*1\s*:\s*0\s*$", check_body, re.MULTILINE):
+            violations.append(
+                f'infra/availability.tf uptime check "{check_name}" must gate provisioning to prod via local.enable_uptime_checks.'
+            )
+        if not re.search(r"^\s*selected_regions\s*=\s*var\.uptime_check_regions\s*$", check_body, re.MULTILINE):
+            violations.append(
+                f'infra/availability.tf uptime check "{check_name}" must configure selected_regions = var.uptime_check_regions.'
+            )
 
     for svc_name in ("agent_api", "ingest_api", "frontend"):
         if not re.search(

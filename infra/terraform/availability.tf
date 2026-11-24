@@ -19,16 +19,23 @@
 #      and fast error-budget burn (`select_slo_burn_rate` over 60m > 14.4x).
 # ==============================================================================
 
+locals {
+  # Provision synthetic HTTPS uptime checks only in production so dev/staging truly scale to zero.
+  enable_uptime_checks = var.environment == "prod"
+}
+
 # ==============================================================================
 # 1. Cloud Monitoring Uptime Checks (HTTPS Probes via External Load Balancer)
 # ==============================================================================
 
-# 1. Frontend Nginx `/healthz` Uptime Check
+# 1. Frontend Nginx `/healthz` Uptime Check (prod only)
 resource "google_monitoring_uptime_check_config" "frontend_health" {
-  project      = var.project_id
-  display_name = "InteractiveRAG — Frontend /healthz Uptime Check (${var.environment})"
-  timeout      = "${var.uptime_check_timeout_seconds}s"
-  period       = "${var.uptime_check_period_seconds}s"
+  count            = local.enable_uptime_checks ? 1 : 0
+  project          = var.project_id
+  display_name     = "InteractiveRAG — Frontend /healthz Uptime Check (${var.environment})"
+  timeout          = "${var.uptime_check_timeout_seconds}s"
+  period           = "${var.uptime_check_period_seconds}s"
+  selected_regions = var.uptime_check_regions
 
   http_check {
     path           = "/healthz"
@@ -62,12 +69,14 @@ resource "google_monitoring_uptime_check_config" "frontend_health" {
   ]
 }
 
-# 2. Document Ingestion API (`/api/ingest/health` -> `ingest-api` `/health`) Uptime Check
+# 2. Document Ingestion API (`/api/ingest/health` -> `ingest-api` `/health`) Uptime Check (prod only)
 resource "google_monitoring_uptime_check_config" "ingest_api_health" {
-  project      = var.project_id
-  display_name = "InteractiveRAG — Ingest API /health Uptime Check (${var.environment})"
-  timeout      = "${var.uptime_check_timeout_seconds}s"
-  period       = "${var.uptime_check_period_seconds}s"
+  count            = local.enable_uptime_checks ? 1 : 0
+  project          = var.project_id
+  display_name     = "InteractiveRAG — Ingest API /health Uptime Check (${var.environment})"
+  timeout          = "${var.uptime_check_timeout_seconds}s"
+  period           = "${var.uptime_check_period_seconds}s"
+  selected_regions = var.uptime_check_regions
 
   http_check {
     path           = "/api/ingest/health"
@@ -101,12 +110,14 @@ resource "google_monitoring_uptime_check_config" "ingest_api_health" {
   ]
 }
 
-# 3. Interactive Agent, Search & Management API (`/api/agent/health` -> `agent-api` `/health`) Uptime Check
+# 3. Interactive Agent, Search & Management API (`/api/agent/health` -> `agent-api` `/health`) Uptime Check (prod only)
 resource "google_monitoring_uptime_check_config" "agent_api_health" {
-  project      = var.project_id
-  display_name = "InteractiveRAG — Agent API /health Uptime Check (${var.environment})"
-  timeout      = "${var.uptime_check_timeout_seconds}s"
-  period       = "${var.uptime_check_period_seconds}s"
+  count            = local.enable_uptime_checks ? 1 : 0
+  project          = var.project_id
+  display_name     = "InteractiveRAG — Agent API /health Uptime Check (${var.environment})"
+  timeout          = "${var.uptime_check_timeout_seconds}s"
+  period           = "${var.uptime_check_period_seconds}s"
+  selected_regions = var.uptime_check_regions
 
   http_check {
     path           = "/api/agent/health"
@@ -277,8 +288,9 @@ resource "google_monitoring_slo" "frontend_availability_slo" {
 # 4. Availability Alert Policies (Multi-Region Uptime Failures & Fast SLO Burn)
 # ==============================================================================
 
-# 1. Multi-Region Uptime Check Failure Alert (fires if >= 2 probe locations fail for 120s)
+# 1. Multi-Region Uptime Check Failure Alert (prod only; fires if >= 2 probe locations fail across 2 intervals)
 resource "google_monitoring_alert_policy" "uptime_check_failure_alert" {
+  count        = local.enable_uptime_checks ? 1 : 0
   project      = var.project_id
   display_name = "InteractiveRAG — Synthetic Uptime Check Failure (${var.environment})"
   combiner     = "OR"
@@ -286,13 +298,13 @@ resource "google_monitoring_alert_policy" "uptime_check_failure_alert" {
   conditions {
     display_name = "Frontend /healthz failing across >= 2 probe regions"
     condition_threshold {
-      filter          = "metric.type=\"monitoring.googleapis.com/uptime_check/check_passed\" AND resource.type=\"uptime_url\" AND metric.label.check_id=\"${google_monitoring_uptime_check_config.frontend_health.uptime_check_id}\""
-      duration        = "120s"
+      filter          = "metric.type=\"monitoring.googleapis.com/uptime_check/check_passed\" AND resource.type=\"uptime_url\" AND metric.label.check_id=\"${google_monitoring_uptime_check_config.frontend_health[0].uptime_check_id}\""
+      duration        = "${var.uptime_check_period_seconds * 2}s"
       comparison      = "COMPARISON_GT"
       threshold_value = 1
 
       aggregations {
-        alignment_period     = "60s"
+        alignment_period     = "${var.uptime_check_period_seconds}s"
         per_series_aligner   = "ALIGN_NEXT_OLDER"
         cross_series_reducer = "REDUCE_COUNT_FALSE"
         group_by_fields      = ["resource.label.host"]
@@ -303,13 +315,13 @@ resource "google_monitoring_alert_policy" "uptime_check_failure_alert" {
   conditions {
     display_name = "Ingest API /api/ingest/health failing across >= 2 probe regions"
     condition_threshold {
-      filter          = "metric.type=\"monitoring.googleapis.com/uptime_check/check_passed\" AND resource.type=\"uptime_url\" AND metric.label.check_id=\"${google_monitoring_uptime_check_config.ingest_api_health.uptime_check_id}\""
-      duration        = "120s"
+      filter          = "metric.type=\"monitoring.googleapis.com/uptime_check/check_passed\" AND resource.type=\"uptime_url\" AND metric.label.check_id=\"${google_monitoring_uptime_check_config.ingest_api_health[0].uptime_check_id}\""
+      duration        = "${var.uptime_check_period_seconds * 2}s"
       comparison      = "COMPARISON_GT"
       threshold_value = 1
 
       aggregations {
-        alignment_period     = "60s"
+        alignment_period     = "${var.uptime_check_period_seconds}s"
         per_series_aligner   = "ALIGN_NEXT_OLDER"
         cross_series_reducer = "REDUCE_COUNT_FALSE"
         group_by_fields      = ["resource.label.host"]
@@ -320,13 +332,13 @@ resource "google_monitoring_alert_policy" "uptime_check_failure_alert" {
   conditions {
     display_name = "Agent API /api/agent/health failing across >= 2 probe regions"
     condition_threshold {
-      filter          = "metric.type=\"monitoring.googleapis.com/uptime_check/check_passed\" AND resource.type=\"uptime_url\" AND metric.label.check_id=\"${google_monitoring_uptime_check_config.agent_api_health.uptime_check_id}\""
-      duration        = "120s"
+      filter          = "metric.type=\"monitoring.googleapis.com/uptime_check/check_passed\" AND resource.type=\"uptime_url\" AND metric.label.check_id=\"${google_monitoring_uptime_check_config.agent_api_health[0].uptime_check_id}\""
+      duration        = "${var.uptime_check_period_seconds * 2}s"
       comparison      = "COMPARISON_GT"
       threshold_value = 1
 
       aggregations {
-        alignment_period     = "60s"
+        alignment_period     = "${var.uptime_check_period_seconds}s"
         per_series_aligner   = "ALIGN_NEXT_OLDER"
         cross_series_reducer = "REDUCE_COUNT_FALSE"
         group_by_fields      = ["resource.label.host"]
@@ -339,7 +351,7 @@ resource "google_monitoring_alert_policy" "uptime_check_failure_alert" {
   }
 
   documentation {
-    content   = "One or more InteractiveRAG HTTPS Load Balancer health endpoints (`/healthz`, `/api/ingest/health`, `/api/agent/health`) failed synthetic probes from multiple regions for over 2 minutes."
+    content   = "One or more InteractiveRAG HTTPS Load Balancer health endpoints (`/healthz`, `/api/ingest/health`, `/api/agent/health`) failed synthetic probes from multiple regions across two consecutive probe intervals."
     mime_type = "text/markdown"
   }
 

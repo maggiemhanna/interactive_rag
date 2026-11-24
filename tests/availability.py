@@ -57,7 +57,8 @@ class TestAvailabilityDesignTerraformAndPolicies(unittest.TestCase):
             self.tfvars_example = fh.read()
 
     def test_uptime_checks_cover_all_three_services_over_validated_https(self) -> None:
-        """Verifies HTTPS uptime checks probe frontend, ingest-api, and agent-api with SSL validation and matchers."""
+        """Verifies HTTPS uptime checks probe frontend, ingest-api, and agent-api with SSL validation, prod-only gating, and 3-region scoping."""
+        self.assertIn('enable_uptime_checks = var.environment == "prod"', self.availability_tf)
         expected_checks = {
             "frontend_health": ("/healthz", "ok"),
             "ingest_api_health": ("/api/ingest/health", "ingest-api"),
@@ -71,6 +72,8 @@ class TestAvailabilityDesignTerraformAndPolicies(unittest.TestCase):
             )
             self.assertIsNotNone(match, f"Missing uptime check resource '{name}'.")
             body = match.group("body")
+            self.assertIn("count            = local.enable_uptime_checks ? 1 : 0", body)
+            self.assertIn("selected_regions = var.uptime_check_regions", body)
             self.assertIn(f'path           = "{expected_path}"', body)
             self.assertIn("port           = 443", body)
             self.assertIn("use_ssl        = true", body)
@@ -128,8 +131,17 @@ class TestAvailabilityDesignTerraformAndPolicies(unittest.TestCase):
         )
         self.assertEqual(self.availability_tf.count("select_slo_burn_rate("), 3)
 
+        period_match = re.search(
+            r'variable\s+"uptime_check_period_seconds"\s*\{.*?default\s*=\s*([0-9]+)',
+            self.variables_tf,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(period_match)
+        self.assertEqual(int(period_match.group(1)), 300)
+
         for var_name in (
             "uptime_check_period_seconds",
+            "uptime_check_regions",
             "uptime_check_timeout_seconds",
             "slo_rolling_period_days",
             "slo_agent_availability_goal",

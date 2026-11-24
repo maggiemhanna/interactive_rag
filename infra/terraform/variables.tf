@@ -468,13 +468,30 @@ variable "alert_memory_utilization_threshold" {
 # ==============================================================================
 
 variable "uptime_check_period_seconds" {
-  description = "Synthetic HTTPS uptime check probe interval in seconds (60, 300, 600, or 900)."
+  description = "Synthetic HTTPS uptime check probe interval in seconds (60, 300, 600, or 900; default 300 = 5 minutes)."
   type        = number
-  default     = 60
+  default     = 300
 
   validation {
     condition     = contains([60, 300, 600, 900], var.uptime_check_period_seconds)
     error_message = "uptime_check_period_seconds must be one of 60, 300, 600, or 900."
+  }
+}
+
+variable "uptime_check_regions" {
+  description = "Cloud Monitoring synthetic probe locations for prod uptime checks (minimum 3 locations required by GCP)."
+  type        = list(string)
+  default     = ["USA_IOWA", "USA_VIRGINIA", "EUROPE"]
+
+  validation {
+    condition = (
+      length(var.uptime_check_regions) >= 3 &&
+      alltrue([
+        for r in var.uptime_check_regions :
+        contains(["USA_OREGON", "USA_IOWA", "USA_VIRGINIA", "EUROPE", "SOUTH_AMERICA", "ASIA_PACIFIC"], r)
+      ])
+    )
+    error_message = "uptime_check_regions must contain at least 3 valid Cloud Monitoring probe regions (USA_OREGON, USA_IOWA, USA_VIRGINIA, EUROPE, SOUTH_AMERICA, ASIA_PACIFIC)."
   }
 }
 

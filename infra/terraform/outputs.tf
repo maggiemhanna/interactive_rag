@@ -151,11 +151,11 @@ output "alert_policy_ids" {
 # ==============================================================================
 
 output "uptime_check_ids" {
-  description = "Cloud Monitoring HTTPS uptime check IDs probing frontend, ingest-api, and agent-api via the Load Balancer."
+  description = "Cloud Monitoring HTTPS uptime check IDs probing frontend, ingest-api, and agent-api via the Load Balancer (null in non-prod)."
   value = {
-    frontend   = google_monitoring_uptime_check_config.frontend_health.uptime_check_id
-    ingest_api = google_monitoring_uptime_check_config.ingest_api_health.uptime_check_id
-    agent_api  = google_monitoring_uptime_check_config.agent_api_health.uptime_check_id
+    frontend   = one(google_monitoring_uptime_check_config.frontend_health[*].uptime_check_id)
+    ingest_api = one(google_monitoring_uptime_check_config.ingest_api_health[*].uptime_check_id)
+    agent_api  = one(google_monitoring_uptime_check_config.agent_api_health[*].uptime_check_id)
   }
 }
 
@@ -179,9 +179,9 @@ output "slo_ids" {
 }
 
 output "availability_alert_policy_ids" {
-  description = "Cloud Monitoring alert policy IDs for multi-region uptime failures and SLO error-budget fast burn."
+  description = "Cloud Monitoring alert policy IDs for multi-region uptime failures (null in non-prod) and SLO error-budget fast burn."
   value = {
-    uptime_check_failure = google_monitoring_alert_policy.uptime_check_failure_alert.id
+    uptime_check_failure = one(google_monitoring_alert_policy.uptime_check_failure_alert[*].id)
     slo_fast_burn        = google_monitoring_alert_policy.slo_fast_burn_alert.id
   }
 }

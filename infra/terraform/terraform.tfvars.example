@@ -65,7 +65,8 @@ alert_agent_latency_p95_ms         = 15000
 alert_memory_utilization_threshold = 0.85
 
 # Availability Design (Cloud Monitoring Uptime Checks & Declarative SLOs)
-uptime_check_period_seconds    = 60
+uptime_check_period_seconds    = 300
+uptime_check_regions           = ["USA_IOWA", "USA_VIRGINIA", "EUROPE"]
 uptime_check_timeout_seconds   = 10
 slo_rolling_period_days        = 28
 slo_agent_availability_goal    = 0.995
