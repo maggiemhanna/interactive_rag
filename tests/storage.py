@@ -275,11 +275,23 @@ class TestPerUserChromaStorage(unittest.TestCase):
         self.assertNotIn("ERR-9042-X", dense_only_docs[0].page_content)
         self.assertTrue(0.0 < dense_only_scored[0][1] <= 1.0)
 
-        hybrid_docs, hybrid_scored = similarity_search_with_scores(
-            vs,
-            "ERR-9042-X",
-            k=2,
-        )
+        from rank_bm25 import BM25Okapi
+
+        orig_get_scores = BM25Okapi.get_scores
+        bm25_score_calls = 0
+
+        def _counting_get_scores(bm25_self, query):
+            nonlocal bm25_score_calls
+            bm25_score_calls += 1
+            return orig_get_scores(bm25_self, query)
+
+        with patch.object(BM25Okapi, "get_scores", _counting_get_scores):
+            hybrid_docs, hybrid_scored = similarity_search_with_scores(
+                vs,
+                "ERR-9042-X",
+                k=2,
+            )
+        self.assertEqual(bm25_score_calls, 1)
         self.assertEqual(len(hybrid_docs), 2)
         self.assertIn("ERR-9042-X", hybrid_docs[0].page_content)
         for _doc, score in hybrid_scored:

@@ -5,6 +5,7 @@ validates embedding model and collection identifiers, and provides collection in
 loading, and deletion operations over a tenant's `persist_directory`.
 """
 
+import heapq
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -238,17 +239,12 @@ def similarity_search_with_scores(
                 query_tokens = bm25_retriever.preprocess_func(query)
                 if query_tokens and getattr(bm25_retriever, "vectorizer", None) is not None:
                     raw_bm25_scores = bm25_retriever.vectorizer.get_scores(query_tokens)
-                    positive_keys = {
-                        _doc_rrf_key(doc)
-                        for doc, score in zip(bm25_retriever.docs, raw_bm25_scores)
-                        if float(score) > 0.0
-                    }
-                    if positive_keys:
-                        bm25_docs = [
-                            doc
-                            for doc in bm25_retriever.invoke(query)
-                            if _doc_rrf_key(doc) in positive_keys
-                        ]
+                    top_indices = heapq.nlargest(
+                        candidate_k,
+                        (idx for idx, score in enumerate(raw_bm25_scores) if float(score) > 0.0),
+                        key=lambda idx: float(raw_bm25_scores[idx]),
+                    )
+                    bm25_docs = [bm25_retriever.docs[idx] for idx in top_indices]
         except Exception:
             bm25_docs = []
 
