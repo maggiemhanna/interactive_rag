@@ -910,6 +910,11 @@ class TestPhase5ObservabilityInfrastructureAndStaticPolicies(unittest.TestCase):
         self.assertIn('resource "google_logging_project_bucket_config" "observability_telemetry"', obs_tf)
         self.assertIn("retention_days   = var.observability_log_retention_days", obs_tf)
         self.assertIn('resource "google_logging_project_sink" "observability_sink"', obs_tf)
+        self.assertIn(
+            'resource "google_logging_project_exclusion" "exclude_observability_from_default"',
+            obs_tf,
+        )
+        self.assertIn("google_logging_project_sink.observability_sink.filter", obs_tf)
         for metric_name in (
             "agent_turn_latency_ms",
             "agent_ttft_ms",

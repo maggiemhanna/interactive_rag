@@ -12,8 +12,9 @@
 #   2. Structured Cloud Run Operational Logs (`run.googleapis.com/stdout` & `stderr`):
 #      Single-line JSON application logs enriched with `request_id`, `trace_id`, `span_id`,
 #      `service`, `uid`, and `sourceLocation`.
-#   3. Both streams remain searchable in `_Default` (Logs Explorer) AND are copied into the
-#      regional `observability_telemetry` log bucket in `var.region`.
+#   3. Both streams are routed into the regional `observability_telemetry` log bucket in
+#      `var.region` and excluded from the global `_Default` sink to prevent cross-region
+#      residency leaks and duplicate ingestion billing.
 #   4. Log-based metrics extract latency distributions, TTFT, stage latencies, token
 #      consumption, retrieval similarity scores, ungrounded response counts, and ingestion
 #      throughput directly from `interactiverag-telemetry` into Cloud Monitoring with
@@ -52,23 +53,34 @@ resource "google_logging_project_bucket_config" "observability_telemetry" {
 }
 
 # ==============================================================================
-# 2. Project-Level Observability & Telemetry Log Sink
+# 2. Project-Level Observability & Telemetry Log Sink & `_Default` Exclusion
 # ==============================================================================
 
-# Non-excluding log sink that copies:
+# Routes:
 #   - Structured AI & performance telemetry events (`interactiverag-telemetry`)
 #   - Structured Cloud Run container logs (`run.googleapis.com/stdout` & `stderr`)
-# into `observability_telemetry` while leaving `_Default` intact for immediate Logs Explorer queries.
+# into the regional `observability_telemetry` bucket.
 resource "google_logging_project_sink" "observability_sink" {
   project     = var.project_id
   name        = "${var.app_name}-observability-sink-${var.environment}"
-  description = "Copies InteractiveRAG AI telemetry events and structured Cloud Run container logs into the regional observability bucket."
+  description = "Routes InteractiveRAG AI telemetry events and structured Cloud Run container logs into the regional observability bucket."
   destination = "logging.googleapis.com/projects/${var.project_id}/locations/${var.region}/buckets/${google_logging_project_bucket_config.observability_telemetry.bucket_id}"
   filter      = "logName=\"projects/${var.project_id}/logs/interactiverag-telemetry\" OR (resource.type=\"cloud_run_revision\" AND (logName=\"projects/${var.project_id}/logs/run.googleapis.com%2Fstdout\" OR logName=\"projects/${var.project_id}/logs/run.googleapis.com%2Fstderr\"))"
 
   depends_on = [
     google_logging_project_bucket_config.observability_telemetry,
   ]
+}
+
+# Excludes the same telemetry and Cloud Run container streams from the built-in global
+# `_Default` sink so they are stored strictly in `var.region` without 2x ingestion billing.
+# Project-scoped user-defined `google_logging_metric` resources evaluate before sink
+# exclusions and remain unaffected.
+resource "google_logging_project_exclusion" "exclude_observability_from_default" {
+  project     = var.project_id
+  name        = "${var.app_name}-exclude-observability-default-${var.environment}"
+  description = "Prevents duplicating InteractiveRAG telemetry and Cloud Run stdout/stderr logs into the global _Default bucket."
+  filter      = google_logging_project_sink.observability_sink.filter
 }
 
 # ==============================================================================

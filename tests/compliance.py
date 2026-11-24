@@ -690,6 +690,11 @@ class TestPhase2AuditLogging(unittest.TestCase):
         self.assertIn('resource "google_logging_project_bucket_config" "compliance_audit"', gov_tf)
         self.assertIn("location         = var.region", gov_tf)
         self.assertIn('resource "google_logging_project_sink" "compliance_audit_sink"', gov_tf)
+        self.assertIn(
+            'resource "google_logging_project_exclusion" "exclude_compliance_from_default"',
+            gov_tf,
+        )
+        self.assertIn("google_logging_project_sink.compliance_audit_sink.filter", gov_tf)
 
         with open(lb_path, encoding="utf-8") as fh:
             lb_tf = fh.read()
@@ -1682,6 +1687,17 @@ class TestPhase4PolicyEnforcement(unittest.TestCase):
             self.assertTrue(any("MODEL_ARMOR_FAIL_CLOSED" in msg for msg in v_cr), v_cr)
             with open(cr_path, "w", encoding="utf-8") as fh:
                 fh.write(orig_cr)
+
+            comp_path = os.path.join(syn_root, "infra", "terraform", "compliance.tf")
+            with open(comp_path, encoding="utf-8") as fh:
+                orig_comp = fh.read()
+            with open(comp_path, "w", encoding="utf-8") as fh:
+                fh.write(orig_comp.replace("exclude_compliance_from_default", "removed_exclusion"))
+            ok_comp, v_comp = evaluate_repo_static_policies(syn_root)
+            self.assertFalse(ok_comp)
+            self.assertTrue(any("exclude_compliance_from_default" in msg for msg in v_comp), v_comp)
+            with open(comp_path, "w", encoding="utf-8") as fh:
+                fh.write(orig_comp)
 
             with open(syn_tfvars, "w", encoding="utf-8") as fh:
                 fh.write('region = "eu"\nmodel_armor_fail_closed = false\n')

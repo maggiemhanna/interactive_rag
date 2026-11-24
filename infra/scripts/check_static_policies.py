@@ -271,6 +271,46 @@ def _check_cloud_run_tf(infra_dir: str) -> List[str]:
     return violations
 
 
+def _check_compliance_tf(infra_dir: str) -> List[str]:
+    """Checks `infra/compliance.tf` for regional audit bucket pinning and `_Default` sink exclusion.
+
+    Args:
+        infra_dir: Path to the `infra/` Terraform directory.
+
+    Returns:
+        List of policy violation messages (empty when compliant).
+    """
+    violations: List[str] = []
+    comp_path = os.path.join(infra_dir, "compliance.tf")
+    if not os.path.isfile(comp_path):
+        return [f"Missing required Terraform file: {comp_path}"]
+
+    with open(comp_path, encoding="utf-8") as fh:
+        content = fh.read()
+
+    excl_match = re.search(
+        r'resource\s+"google_logging_project_exclusion"\s+"exclude_compliance_from_default"\s*\{(?P<body>.*?)\n\}',
+        content,
+        re.DOTALL,
+    )
+    if not excl_match:
+        violations.append(
+            'infra/compliance.tf is missing google_logging_project_exclusion "exclude_compliance_from_default".'
+        )
+    else:
+        excl_body = excl_match.group("body")
+        if re.search(r"^\s*disabled\s*=\s*true\b", excl_body, re.MULTILINE | re.IGNORECASE):
+            violations.append(
+                'infra/compliance.tf "exclude_compliance_from_default" must not set disabled = true.'
+            )
+        if "compliance_audit_sink.filter" not in excl_body:
+            violations.append(
+                'infra/compliance.tf "exclude_compliance_from_default" must reference google_logging_project_sink.compliance_audit_sink.filter.'
+            )
+
+    return violations
+
+
 def _check_observability_tf(infra_dir: str) -> List[str]:
     """Checks `infra/observability.tf` for regional log bucket pinning, sink routing, log metrics, dashboard, and alert policies.
 
@@ -323,6 +363,26 @@ def _check_observability_tf(infra_dir: str) -> List[str]:
         if "interactiverag-telemetry" not in sink_body:
             violations.append(
                 'infra/observability.tf "observability_sink" filter must include interactiverag-telemetry.'
+            )
+
+    obs_excl_match = re.search(
+        r'resource\s+"google_logging_project_exclusion"\s+"exclude_observability_from_default"\s*\{(?P<body>.*?)\n\}',
+        content,
+        re.DOTALL,
+    )
+    if not obs_excl_match:
+        violations.append(
+            'infra/observability.tf is missing google_logging_project_exclusion "exclude_observability_from_default".'
+        )
+    else:
+        obs_excl_body = obs_excl_match.group("body")
+        if re.search(r"^\s*disabled\s*=\s*true\b", obs_excl_body, re.MULTILINE | re.IGNORECASE):
+            violations.append(
+                'infra/observability.tf "exclude_observability_from_default" must not set disabled = true.'
+            )
+        if "observability_sink.filter" not in obs_excl_body:
+            violations.append(
+                'infra/observability.tf "exclude_observability_from_default" must reference google_logging_project_sink.observability_sink.filter.'
             )
 
     for metric_name in (
@@ -518,6 +578,7 @@ def evaluate_repo_static_policies(repo_root: str) -> Tuple[bool, List[str]]:
     violations.extend(_check_python_config(repo_root))
     violations.extend(_check_terraform_variables(infra_dir))
     violations.extend(_check_cloud_run_tf(infra_dir))
+    violations.extend(_check_compliance_tf(infra_dir))
     violations.extend(_check_observability_tf(infra_dir))
     violations.extend(_check_availability_tf(infra_dir))
     violations.extend(_check_all_tf_locations_and_tfvars(infra_dir))

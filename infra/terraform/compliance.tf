@@ -5,8 +5,9 @@
 #   1. Application audit events (`projects/<project>/logs/interactiverag-audit`)
 #   2. GCP Data Access Audit Logs (`cloudaudit.googleapis.com/data_access`)
 #   3. HTTPS Load Balancer HTTP access logs (`resource.type="http_load_balancer"`)
-#      -> All three remain searchable in `_Default` (Logs Explorer) AND are copied into
-#         the regional `compliance_audit` log bucket in `var.region` for long-term retention.
+#      -> Routed into the regional `compliance_audit` log bucket in `var.region`
+#         and excluded from the global `_Default` sink to prevent cross-region
+#         residency leaks and duplicate ingestion billing.
 # ==============================================================================
 
 locals {
@@ -77,24 +78,34 @@ resource "google_logging_project_bucket_config" "compliance_audit" {
 }
 
 # ==============================================================================
-# 3. Project-Level Compliance Log Sink
+# 3. Project-Level Compliance Log Sink & `_Default` Sink Exclusion
 # ==============================================================================
 
-# Non-excluding log sink that copies:
+# Routes:
 #   - Application compliance events (`interactiverag-audit`)
 #   - GCP Cloud Audit Logs (`cloudaudit.googleapis.com`)
 #   - External HTTPS Load Balancer access logs (`resource.type="http_load_balancer"`)
-# into `compliance_audit` while leaving `_Default` intact for immediate Logs Explorer queries.
+# into the regional `compliance_audit` bucket.
 # Note: Sinks routing to a Cloud Logging bucket in the SAME project write directly within
 # the project and do not require a separate `writer_identity` IAM binding.
 resource "google_logging_project_sink" "compliance_audit_sink" {
   project     = var.project_id
   name        = "${var.app_name}-audit-sink-${var.environment}"
-  description = "Copies InteractiveRAG application audit events, GCP Cloud Audit Logs, and HTTPS LB logs into the regional compliance bucket."
+  description = "Routes InteractiveRAG application audit events, GCP Cloud Audit Logs, and HTTPS LB logs into the regional compliance bucket."
   destination = "logging.googleapis.com/projects/${var.project_id}/locations/${var.region}/buckets/${google_logging_project_bucket_config.compliance_audit.bucket_id}"
   filter      = "logName=\"projects/${var.project_id}/logs/interactiverag-audit\" OR logName:\"cloudaudit.googleapis.com\" OR resource.type=\"http_load_balancer\""
 
   depends_on = [
     google_logging_project_bucket_config.compliance_audit,
   ]
+}
+
+# Excludes the same compliance, Data Access, and Load Balancer streams from the built-in
+# global `_Default` sink so they are stored strictly in `var.region` without 2x ingestion
+# billing (system-managed `_Required` Admin Activity logs remain unaffected).
+resource "google_logging_project_exclusion" "exclude_compliance_from_default" {
+  project     = var.project_id
+  name        = "${var.app_name}-exclude-audit-default-${var.environment}"
+  description = "Prevents duplicating InteractiveRAG compliance audit, Data Access, and LB logs into the global _Default bucket."
+  filter      = google_logging_project_sink.compliance_audit_sink.filter
 }
