@@ -69,6 +69,7 @@ def agent(
 
         # Pre-validate user's synced ChromaDB & collection so missing collections return 404 even when stream=True
         with user_read_lock(uid) as persist_directory:
+            MEMORY_SAVER.sync_user_workspace(uid, persist_directory)
             require_collection(persist_directory, request.collection_name)
 
             if request.stream:

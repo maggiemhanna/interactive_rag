@@ -223,6 +223,7 @@ def stream_sse(
     streamed_messages = []
     try:
         with user_read_lock(uid) as stream_persist_dir:
+            MEMORY_SAVER.sync_user_workspace(uid, stream_persist_dir)
             for evt in stream_events(
                 query=request.query,
                 collection_name=request.collection_name,

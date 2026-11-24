@@ -408,6 +408,11 @@ def get_chroma_tmp_min_free_bytes() -> int:
     return _parse_non_negative_int("CHROMA_TMP_MIN_FREE_BYTES", 256 * 1024 * 1024)
 
 
+def get_memory_ttl_seconds() -> int:
+    """Returns the idle TTL (in seconds) after which in-memory conversation threads are evicted (`0` disables)."""
+    return _parse_non_negative_int("MEMORY_TTL_SECONDS", 1800)
+
+
 # Module-level snapshots (for direct constant imports; runtime validators call get_* helpers)
 GOOGLE_CLOUD_LOCATION: str = get_google_cloud_location()
 MAX_QUERY_CHARS: int = get_max_query_chars()
@@ -478,6 +483,7 @@ __all__ = [
     "get_max_files_per_request",
     "get_max_query_chars",
     "get_max_upload_mb",
+    "get_memory_ttl_seconds",
     "get_model_armor_location",
     "get_model_armor_template_id",
     "get_rate_limit_ingest_per_minute",

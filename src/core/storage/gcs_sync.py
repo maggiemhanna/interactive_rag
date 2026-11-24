@@ -37,6 +37,7 @@ from src.core.storage.paths import (
     get_user_dir,
     get_user_uploads_dir,
     read_local_version,
+    read_local_workspace_id,
     release_client_cache,
     user_gcs_prefix,
     user_uploads_gcs_prefix,
@@ -264,8 +265,10 @@ def _push_user_dir_to_gcs(bucket: storage.Bucket, uid: str, user_dir: str) -> No
         chroma_sqlite_rel = f"{CHROMA_SUBDIR}/{SQLITE_FILENAME}"
         local_version_path = os.path.join(user_dir, VERSION_FILENAME)
         if chroma_sqlite_rel in local_rel_files:
+            workspace_id = read_local_workspace_id(user_dir) or uuid.uuid4().hex
             new_version = {
                 "version": uuid.uuid4().hex,
+                "workspace_id": workspace_id,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "file_count": len(local_rel_files),
             }

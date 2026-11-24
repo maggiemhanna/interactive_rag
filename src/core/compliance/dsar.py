@@ -88,6 +88,8 @@ def list_user_memory_threads(uid: str, checkpointer: Optional[Any] = None) -> Li
     safe_uid = validate_uid(uid)
     if checkpointer is None:
         return []
+    if hasattr(checkpointer, "evict_expired"):
+        checkpointer.evict_expired()
     prefix = f"{safe_uid}:"
     with _memory_lock:
         matched = _collect_matching_thread_ids(prefix, checkpointer)
@@ -112,6 +114,8 @@ def clear_user_memory(uid: str, checkpointer: Optional[Any] = None) -> int:
         matched = _collect_matching_thread_ids(prefix, checkpointer)
         for tid in matched:
             checkpointer.delete_thread(tid)
+        if hasattr(checkpointer, "clear_user_workspace"):
+            checkpointer.clear_user_workspace(safe_uid)
 
     if matched:
         logger.info(
@@ -171,6 +175,8 @@ def get_user_data_inventory(uid: str, checkpointer: Optional[Any] = None) -> Dic
     bucket_name = get_bucket_name()
 
     with user_read_lock(safe_uid) as persist_directory:
+        if checkpointer is not None and hasattr(checkpointer, "sync_user_workspace"):
+            checkpointer.sync_user_workspace(safe_uid, persist_directory)
         col_payload = list_collections(persist_directory)
         raw_details = col_payload.get("details", []) if isinstance(col_payload, dict) else []
         collections = [

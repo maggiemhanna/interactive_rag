@@ -31,7 +31,7 @@ from infra.scripts.check_region_policy import evaluate_effective_location_policy
 from infra.scripts.check_static_policies import evaluate_repo_static_policies
 from src.agent import app as agent_app_module
 from src.agent import graph as agent_graph_module
-from src.agent.memory import MEMORY_SAVER
+from src.agent.memory import MEMORY_SAVER, TenantMemorySaver
 from src.core import config as config_module
 from src.core.ai_security import armor as armor_module
 from src.core.ai_security import guardrails as guardrails_module
@@ -40,6 +40,7 @@ from src.core.compliance import (
     audit as audit_module,
     hash_query,
     list_user_memory_threads,
+    purge_all_user_data,
     register_audit_listener,
     validate_gcp_region,
 )
@@ -51,6 +52,7 @@ from src.core.config import (
 from src.core.logger import setup_logging
 from src.core.storage import chroma as chroma_module
 from src.core.storage import gcs_sync as gcs_sync_module
+from src.core.storage.paths import get_user_dir, read_local_workspace_id
 from src.ingest import app as ingest_app_module
 from tests.helpers import (
     DeterministicFakeEmbeddings,
@@ -927,6 +929,130 @@ class TestPhase3RegulatoryCompliance(unittest.TestCase):
         self.assertEqual(bob_inv["collection_count"], 1)
         self.assertEqual(bob_inv["uploaded_pdf_count"], 1)
         self.assertEqual(bob_inv["memory_thread_count"], 1)
+
+    def test_workspace_id_invalidates_stale_memory_across_instances_without_resurrection(
+        self,
+    ) -> None:
+        """Verifies cross-instance DSAR erasure invalidates stale `MEMORY_SAVER` threads via `workspace_id` so erased turns can never resurrect."""
+        # 1. Alice ingests PDF #1 (creates workspace_id ws1) and chats on "Instance A" (MEMORY_SAVER)
+        r_ing1 = self.ingest_client.post(
+            "/ingest",
+            headers={"X-Dev-User-Id": "alice_gdpr"},
+            data={"collection_name": "ws_col"},
+            files=[("files", ("v1.pdf", make_test_pdf("Original secret project alpha."), "application/pdf"))],
+        )
+        self.assertEqual(r_ing1.status_code, 200)
+        ws1 = read_local_workspace_id(get_user_dir("alice_gdpr"))
+        self.assertIsNotNone(ws1)
+
+        r_chat1 = self.agent_client.post(
+            "/agent",
+            headers={"X-Dev-User-Id": "alice_gdpr"},
+            json={"query": "Tell me about project alpha", "collection_name": "ws_col", "thread_id": "t1", "stream": False},
+        )
+        self.assertEqual(r_chat1.status_code, 200)
+        self.assertEqual(list_user_memory_threads("alice_gdpr", MEMORY_SAVER), ["t1"])
+
+        # 2. Normal 2nd upload preserves ws1 and keeps Instance A's chat history intact
+        r_ing2 = self.ingest_client.post(
+            "/ingest",
+            headers={"X-Dev-User-Id": "alice_gdpr"},
+            data={"collection_name": "ws_col"},
+            files=[("files", ("v2.pdf", make_test_pdf("Follow-up addendum."), "application/pdf"))],
+        )
+        self.assertEqual(r_ing2.status_code, 200)
+        self.assertEqual(read_local_workspace_id(get_user_dir("alice_gdpr")), ws1)
+        inv_before = self.agent_client.get("/compliance/my-data", headers={"X-Dev-User-Id": "alice_gdpr"}).json()
+        self.assertEqual(inv_before["memory_thread_count"], 1)
+
+        # 3. Simulate DSAR erasure running on a DIFFERENT container ("Instance B")
+        instance_b_memory = TenantMemorySaver()
+        purge_all_user_data("alice_gdpr", checkpointer=instance_b_memory)
+        # Instance A's RAM still has t1 until Instance A syncs
+        self.assertEqual(list_user_memory_threads("alice_gdpr", MEMORY_SAVER), ["t1"])
+
+        # 4a. GET /compliance/my-data on Instance A immediately detects missing workspace and purges stale RAM
+        inv_after = self.agent_client.get("/compliance/my-data", headers={"X-Dev-User-Id": "alice_gdpr"}).json()
+        self.assertEqual(inv_after["memory_thread_count"], 0)
+        self.assertEqual(list_user_memory_threads("alice_gdpr", MEMORY_SAVER), [])
+
+        # 4b. Re-create workspace -> chat on Instance A -> erase on Instance B -> immediately re-ingest (ws2 != ws1)
+        self.ingest_client.post(
+            "/ingest",
+            headers={"X-Dev-User-Id": "alice_gdpr"},
+            data={"collection_name": "ws_col"},
+            files=[("files", ("pre_erase.pdf", make_test_pdf("Pre-erasure content."), "application/pdf"))],
+        )
+        ws_pre = read_local_workspace_id(get_user_dir("alice_gdpr"))
+        self.agent_client.post(
+            "/agent",
+            headers={"X-Dev-User-Id": "alice_gdpr"},
+            json={"query": "Remember secret pre-erasure phrase", "collection_name": "ws_col", "thread_id": "t1", "stream": False},
+        )
+        self.assertEqual(list_user_memory_threads("alice_gdpr", MEMORY_SAVER), ["t1"])
+
+        # Instance B wipes GCS + version.json, then user uploads a brand-new PDF (gets ws_post != ws_pre)
+        purge_all_user_data("alice_gdpr", checkpointer=TenantMemorySaver())
+        self.ingest_client.post(
+            "/ingest",
+            headers={"X-Dev-User-Id": "alice_gdpr"},
+            data={"collection_name": "ws_col"},
+            files=[("files", ("post_erase.pdf", make_test_pdf("Brand new content."), "application/pdf"))],
+        )
+        ws_post = read_local_workspace_id(get_user_dir("alice_gdpr"))
+        self.assertIsNotNone(ws_post)
+        self.assertNotEqual(ws_post, ws_pre)
+
+        # Next chat on Instance A reusing the same thread_id="t1" must NOT resurrect pre-erasure turns
+        r_chat_new = self.agent_client.post(
+            "/agent",
+            headers={"X-Dev-User-Id": "alice_gdpr"},
+            json={"query": "Fresh question", "collection_name": "ws_col", "thread_id": "t1", "stream": False},
+        )
+        self.assertEqual(r_chat_new.status_code, 200)
+        saved_tuple = MEMORY_SAVER.get_tuple({"configurable": {"thread_id": "alice_gdpr:t1"}})
+        self.assertIsNotNone(saved_tuple)
+        saved_messages = saved_tuple.checkpoint["channel_values"].get("messages", [])
+        human_texts = [getattr(m, "content", "") for m in saved_messages if getattr(m, "type", "") == "human"]
+        self.assertEqual(human_texts, ["Fresh question"])
+
+    def test_memory_saver_idle_ttl_eviction(self) -> None:
+        """Verifies `TenantMemorySaver` refreshes TTL on access and evicts idle threads once `MEMORY_TTL_SECONDS` elapses."""
+        now = [100.0]
+        saver = TenantMemorySaver(clock=lambda: now[0])
+
+        def _put_thread(tid: str, step: str) -> None:
+            saver.put(
+                {"configurable": {"thread_id": tid, "checkpoint_ns": ""}},
+                {
+                    "v": 1,
+                    "id": f"cp-{step}",
+                    "ts": "2026-01-01T00:00:00Z",
+                    "channel_values": {"messages": [step]},
+                    "channel_versions": {"messages": "1"},
+                    "versions_seen": {},
+                },
+                {"source": "input", "step": 1, "writes": {}},
+                {"messages": "1"},
+            )
+
+        with patch.dict(os.environ, {"MEMORY_TTL_SECONDS": "60"}, clear=False):
+            _put_thread("alice:t1", "one")
+            now[0] = 110.0
+            _put_thread("alice:t2", "two")
+
+            # Refresh t1 at t=150; t2 remains last used at t=110
+            now[0] = 150.0
+            self.assertIsNotNone(saver.get_tuple({"configurable": {"thread_id": "alice:t1"}}))
+
+            # At t=170: t2 is idle 60s (evicted), t1 is idle 20s (kept)
+            now[0] = 170.0
+            self.assertEqual(list_user_memory_threads("alice", saver), ["t1"])
+
+            # At t=210: t1 is idle 60s (evicted)
+            now[0] = 210.0
+            self.assertEqual(list_user_memory_threads("alice", saver), [])
+            self.assertIsNone(saver.get_tuple({"configurable": {"thread_id": "alice:t1"}}))
 
     def test_eu_ai_act_art50_compliance_provenance_in_json_and_sse_including_pii_filtered(
         self,

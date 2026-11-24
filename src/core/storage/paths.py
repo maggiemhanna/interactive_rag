@@ -271,6 +271,33 @@ def read_local_version(user_dir: str) -> Optional[str]:
         return None
 
 
+def read_local_workspace_id(user_dir: str) -> Optional[str]:
+    """Reads the stable `workspace_id` UUID from `<user_dir>/version.json` when present.
+
+    `workspace_id` remains stable across normal document ingests and collection deletes, and
+    is destroyed only when the entire tenant workspace is erased (e.g., DSAR Art. 17 purge),
+    allowing other Cloud Run instances to detect erasure and invalidate stale RAM memory.
+
+    Args:
+        user_dir: Local tenant working directory.
+
+    Returns:
+        Workspace UUID string if `version.json` and `chroma/chroma.sqlite3` exist and contain
+        a non-empty `workspace_id`, otherwise `None`.
+    """
+    version_path = os.path.join(user_dir, VERSION_FILENAME)
+    sqlite_path = os.path.join(get_chroma_dir(user_dir), SQLITE_FILENAME)
+    if not os.path.exists(version_path) or not os.path.exists(sqlite_path):
+        return None
+    try:
+        with open(version_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        workspace_id = data.get("workspace_id")
+        return str(workspace_id) if isinstance(workspace_id, str) and workspace_id.strip() else None
+    except Exception:
+        return None
+
+
 __all__ = [
     "CHROMA_SUBDIR",
     "FTS_SUBDIR",
@@ -290,6 +317,7 @@ __all__ = [
     "get_user_dir",
     "get_user_uploads_dir",
     "read_local_version",
+    "read_local_workspace_id",
     "release_client_cache",
     "user_chroma_gcs_prefix",
     "user_fts_gcs_prefix",

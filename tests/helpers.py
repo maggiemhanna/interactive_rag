@@ -422,10 +422,8 @@ def cleanup_chroma_tmpdir(*roots: str) -> None:
 
 
 def reset_memory_saver() -> None:
-    """Clears all in-memory checkpoints, writes, and blobs from the shared LangGraph `MEMORY_SAVER`."""
-    MEMORY_SAVER.storage.clear()
-    MEMORY_SAVER.writes.clear()
-    MEMORY_SAVER.blobs.clear()
+    """Clears all in-memory checkpoints, writes, blobs, TTL timestamps, and workspace bindings."""
+    MEMORY_SAVER.reset()
 
 
 def parse_sse_frames(raw_sse_text: str) -> List[Dict[str, Any]]:
